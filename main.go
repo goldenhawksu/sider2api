@@ -1,4 +1,4 @@
-package handler
+package handler // IMPORTANT: package name is 'handler'
 
 import (
 	"bufio"
@@ -315,7 +315,12 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				fmt.Printf("写入DONE失败: %v\n", err)
 			}
-			w.(http.Flusher).Flush()
+			// Conditionally Flush
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			} else {
+				fmt.Println("ResponseWriter does not support Flush")
+			}
 			break
 		}
 
@@ -364,7 +369,12 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 			fmt.Printf("写入响应失败: %v\n", err)
 			return
 		}
-		w.(http.Flusher).Flush()
+		// Conditionally Flush
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		} else {
+			fmt.Println("ResponseWriter does not support Flush")
+		}
 	}
 }
 
