@@ -124,12 +124,10 @@ func forwardToSider(w http.ResponseWriter, r *http.Request, userStream bool, pro
 	fmt.Printf("处理的prompt: %s\n", prompt)
 	fmt.Printf("使用的模型: %s\n", model)
 
-
 	// Add prompt, model and stream to config
 	defaultConfig["prompt"] = prompt
 	defaultConfig["model"] = model
 	defaultConfig["stream"] = userStream // Use the passed userStream value
-
 
 	// 转换回JSON
 	finalBody, err := json.Marshal(defaultConfig)
@@ -181,49 +179,28 @@ func forwardToSider(w http.ResponseWriter, r *http.Request, userStream bool, pro
 	fmt.Printf("userStream value: %v\n", userStream) // <---- ADDED LOG: Check userStream value
 
 	if !userStream {
-		fmt.Println("Entering Non-Streaming Branch") // <---- ADDED LOG: Confirm entering non-streaming
+		fmt.Println("Entering Non-Streaming Branch")
 
-		// --- Log Sider Response Body ---
-		siderResponseBody, err := io.ReadAll(resp.Body) // Read the full response body
+		// --- Get Sider Response Body (already done for logging) ---
+		siderResponseBody, err := io.ReadAll(resp.Body) // Read the full response body AGAIN
 		if err != nil {
 			fmt.Printf("Error reading Sider response body: %v\n", err)
 			http.Error(w, "Error reading Sider response", http.StatusInternalServerError)
-			return // Important: Return on error
+			return
 		}
-		resp.Body.Close() // Close original body
-		resp.Body = io.NopCloser(bytes.NewBuffer(siderResponseBody)) // Restore body for later processing
-		fmt.Printf("Sider Response Body: %s\n", string(siderResponseBody)) // <---- ADDED LOG: Log the body
+		fmt.Printf("Sider Response Body: %s\n", string(siderResponseBody))
 
-		// Non-流式响应
+		// --- Unmarshal the ENTIRE Sider Response Body directly ---
+		var siderResp SiderResponse
+		if err := json.Unmarshal(siderResponseBody, &siderResp); err != nil { // Unmarshal the whole body
+			fmt.Printf("Error unmarshaling SiderResponse body: %v\n", err)
+			http.Error(w, "Error unmarshaling Sider response", http.StatusInternalServerError)
+			return
+		}
+
+		// Non-流式响应 - Build OpenAI Response directly from siderResp
 		w.Header().Set("Content-Type", "application/json")
-		fullResponse := ""
-		reader := bufio.NewReader(resp.Body)
-
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-				http.Error(w, "读取响应失败", http.StatusInternalServerError)
-				return
-			}
-
-			line = strings.TrimSpace(line)
-			line = strings.TrimPrefix(line, "data:")
-
-			if line == "" || line == "[DONE]" {
-				continue
-			}
-
-			var siderResp SiderResponse
-			if err := json.Unmarshal([]byte(line), &siderResp); err != nil {
-				fmt.Printf("Error unmarshaling SiderResponse line: %v, line: %s\n", err, line) // Log unmarshal errors
-				continue
-			}
-
-			fullResponse += siderResp.Data.Text
-		}
+		fullResponse := siderResp.Data.Text // Extract text directly from unmarshaled SiderResponse
 
 		openAIResp := OpenAIResponse{
 			ID:      "chatcmpl-" + time.Now().Format("20060102150405"),
@@ -272,8 +249,7 @@ func forwardToSider(w http.ResponseWriter, r *http.Request, userStream bool, pro
 		json.NewEncoder(w).Encode(openAIResp)
 		return
 	} else {
-		fmt.Println("Entering Streaming Branch") // <---- ADDED LOG: Confirm entering streaming
-
+		fmt.Println("Entering Streaming Branch")
 		// 流式响应 - This branch should NOT be reached on Vercel due to forced stream=false
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
