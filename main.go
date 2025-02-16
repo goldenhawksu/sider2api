@@ -246,6 +246,14 @@ func forwardToSider(w http.ResponseWriter, r *http.Request, userStream bool, pro
 			},
 		}
 
+		// --- Debugging Logs ---
+		fmt.Println("--- Debugging Logs (Non-Streaming Response) ---")
+		fmt.Printf("Prompt: %s\n", prompt)
+		fmt.Printf("Model: %s\n", model)
+		fmt.Printf("Full Response from Sider: %s\n", fullResponse)
+		fmt.Printf("OpenAI Response struct: %+v\n", openAIResp)
+		fmt.Println("--- End Debugging Logs ---")
+
 		json.NewEncoder(w).Encode(openAIResp)
 		return
 	}
