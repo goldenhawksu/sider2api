@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os" // 导入 os 包
+	"os"
 	"strings"
 	"time"
 )
@@ -368,19 +368,17 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func main() {
-	// 注册路由处理函数
-	http.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "OPTIONS" {
-			handleOptions(w, r)
-			return
-		}
-		forwardToSider(w, r)
-	})
-
-	fmt.Println("服务器启动在 http://127.0.0.1:7055")
-	fmt.Println("支持的模型: gpt-4o, claude-3.5-sonnet, deepseek-reasoner，o3-mini，o1,llama-3.1-405b,gemini-2.0-pro")
-	if err := http.ListenAndServe("127.0.0.1:7055", nil); err != nil {
-		fmt.Printf("服务器启动失败: %v\n", err)
+// CompletionsHandler is the exported handler for Vercel
+func CompletionsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "OPTIONS" {
+		handleOptions(w, r)
+		return
 	}
+	forwardToSider(w, r)
+}
+
+
+func main() {
+	// Vercel will call CompletionsHandler for requests to /v1/chat/completions.
+	fmt.Println("Server starting (Vercel managed port)")
 }
