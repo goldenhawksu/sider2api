@@ -157,8 +157,8 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 		defaultConfig["model"] = "gpt-4o" // 默认模型
 	}
 
-	// 设置stream参数
-	defaultConfig["stream"] = userReq.Stream
+	// 设置stream参数 - IMPORTANT: Stream will be controlled by Vercel check in Handler now.
+	defaultConfig["stream"] = userReq.Stream // Initially keep user's stream request, might be overridden in handler
 
 	fmt.Printf("使用的模型: %s\n", defaultConfig["model"])
 
@@ -209,8 +209,11 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Printf("Sider响应状态码: %d\n", resp.StatusCode)
 
-	if !userReq.Stream {
-		// 非流式响应
+	userStream := defaultConfig["stream"].(bool) // Get stream setting from defaultConfig, which might be overridden
+
+
+	if !userStream { // Use the potentially overridden stream setting
+		// Non-流式响应
 		w.Header().Set("Content-Type", "application/json")
 		fullResponse := ""
 		reader := bufio.NewReader(resp.Body)
@@ -280,7 +283,7 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 流式响应
+	// 流式响应 - This branch should NOT be reached on Vercel due to forced stream=false
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -315,11 +318,11 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				fmt.Printf("写入DONE失败: %v\n", err)
 			}
-			// Conditionally Flush
+			// Conditionally Flush - Keep this for non-Vercel environments if needed
 			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
 			} else {
-				fmt.Println("ResponseWriter does not support Flush")
+				fmt.Println("ResponseWriter does not support Flush (still logged, but should not cause error on Vercel)")
 			}
 			break
 		}
@@ -369,11 +372,11 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 			fmt.Printf("写入响应失败: %v\n", err)
 			return
 		}
-		// Conditionally Flush
+		// Conditionally Flush - Keep this for non-Vercel environments if needed
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		} else {
-			fmt.Println("ResponseWriter does not support Flush")
+			fmt.Println("ResponseWriter does not support Flush (still logged, but should not cause error on Vercel)")
 		}
 	}
 }
@@ -384,6 +387,33 @@ func CompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		handleOptions(w, r)
 		return
 	}
+
+	// Detect if running on Vercel and force stream to false
+	userReq := &UserRequest{} // Create a pointer to UserRequest
+	if os.Getenv("VERCEL") != "" {
+		fmt.Println("Vercel environment detected, forcing stream=false for user request")
+		bodyBytes, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		if err := json.Unmarshal(bodyBytes, userReq); err != nil { // Unmarshal into the pointer
+			fmt.Println("Error unmarshaling request body:", err)
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+		userReq.Stream = false // Modify the struct via pointer
+		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes)) // Restore the original body for later processing - important!
+	} else {
+		// If not on Vercel, proceed as normal (unmarshal without forcing stream=false)
+		bodyBytes, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		if err := json.Unmarshal(bodyBytes, userReq); err != nil { // Unmarshal into the pointer
+			fmt.Println("Error unmarshaling request body:", err)
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes)) // Restore the original body
+	}
+
+
 	forwardToSider(w, r)
 }
 
