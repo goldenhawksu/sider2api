@@ -105,32 +105,13 @@ func handleOptions(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func forwardToSider(w http.ResponseWriter, r *http.Request) {
+func forwardToSider(w http.ResponseWriter, r *http.Request, userStream bool, prompt string, model string) { // Pass userStream, prompt, model as arguments
 	fmt.Printf("收到新请求: %s %s\n", r.Method, r.URL.Path)
 
 	// 设置CORS头
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-
-	// 读取请求体
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		fmt.Printf("读取请求体失败: %v\n", err)
-		http.Error(w, "读取请求失败", http.StatusBadRequest)
-		return
-	}
-	defer r.Body.Close()
-
-	fmt.Printf("收到请求体: %s\n", string(body))
-
-	// 解析用户请求
-	var userReq UserRequest
-	if err := json.Unmarshal(body, &userReq); err != nil {
-		fmt.Printf("解析请求体失败: %v\n", err)
-		http.Error(w, "解析请求失败", http.StatusBadRequest)
-		return
-	}
 
 	// 解析默认模板
 	var defaultConfig map[string]interface{}
@@ -140,27 +121,15 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 获取用户消息内容
-	prompt := "你好" // 默认提示词
-	if len(userReq.Messages) > 0 {
-		prompt = userReq.Messages[len(userReq.Messages)-1].Content
-	}
 	fmt.Printf("处理的prompt: %s\n", prompt)
+	fmt.Printf("使用的模型: %s\n", model)
 
-	// 添加prompt到配置中
+
+	// Add prompt, model and stream to config
 	defaultConfig["prompt"] = prompt
+	defaultConfig["model"] = model
+	defaultConfig["stream"] = userStream // Use the passed userStream value
 
-	// 添加model到配置中
-	if userReq.Model != "" {
-		defaultConfig["model"] = userReq.Model
-	} else {
-		defaultConfig["model"] = "gpt-4o" // 默认模型
-	}
-
-	// 设置stream参数 - IMPORTANT: Stream will be controlled by Vercel check in Handler now.
-	defaultConfig["stream"] = userReq.Stream // Initially keep user's stream request, might be overridden in handler
-
-	fmt.Printf("使用的模型: %s\n", defaultConfig["model"])
 
 	// 转换回JSON
 	finalBody, err := json.Marshal(defaultConfig)
@@ -209,10 +178,8 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Printf("Sider响应状态码: %d\n", resp.StatusCode)
 
-	userStream := defaultConfig["stream"].(bool) // Get stream setting from defaultConfig, which might be overridden
 
-
-	if !userStream { // Use the potentially overridden stream setting
+	if !userStream { // Check the passed userStream argument
 		// Non-流式响应
 		w.Header().Set("Content-Type", "application/json")
 		fullResponse := ""
@@ -247,7 +214,7 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 			ID:      "chatcmpl-" + time.Now().Format("20060102150405"),
 			Object:  "chat.completion",
 			Created: time.Now().Unix(),
-			Model:   userReq.Model,
+			Model:   model, // Use the passed model argument
 			Choices: []struct {
 				Message struct {
 					Role    string `json:"role"`
@@ -339,7 +306,7 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 			ID:      "chatcmpl-" + siderResp.Data.ChatModel,
 			Object:  "chat.completion.chunk",
 			Created: time.Now().Unix(),
-			Model:   siderResp.Data.ChatModel,
+			Model:   model, // Use the passed model argument
 			Choices: []struct {
 				Delta struct {
 					Content string `json:"content"`
@@ -388,33 +355,35 @@ func CompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Detect if running on Vercel and force stream to false
-	userReq := &UserRequest{} // Create a pointer to UserRequest
-	if os.Getenv("VERCEL") != "" {
-		fmt.Println("Vercel environment detected, forcing stream=false for user request")
-		bodyBytes, _ := io.ReadAll(r.Body)
-		r.Body.Close()
-		if err := json.Unmarshal(bodyBytes, userReq); err != nil { // Unmarshal into the pointer
-			fmt.Println("Error unmarshaling request body:", err)
-			http.Error(w, "Bad Request", http.StatusBadRequest)
-			return
-		}
-		userReq.Stream = false // Modify the struct via pointer
-		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes)) // Restore the original body for later processing - important!
-	} else {
-		// If not on Vercel, proceed as normal (unmarshal without forcing stream=false)
-		bodyBytes, _ := io.ReadAll(r.Body)
-		r.Body.Close()
-		if err := json.Unmarshal(bodyBytes, userReq); err != nil { // Unmarshal into the pointer
-			fmt.Println("Error unmarshaling request body:", err)
-			http.Error(w, "Bad Request", http.StatusBadRequest)
-			return
-		}
-		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes)) // Restore the original body
+	userReq := &UserRequest{}
+	bodyBytes, _ := io.ReadAll(r.Body)
+	r.Body.Close()
+	if err := json.Unmarshal(bodyBytes, userReq); err != nil {
+		fmt.Println("Error unmarshaling request body:", err)
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes)) // Restore body
+
+	userStream := userReq.Stream // Get user's requested stream value
+	prompt := "你好" // default prompt
+	if len(userReq.Messages) > 0 {
+		prompt = userReq.Messages[len(userReq.Messages)-1].Content
+	}
+	model := "gpt-4o" // default model
+	if userReq.Model != "" {
+		model = userReq.Model
 	}
 
 
-	forwardToSider(w, r)
+	// Detect Vercel and FORCE stream=false
+	if os.Getenv("VERCEL") != "" {
+		fmt.Println("Vercel environment detected, forcing stream=false")
+		userStream = false // Override user's stream request to false
+	}
+
+
+	forwardToSider(w, r, userStream, prompt, model) // Pass userStream, prompt, model as arguments
 }
 
 
