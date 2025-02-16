@@ -178,8 +178,22 @@ func forwardToSider(w http.ResponseWriter, r *http.Request, userStream bool, pro
 
 	fmt.Printf("Sider响应状态码: %d\n", resp.StatusCode)
 
+	fmt.Printf("userStream value: %v\n", userStream) // <---- ADDED LOG: Check userStream value
 
-	if !userStream { // Check the passed userStream argument
+	if !userStream {
+		fmt.Println("Entering Non-Streaming Branch") // <---- ADDED LOG: Confirm entering non-streaming
+
+		// --- Log Sider Response Body ---
+		siderResponseBody, err := io.ReadAll(resp.Body) // Read the full response body
+		if err != nil {
+			fmt.Printf("Error reading Sider response body: %v\n", err)
+			http.Error(w, "Error reading Sider response", http.StatusInternalServerError)
+			return // Important: Return on error
+		}
+		resp.Body.Close() // Close original body
+		resp.Body = io.NopCloser(bytes.NewBuffer(siderResponseBody)) // Restore body for later processing
+		fmt.Printf("Sider Response Body: %s\n", string(siderResponseBody)) // <---- ADDED LOG: Log the body
+
 		// Non-流式响应
 		w.Header().Set("Content-Type", "application/json")
 		fullResponse := ""
@@ -204,6 +218,7 @@ func forwardToSider(w http.ResponseWriter, r *http.Request, userStream bool, pro
 
 			var siderResp SiderResponse
 			if err := json.Unmarshal([]byte(line), &siderResp); err != nil {
+				fmt.Printf("Error unmarshaling SiderResponse line: %v, line: %s\n", err, line) // Log unmarshal errors
 				continue
 			}
 
@@ -256,42 +271,96 @@ func forwardToSider(w http.ResponseWriter, r *http.Request, userStream bool, pro
 
 		json.NewEncoder(w).Encode(openAIResp)
 		return
-	}
+	} else {
+		fmt.Println("Entering Streaming Branch") // <---- ADDED LOG: Confirm entering streaming
 
-	// 流式响应 - This branch should NOT be reached on Vercel due to forced stream=false
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
+		// 流式响应 - This branch should NOT be reached on Vercel due to forced stream=false
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
 
-	// 使用bufio.Reader来读取流式响应
-	reader := bufio.NewReader(resp.Body)
+		// 使用bufio.Reader来读取流式响应
+		reader := bufio.NewReader(resp.Body)
 
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				fmt.Println("响应结束")
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					fmt.Println("响应结束")
+					break
+				}
+				fmt.Printf("读取响应失败: %v\n", err)
+				return
+			}
+
+			line = strings.TrimSpace(line)
+			line = strings.TrimPrefix(line, "data:")
+
+			// 跳过空行
+			if line == "" {
+				continue
+			}
+
+			// 如果是[DONE]，发送OpenAI格式的[DONE]
+			if line == "[DONE]" {
+				_, err = w.Write([]byte("data: [DONE]\n\n"))
+				if err != nil {
+					fmt.Printf("写入DONE失败: %v\n", err)
+				}
+				// Conditionally Flush - Keep this for non-Vercel environments if needed
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				} else {
+					fmt.Println("ResponseWriter does not support Flush (still logged, but should not cause error on Vercel)")
+				}
 				break
 			}
-			fmt.Printf("读取响应失败: %v\n", err)
-			return
-		}
 
-		// 去除前缀和空白字符
-		line = strings.TrimSpace(line)
-		line = strings.TrimPrefix(line, "data:")
+			// 解析Sider响应
+			var siderResp SiderResponse
+			if err := json.Unmarshal([]byte(line), &siderResp); err != nil {
+				fmt.Printf("解析Sider响应失败: %v\n", err)
+				continue
+			}
 
-		// 跳过空行
-		if line == "" {
-			continue
-		}
+			// 转换为OpenAI格式
+			openAIResp := OpenAIStreamResponse{
+				ID:      "chatcmpl-" + siderResp.Data.ChatModel,
+				Object:  "chat.completion.chunk",
+				Created: time.Now().Unix(),
+				Model:   model, // Use the passed model argument
+				Choices: []struct {
+					Delta struct {
+						Content string `json:"content"`
+					} `json:"delta"`
+					FinishReason string `json:"finish_reason"`
+					Index        int    `json:"index"`
+				}{
+					{
+						Delta: struct {
+							Content string `json:"content"`
+						}{
+							Content: siderResp.Data.Text,
+						},
+						FinishReason: "",
+						Index:        0,
+					},
+				},
+			}
 
-		// 如果是[DONE]，发送OpenAI格式的[DONE]
-		if line == "[DONE]" {
-			_, err = w.Write([]byte("data: [DONE]\n\n"))
+			// 转换为JSON
+			openAIJSON, err := json.Marshal(openAIResp)
 			if err != nil {
-				fmt.Printf("写入DONE失败: %v\n", err)
+				fmt.Printf("转换OpenAI格式失败: %v\n", err)
+				continue
+			}
+
+			// 发送OpenAI格式的响应
+			_, err = w.Write([]byte("data: " + string(openAIJSON) + "\n\n"))
+			if err != nil {
+				fmt.Printf("写入响应失败: %v\n", err)
+				return
 			}
 			// Conditionally Flush - Keep this for non-Vercel environments if needed
 			if flusher, ok := w.(http.Flusher); ok {
@@ -299,59 +368,6 @@ func forwardToSider(w http.ResponseWriter, r *http.Request, userStream bool, pro
 			} else {
 				fmt.Println("ResponseWriter does not support Flush (still logged, but should not cause error on Vercel)")
 			}
-			break
-		}
-
-		// 解析Sider响应
-		var siderResp SiderResponse
-		if err := json.Unmarshal([]byte(line), &siderResp); err != nil {
-			fmt.Printf("解析Sider响应失败: %v\n", err)
-			continue
-		}
-
-		// 转换为OpenAI格式
-		openAIResp := OpenAIStreamResponse{
-			ID:      "chatcmpl-" + siderResp.Data.ChatModel,
-			Object:  "chat.completion.chunk",
-			Created: time.Now().Unix(),
-			Model:   model, // Use the passed model argument
-			Choices: []struct {
-				Delta struct {
-					Content string `json:"content"`
-				} `json:"delta"`
-				FinishReason string `json:"finish_reason"`
-				Index        int    `json:"index"`
-			}{
-				{
-					Delta: struct {
-						Content string `json:"content"`
-					}{
-						Content: siderResp.Data.Text,
-					},
-					FinishReason: "",
-					Index:        0,
-				},
-			},
-		}
-
-		// 转换为JSON
-		openAIJSON, err := json.Marshal(openAIResp)
-		if err != nil {
-			fmt.Printf("转换OpenAI格式失败: %v\n", err)
-			continue
-		}
-
-		// 发送OpenAI格式的响应
-		_, err = w.Write([]byte("data: " + string(openAIJSON) + "\n\n"))
-		if err != nil {
-			fmt.Printf("写入响应失败: %v\n", err)
-			return
-		}
-		// Conditionally Flush - Keep this for non-Vercel environments if needed
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		} else {
-			fmt.Println("ResponseWriter does not support Flush (still logged, but should not cause error on Vercel)")
 		}
 	}
 }
