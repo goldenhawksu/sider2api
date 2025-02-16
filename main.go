@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os" // 导入 os 包
 	"strings"
 	"time"
 )
@@ -180,10 +181,18 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 获取环境变量中的 Authorization Key
+	authorizationKey := os.Getenv("SIDER_AUTHORIZATION_KEY")
+	if authorizationKey == "" {
+		fmt.Println("环境变量 SIDER_AUTHORIZATION_KEY 未设置")
+		http.Error(w, "服务器配置错误: Authorization Key 未设置", http.StatusInternalServerError)
+		return
+	}
+
 	// 设置请求头
 	req.Header.Set("accept", "*/*")
 	req.Header.Set("accept-language", "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6")
-	req.Header.Set("authorization", "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxMDQ3ODEyNywicmVnaXN0ZXJfdHlwZSI6Im9hdXRoMiIsImFwcF9uYW1lIjoiQ2hpdENoYXRfRWRnZV9FeHQiLCJ0b2tlbl9pZCI6IjMyMTRiMDc0LTU2MTMtNDI1ZC04YjM2LTQzNGU4YjBjYjRkOSIsImlzcyI6InNpZGVyLmFpIiwiYXVkIjpbIiJdLCJleHAiOjE3NTA0NzIxMTEsIm5iZiI6MTcxOTM2ODExMSwiaWF0IjoxNzE5MzY4MTExfQ.glb9636RPBhoL0v3F0YzGPKoRaVv4FmTeDW-Swk-JWA")
+	req.Header.Set("authorization", "Bearer "+authorizationKey) // 使用环境变量
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set("origin", "chrome-extension://dhoenijjpgpeimemopealfcbiecgceod")
 	req.Header.Set("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0")
