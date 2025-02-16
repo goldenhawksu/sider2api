@@ -3,10 +3,7 @@
   "builds": [
     {
       "src": "main.go",
-      "use": "@vercel/go",
-      "functions": {
-        "main.go": { "handler": "CompletionsHandler" }
-      }
+      "use": "@vercel/go"
     }
   ],
   "routes": [
