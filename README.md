@@ -5,8 +5,11 @@
 ## 项目描述
 
 Sider2API 是一个基于 Go 语言开发的高性能 API 服务框架。该项目旨在提供一个简单、高效、可扩展的 API 开发解决方案。
+
 hf-main.go 用于部署在huggingface上
+
 origin-main.go 用于在linux terminal 里直接启动运行
+
 main.go+vercel.json+go.mod 用于部署在vercel (不建议，对话会被vercel的免费60s限制截断，导致无法正常运行)
 
 ## 功能特点
