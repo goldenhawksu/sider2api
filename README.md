@@ -5,6 +5,9 @@
 ## 项目描述
 
 Sider2API 是一个基于 Go 语言开发的高性能 API 服务框架。该项目旨在提供一个简单、高效、可扩展的 API 开发解决方案。
+hf-main.go 用于部署在huggingface上
+origin-main.go 用于在linux terminal 里直接启动运行
+main.go+vercel.json+go.mod 用于部署在vercel (不建议，对话会被vercel的免费60s限制截断，导致无法正常运行)
 
 ## 功能特点
 
@@ -37,7 +40,14 @@ go mod tidy
 go run main.go
 ```
 
+4. 退出服务
+```bash
+ps aux | grep main.go
+kill nnn
+```
+
 ## 配置说明
+Token获取：Chrome->F12->应用程序->存储->扩展存储->Sider:ChatGPT侧边栏->本地->“密钥”栏->token
 
 项目配置文件位于 `config` 目录下，支持以下配置项：
 
