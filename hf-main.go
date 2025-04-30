@@ -429,12 +429,16 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
     authMiddleware(func(w http.ResponseWriter, r *http.Request){
         models := []Model{
             {ID: "gpt-4o", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
+	    {ID: "gpt-4.1", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
+	    {ID: "gpt-4.1-mini", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
             {ID: "claude-3.5-sonnet", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
+	    {ID: "claude-3.7-sonnet", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},	
             {ID: "deepseek-reasoner", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
             {ID: "o3-mini", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
             {ID: "o1", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
             {ID: "llama-3.1-405b", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
             {ID: "gemini-2.0-pro", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
+	    {ID: "gemini-2.5-pro", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
         }
 
         response := ModelListResponse{
@@ -464,7 +468,7 @@ func main() {
 
 
 	fmt.Println("服务已启动！")
-	fmt.Println("支持的模型: gpt-4o, claude-3.5-sonnet, deepseek-reasoner，o3-mini，o1,llama-3.1-405b,gemini-2.0-pro")
+	fmt.Println("支持的模型: gpt-4o, claude-3.5-sonnet, claude-3.7-sonnet, deepseek-reasoner，o3-mini，o1,llama-3.1-405b,gemini-2.0-pro,gemini-2.5-pro, gpt-4.1, gpt-4.1-mini")
 	// Use 0.0.0.0 to listen on all interfaces
 	if err := http.ListenAndServe("0.0.0.0:7055", nil); err != nil {
 		fmt.Printf("服务器启动失败: %v\n", err)
