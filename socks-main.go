@@ -1,26 +1,15 @@
-// # Sider API 配置  
-// # -------------------  
-// 
-// # SOCKS 代理设置  
-// # 设置为 1 或 true 表示启用 SOCKS 代理  
-// USE_SOCKS=1  
-// # SOCKS 代理服务器地址  
-// SOCKS_PROXY=socks.xxx.net:3128  
-// 
-// # Sider 认证设置  
-// # 如果需要使用自己的 Token，取消下面的注释并填入  
-// # SIDER_AUTH_TOKEN=your_sider_token_here  
-// 
-// # 服务器监听设置  
-// # 默认为 127.0.0.1:7055，如需改变监听地址，取消下面注释  
-// # LISTEN_ADDR=0.0.0.0:7055 
-
+// go get github.com/joho/godotenv  
+// go get golang.org/x/net/proxy  
+// 将示例的.env文件保存在与main.go同一目录下, socks-main.go改名为main.go
+// 根据您的需求修改配置，特别是SOCKS5代理和Sider令牌
+// go run main.go  
 
 package main
 
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,54 +19,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/joho/godotenv"
 	"golang.org/x/net/proxy"
 )
-
-// 加载.env文件
-func loadEnv() {
-	envFile := ".env"
-	file, err := os.Open(envFile)
-	if err != nil {
-		// 如果文件不存在，静默忽略
-		if os.IsNotExist(err) {
-			return
-		}
-		fmt.Printf("警告: 无法打开.env文件: %v\n", err)
-		return
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		// 跳过空行和注释
-		if len(line) == 0 || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		// 解析KEY=VALUE格式
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-
-		// 如果值被引号包围，去掉引号
-		if len(value) >= 2 && (value[0] == '"' && value[len(value)-1] == '"' || 
-			value[0] == '\'' && value[len(value)-1] == '\'') {
-			value = value[1 : len(value)-1]
-		}
-
-		// 设置环境变量
-		os.Setenv(key, value)
-	}
-
-	if err := scanner.Err(); err != nil {
-		fmt.Printf("警告: 读取.env文件出错: %v\n", err)
-	}
-}
 
 // 用户请求的结构
 type UserRequest struct {
@@ -165,45 +109,42 @@ type OpenAIStreamResponse struct {
 	} `json:"choices"`
 }
 
-// 获取HTTP客户端（普通或SOCKS代理）
-func getHttpClient() *http.Client {
-	// 从环境变量获取SOCKS代理配置
-	useSocks := os.Getenv("USE_SOCKS") == "1" || os.Getenv("USE_SOCKS") == "true"
-	socksProxy := os.Getenv("SOCKS_PROXY")
-	
-	// 如果没有配置代理地址，使用默认值
-	if socksProxy == "" {
-		socksProxy = "127.0.0.1:1080"
+// 配置结构
+type Config struct {
+	Port          string
+	ProxyAddr     string
+	ProxyPort     string
+	ProxyUser     string
+	ProxyPassword string
+	SiderURL      string
+	SiderToken    string
+	DefaultModel  string
+}
+
+// 全局配置
+var appConfig Config
+
+// 从环境变量加载配置
+func loadConfig() Config {
+	return Config{
+		Port:          getEnv("PORT", "7055"),
+		ProxyAddr:     getEnv("PROXY_ADDR", ""),
+		ProxyPort:     getEnv("PROXY_PORT", ""),
+		ProxyUser:     getEnv("PROXY_USER", ""),
+		ProxyPassword: getEnv("PROXY_PASSWORD", ""),
+		SiderURL:      getEnv("SIDER_URL", "https://api2.sider.ai/api/v3/completion/text"),
+		SiderToken:    getEnv("SIDER_TOKEN", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxMDQ3ODEyNywicmVnaXN0ZXJfdHlwZSI6Im9hdXRoMiIsImFwcF9uYW1lIjoiQ2hpdENoYXRfRWRnZV9FeHQiLCJ0b2tlbl9pZCI6IjMyMTRiMDc0LTU2MTMtNDI1ZC04YjM2LTQzNGU4YjBjYjRkOSIsImlzcyI6InNpZGVyLmFpIiwiYXVkIjpbIiJdLCJleHAiOjE3NTA0NzIxMTEsIm5iZiI6MTcxOTM2ODExMSwiaWF0IjoxNzE5MzY4MTExfQ.glb9636RPBhoL0v3F0YzGPKoRaVv4FmTeDW-Swk-JWA"),
+		DefaultModel:  getEnv("DEFAULT_MODEL", "gpt-4o"),
 	}
-	
-	// 如果不使用SOCKS代理，返回普通客户端
-	if !useSocks {
-		return &http.Client{
-			Timeout: 60 * time.Second,
-		}
+}
+
+// 获取环境变量，如果不存在则返回默认值
+func getEnv(key, defaultValue string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
 	}
-	
-	fmt.Printf("使用SOCKS代理: %s\n", socksProxy)
-	
-	// 创建SOCKS5拨号器
-	dialer, err := proxy.SOCKS5("tcp", socksProxy, nil, proxy.Direct)
-	if err != nil {
-		fmt.Printf("创建SOCKS5代理失败: %v，将使用直连\n", err)
-		return &http.Client{
-			Timeout: 60 * time.Second,
-		}
-	}
-	
-	// 创建自定义Transport
-	httpTransport := &http.Transport{
-		Dial: dialer.Dial,
-	}
-	
-	// 返回使用SOCKS代理的客户端
-	return &http.Client{
-		Transport: httpTransport,
-		Timeout: 60 * time.Second,
-	}
+	return value
 }
 
 func handleOptions(w http.ResponseWriter, r *http.Request) {
@@ -211,6 +152,44 @@ func handleOptions(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	w.WriteHeader(http.StatusOK)
+}
+
+// 创建带有SOCKS代理的HTTP客户端
+func createHTTPClient() (*http.Client, error) {
+	// 检查是否配置了代理
+	if appConfig.ProxyAddr == "" || appConfig.ProxyPort == "" {
+		return &http.Client{}, nil
+	}
+
+	// 构建代理地址
+	proxyAddr := fmt.Sprintf("%s:%s", appConfig.ProxyAddr, appConfig.ProxyPort)
+	fmt.Printf("使用SOCKS5代理: %s\n", proxyAddr)
+
+	var auth *proxy.Auth
+	if appConfig.ProxyUser != "" && appConfig.ProxyPassword != "" {
+		auth = &proxy.Auth{
+			User:     appConfig.ProxyUser,
+			Password: appConfig.ProxyPassword,
+		}
+	}
+
+	// 创建SOCKS5拨号器
+	dialer, err := proxy.SOCKS5("tcp", proxyAddr, auth, proxy.Direct)
+	if err != nil {
+		return nil, fmt.Errorf("创建SOCKS5拨号器失败: %v", err)
+	}
+
+	// 创建自定义Transport
+	httpTransport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.Dial(network, addr)
+		},
+	}
+
+	// 返回HTTP客户端
+	return &http.Client{
+		Transport: httpTransport,
+	}, nil
 }
 
 func forwardToSider(w http.ResponseWriter, r *http.Request) {
@@ -262,7 +241,7 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 	if userReq.Model != "" {
 		defaultConfig["model"] = userReq.Model
 	} else {
-		defaultConfig["model"] = "gpt-4o" // 默认模型
+		defaultConfig["model"] = appConfig.DefaultModel // 使用配置的默认模型
 	}
 
 	// 设置stream参数
@@ -281,8 +260,7 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 	fmt.Printf("发送到Sider的请求体: %s\n", string(finalBody))
 
 	// 创建转发到Sider的请求
-	url := "https://api2.sider.ai/api/v3/completion/text"
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(finalBody))
+	req, err := http.NewRequest("POST", appConfig.SiderURL, bytes.NewBuffer(finalBody))
 	if err != nil {
 		fmt.Printf("创建Sider请求失败: %v\n", err)
 		http.Error(w, "创建请求失败", http.StatusInternalServerError)
@@ -292,20 +270,20 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 	// 设置请求头
 	req.Header.Set("accept", "*/*")
 	req.Header.Set("accept-language", "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6")
-	
-	// 从环境变量获取认证Token
-	authToken := os.Getenv("SIDER_AUTH_TOKEN")
-	if authToken == "" {
-		authToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxMDQ3ODEyNywicmVnaXN0ZXJfdHlwZSI6Im9hdXRoMiIsImFwcF9uYW1lIjoiQ2hpdENoYXRfRWRnZV9FeHQiLCJ0b2tlbl9pZCI6IjMyMTRiMDc0LTU2MTMtNDI1ZC04YjM2LTQzNGU4YjBjYjRkOSIsImlzcyI6InNpZGVyLmFpIiwiYXVkIjpbIiJdLCJleHAiOjE3NTA0NzIxMTEsIm5iZiI6MTcxOTM2ODExMSwiaWF0IjoxNzE5MzY4MTExfQ.glb9636RPBhoL0v3F0YzGPKoRaVv4FmTeDW-Swk-JWA"
-	}
-	req.Header.Set("authorization", "Bearer "+authToken)
-	
+	req.Header.Set("authorization", "Bearer "+appConfig.SiderToken)  // 添加Bearer前缀
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set("origin", "chrome-extension://dhoenijjpgpeimemopealfcbiecgceod")
 	req.Header.Set("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0")
 
-	// 使用普通或SOCKS代理客户端
-	client := getHttpClient()
+	// 创建带有SOCKS代理的HTTP客户端
+	client, err := createHTTPClient()
+	if err != nil {
+		fmt.Printf("创建HTTP客户端失败: %v\n", err)
+		http.Error(w, "创建HTTP客户端失败", http.StatusInternalServerError)
+		return
+	}
+
+	// 发送请求到Sider
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Printf("发送到Sider请求失败: %v\n", err)
@@ -391,4 +369,119 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.
+	w.WriteHeader(http.StatusOK)
+
+	// 使用bufio.Reader来读取流式响应
+	reader := bufio.NewReader(resp.Body)
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				fmt.Println("响应结束")
+				break
+			}
+			fmt.Printf("读取响应失败: %v\n", err)
+			return
+		}
+
+		// 去除前缀和空白字符
+		line = strings.TrimSpace(line)
+		line = strings.TrimPrefix(line, "data:")
+
+		// 跳过空行
+		if line == "" {
+			continue
+		}
+
+		// 如果是[DONE]，发送OpenAI格式的[DONE]
+		if line == "[DONE]" {
+			_, err = w.Write([]byte("data: [DONE]\n\n"))
+			if err != nil {
+				fmt.Printf("写入DONE失败: %v\n", err)
+			}
+			w.(http.Flusher).Flush()
+			break
+		}
+
+		// 解析Sider响应
+		var siderResp SiderResponse
+		if err := json.Unmarshal([]byte(line), &siderResp); err != nil {
+			fmt.Printf("解析Sider响应失败: %v\n", err)
+			continue
+		}
+
+		// 转换为OpenAI格式
+		openAIResp := OpenAIStreamResponse{
+			ID:      "chatcmpl-" + siderResp.Data.ChatModel,
+			Object:  "chat.completion.chunk",
+			Created: time.Now().Unix(),
+			Model:   siderResp.Data.ChatModel,
+			Choices: []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+				FinishReason string `json:"finish_reason"`
+				Index        int    `json:"index"`
+			}{
+				{
+					Delta: struct {
+						Content string `json:"content"`
+					}{
+						Content: siderResp.Data.Text,
+					},
+					FinishReason: "",
+					Index:        0,
+				},
+			},
+		}
+
+		// 转换为JSON
+		openAIJSON, err := json.Marshal(openAIResp)
+		if err != nil {
+			fmt.Printf("转换OpenAI格式失败: %v\n", err)
+			continue
+		}
+
+		// 发送OpenAI格式的响应
+		_, err = w.Write([]byte("data: " + string(openAIJSON) + "\n\n"))
+		if err != nil {
+			fmt.Printf("写入响应失败: %v\n", err)
+			return
+		}
+		w.(http.Flusher).Flush()
+	}
+}
+
+func main() {
+	// 加载.env文件
+	err := godotenv.Load()
+	if err != nil {
+		fmt.Println(".env文件未找到，将使用默认配置")
+	}
+
+	// 加载配置
+	appConfig = loadConfig()
+
+	// 注册路由处理函数
+	http.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "OPTIONS" {
+			handleOptions(w, r)
+			return
+		}
+		forwardToSider(w, r)
+	})
+
+	listenAddr := fmt.Sprintf("127.0.0.1:%s", appConfig.Port)
+	fmt.Printf("服务器启动在 http://%s\n", listenAddr)
+	fmt.Println("支持的模型: gpt-4o, claude-3.5-sonnet, deepseek-reasoner, o3-mini, o1, llama-3.1-405b, gemini-2.0-pro")
+	
+	if appConfig.ProxyAddr != "" {
+		fmt.Printf("使用SOCKS5代理: %s:%s\n", appConfig.ProxyAddr, appConfig.ProxyPort)
+	}
+	
+	if err := http.ListenAndServe(listenAddr, nil); err != nil {
+		fmt.Printf("服务器启动失败: %v\n", err)
+	}
+}
+
