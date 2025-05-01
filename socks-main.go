@@ -1,22 +1,20 @@
-// ------使用方法linux---------
-// # 设置使用SOCKS代理  
-// export USE_SOCKS=1  
+// # Sider API 配置  
+// # -------------------  
+// 
+// # SOCKS 代理设置  
+// # 设置为 1 或 true 表示启用 SOCKS 代理  
+// USE_SOCKS=1  
+// # SOCKS 代理服务器地址  
+// SOCKS_PROXY=socks.xxx.net:3128  
+// 
+// # Sider 认证设置  
+// # 如果需要使用自己的 Token，取消下面的注释并填入  
+// # SIDER_AUTH_TOKEN=your_sider_token_here  
+// 
+// # 服务器监听设置  
+// # 默认为 127.0.0.1:7055，如需改变监听地址，取消下面注释  
+// # LISTEN_ADDR=0.0.0.0:7055 
 
-// # 设置SOCKS代理地址  
-// export SOCKS_PROXY=socks.xxx.net:3128  
-
-// # 运行服务  
-// go run main.go  
-
-//---- 使用方法Windows------
-// REM 设置使用SOCKS代理  
-// set USE_SOCKS=1  
-
-// REM 设置SOCKS代理地址  
-// set SOCKS_PROXY=socks.xxx.net:63128  
-
-// REM 运行服务  
-// go run main.go  
 
 package main
 
@@ -34,6 +32,52 @@ import (
 
 	"golang.org/x/net/proxy"
 )
+
+// 加载.env文件
+func loadEnv() {
+	envFile := ".env"
+	file, err := os.Open(envFile)
+	if err != nil {
+		// 如果文件不存在，静默忽略
+		if os.IsNotExist(err) {
+			return
+		}
+		fmt.Printf("警告: 无法打开.env文件: %v\n", err)
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		// 跳过空行和注释
+		if len(line) == 0 || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// 解析KEY=VALUE格式
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+
+		// 如果值被引号包围，去掉引号
+		if len(value) >= 2 && (value[0] == '"' && value[len(value)-1] == '"' || 
+			value[0] == '\'' && value[len(value)-1] == '\'') {
+			value = value[1 : len(value)-1]
+		}
+
+		// 设置环境变量
+		os.Setenv(key, value)
+	}
+
+	if err := scanner.Err(); err != nil {
+		fmt.Printf("警告: 读取.env文件出错: %v\n", err)
+	}
+}
 
 // 用户请求的结构
 type UserRequest struct {
@@ -347,102 +391,4 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-
-	// 使用bufio.Reader来读取流式响应
-	reader := bufio.NewReader(resp.Body)
-
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				fmt.Println("响应结束")
-				break
-			}
-			fmt.Printf("读取响应失败: %v\n", err)
-			return
-		}
-
-		// 去除前缀和空白字符
-		line = strings.TrimSpace(line)
-		line = strings.TrimPrefix(line, "data:")
-
-		// 跳过空行
-		if line == "" {
-			continue
-		}
-
-		// 如果是[DONE]，发送OpenAI格式的[DONE]
-		if line == "[DONE]" {
-			_, err = w.Write([]byte("data: [DONE]\n\n"))
-			if err != nil {
-				fmt.Printf("写入DONE失败: %v\n", err)
-			}
-			w.(http.Flusher).Flush()
-			break
-		}
-
-		// 解析Sider响应
-		var siderResp SiderResponse
-		if err := json.Unmarshal([]byte(line), &siderResp); err != nil {
-			fmt.Printf("解析Sider响应失败: %v\n", err)
-			continue
-		}
-
-		// 转换为OpenAI格式
-		openAIResp := OpenAIStreamResponse{
-			ID:      "chatcmpl-" + siderResp.Data.ChatModel,
-			Object:  "chat.completion.chunk",
-			Created: time.Now().Unix(),
-			Model:   siderResp.Data.ChatModel,
-			Choices: []struct {
-				Delta struct {
-					Content string `json:"content"`
-				} `json:"delta"`
-				FinishReason string `json:"finish_reason"`
-				Index        int    `json:"index"`
-			}{
-				{
-					Delta: struct {
-						Content string `json:"content"`
-					}{
-						Content: siderResp.Data.Text,
-					},
-					FinishReason: "",
-					Index:        0,
-				},
-			},
-		}
-
-		// 转换为JSON
-		openAIJSON, err := json.Marshal(openAIResp)
-		if err != nil {
-			fmt.Printf("转换OpenAI格式失败: %v\n", err)
-			continue
-		}
-
-		// 发送OpenAI格式的响应
-		_, err = w.Write([]byte("data: " + string(openAIJSON) + "\n\n"))
-		if err != nil {
-			fmt.Printf("写入响应失败: %v\n", err)
-			return
-		}
-		w.(http.Flusher).Flush()
-	}
-}
-
-func indexHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, "🚀 Sider2API服务已启动！")
-}
-
-type Model struct {
-	ID string `json:"id"`
-	Object string `json:"object"`
-	OwnedBy string `json:"owned_by"`
-	Permission []string `json:"permission"`
-}
-
-type ModelListResponse struct {
-	Object string `json:"object"`
-	Data
+	w.
