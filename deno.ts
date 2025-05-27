@@ -34,25 +34,57 @@ const MODEL_MAPPING = {
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "gpt-4o" 
   },
-  "claude-3.5-sonnet": { 
+  "gpt-4.1": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "claude-3.5-sonnet" 
+    model: "gpt-4.1" 
+  },
+  "gpt-4.5": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "gpt-4.5" 
+  },
+  "gpt-4.1-mini": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "gpt-4.1-mini" 
   },
   "claude-3.7-sonnet": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "claude-3.7-sonnet" 
   },
+  "claude-4-sonnet": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "claude-4-sonnet" 
+  },
+  "claude-4-sonnet-think": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "claude-4-sonnet-think" 
+  },
+  "claude-4-opus": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "claude-4-opus" 
+  },
+  "claude-4-opus-think": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "claude-4-opus-think" 
+  },
   "deepseek-reasoner": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "deepseek-reasoner" 
+  },
+  "o1": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "o1" 
+  },
+  "o3": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "o3" 
   },
   "o3-mini": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "o3-mini" 
   },
-  "o1": { 
+  "o4-mini": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "o1" 
+    model: "o4-mini" 
   },
   "llama-3.1-405b": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
@@ -65,6 +97,18 @@ const MODEL_MAPPING = {
   "gemini-2.5-pro": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "gemini-2.5-pro" 
+  },
+  "gemini-2.5-flash": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "gemini-2.5-flash" 
+  },
+  "gemini-2.5-pro-think": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "gemini-2.5-pro-think" 
+  },
+  "gemini-2.5-flash-think": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "gemini-2.5-flash-think" 
   }
 };
 
