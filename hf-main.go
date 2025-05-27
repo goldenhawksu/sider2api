@@ -430,15 +430,24 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
         models := []Model{
 			{ID: "gpt-4o", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
 			{ID: "gpt-4.1", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
+            		{ID: "gpt-4.5", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
 			{ID: "gpt-4.1-mini", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
-			{ID: "claude-3.5-sonnet", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
-			{ID: "claude-3.7-sonnet", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},	
+			{ID: "claude-3.7-sonnet", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
+			{ID: "claude-4-sonnet", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
+			{ID: "claude-4-sonnet-think", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
+			{ID: "claude-4-opus", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
+			{ID: "claude-4-opus-think", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
 			{ID: "deepseek-reasoner", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
-			{ID: "o3-mini", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
 			{ID: "o1", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
+			{ID: "o3", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
+            		{ID: "o3-mini", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
+			{ID: "o4-mini", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
 			{ID: "llama-3.1-405b", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
 			{ID: "gemini-2.0-pro", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
 			{ID: "gemini-2.5-pro", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
+            		{ID: "gemini-2.5-flash", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
+			{ID: "gemini-2.5-pro-think", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},
+            		{ID: "gemini-2.5-flash-think", Object: "model", OwnedBy: "sider", Permission: []string{"read"}},            
         }
 
         response := ModelListResponse{
