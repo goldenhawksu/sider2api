@@ -33,7 +33,7 @@ socks-main.go是在origin-main.go基础上添加了socks代理功能
 
 1. 克隆项目
 ```bash
-git clone https://github.com/yourusername/sider2api.git
+git clone https://github.com/goldenhawksu/sider2api.git
 cd sider2api
 ```
 
