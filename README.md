@@ -81,6 +81,63 @@ endpoint(?)：Chrome->F12->应用程序->存储->扩展存储->Sider:ChatGPT侧�
 
 model: Chrome->F12->应用程序->存储->扩展存储->Sider:ChatGPT侧边栏->本地->“密钥”栏-> siderModels -> name
 
+
+# 模型列表（按创建者归类）
+
+| category | creator | level | name | is_think_model | replaceBy |
+|---|---|---|---|---|---|
+| 1 | | 1 | slides-agent | 否 | |
+| 1 | | 1 | slides-editor | 否 | |
+| 1 | | 1 | dalle_3_HD | 否 | |
+| 1 | | 1 | ideogram_v2 | 否 | |
+| 1 | | 1 | sdxlV1.0 | 否 | |
+| 1 | | 1 | flux-pro-1.1 | 否 | |
+| 1 | | 1 | flux-pro-1.1-ultra | 否 | |
+| 1 | Google | 1 | gemini-2.0-flash | 否 | gemini-2.5-flash |
+| 1 | SD | 1 | sd3.5-large | 否 | |
+| 1 | anthropic | 1 | claude-3.5-haiku | 否 | |
+| 1 | anthropic | 1 | claude-3-haiku | 否 | sider |
+| 1 | anthropic | 1 | claude-instant | 否 | |
+| 2 | anthropic | 2 | claude-3.7-sonnet | 否 | |
+| 2 | anthropic | 2 | claude-4-sonnet | 否 | |
+| 3 | anthropic | 2 | claude-3.7-sonnet-think | 是 | |
+| 3 | anthropic | 2 | claude-4-sonnet-think | 是 | |
+| 3 | anthropic | 2 | claude-4-opus | 否 | |
+| 3 | anthropic | 2 | claude-4-opus-think | 是 | |
+| 2 | anthropic | 2 | claude-3.5-sonnet | 否 | |
+| 2 | anthropic | 2 | claude2 | 否 | |
+| 2 | anthropic | 2 | claude-3-sonnet | 否 | |
+| 2 | anthropic | 2 | claude-3-opus | 否 | |
+| 1 | deepseek | 1 | deepseek-chat | 否 | |
+| 1 | deepseek | 1 | deepseek-r1-distill-llama-70b | 否 | sider |
+| 3 | deepseek | 2 | deepseek-reasoner | 是 | |
+| 1 | google | 1 | gemini-2.5-flash | 否 | |
+| 1 | google | 1 | gemini-1.5-flash | 否 | gemini-2.5-flash |
+| 1 | google | 1 | gemini-pro | 否 | |
+| 2 | google | 2 | gemini-2.5-pro | 否 | |
+| 2 | google | 2 | gemini-2.5-flash-think | 是 | |
+| 3 | google | 2 | gemini-2.5-pro-think | 是 | |
+| 2 | google | 2 | gemini-2.0-pro | 否 | gemini-2.5-pro |
+| 2 | google | 2 | gemini-1.5-pro | 否 | gemini-2.5-pro |
+| 1 | meta | 1 | llama-3.3-70b | 否 | sider |
+| 1 | meta | 1 | llama-3 | 否 | sider |
+| 2 | meta | 2 | llama-3.1-405b | 否 | |
+| 1 | openai | 1 | gpt-4.1-mini | 否 | |
+| 1 | openai | 1 | gpt-4o-mini | 否 | gpt-4.1-mini |
+| 1 | openai | 1 | gpt-3.5 | 否 | gpt-4.1-mini |
+| 2 | openai | 2 | gpt-4.1 | 否 | |
+| 2 | openai | 2 | gpt-4o | 否 | gpt-4.1 |
+| 2 | openai | 2 | gpt-4 | 否 | |
+| 3 | openai1 | 2 | o4-mini | 是 | |
+| 3 | openai1 | 2 | o3 | 是 | |
+| 3 | openai1 | 2 | o1 | 否 | o3 |
+| 3 | openai1 | 2 | o3-mini | 否 | o4-mini |
+| 3 | openai1 | 2 | gpt-4.5 | 否 | |
+| 3 | openai1 | 2 | o1-mini | 否 | o4-mini |
+| 1 | sider | 1 | sider | 否 | |
+
+
+
 ## 贡献指南
 
 欢迎提交 Pull Request 或创建 Issue！
