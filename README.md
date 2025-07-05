@@ -62,12 +62,21 @@ kill nnn
 - 数据库连接
 - 日志级别
 - 其他自定义配置
--   AUTH_TOKEN: 用于访问本服务的API Key, 用于填写New-API的新建渠道
--   SIDER_AUTH_TOKEN: Chrome->F12->应用程序->存储->扩展存储->Sider:ChatGPT侧边栏->本地->“密钥”栏->token
+
+AUTH_TOKEN: 用于访问本服务的API Key, 用于填写New-API的新建渠道
+SIDER_AUTH_TOKEN: Chrome->F12->应用程序->存储->扩展存储->Sider:ChatGPT侧边栏->本地->“密钥”栏->token
+
 
 ## API 文档
 
-API 文档正在完善中，将很快提供详细的接口说明。
+const MODEL_MAPPING = {
+  "gpt-4o": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "gpt-4o" 
+  },
+  
+endpoint(?)：Chrome->F12->应用程序->存储->扩展存储->Sider:ChatGPT侧边栏->本地->“密钥”栏-> domainPool
+model: Chrome->F12->应用程序->存储->扩展存储->Sider:ChatGPT侧边栏->本地->“密钥”栏-> siderModels -> name
 
 ## 贡献指南
 
