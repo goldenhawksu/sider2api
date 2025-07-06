@@ -149,3 +149,63 @@ model: Chrome->F12->应用程序->存储->扩展存储->Sider:ChatGPT侧边栏->
 ## 联系方式
 
 如有任何问题或建议，请通过 Issue 与我们联系。
+
+
+~~~
+#!/bin/bash
+
+# VPS 部署脚本
+
+# 1. 安装 Deno
+echo "安装 Deno..."
+curl -fsSL https://deno.land/install.sh | sh
+export PATH="$HOME/.deno/bin:$PATH"
+
+# 2. 创建服务目录
+mkdir -p /opt/sider2api
+cd /opt/sider2api
+
+# 3. 下载您的 Deno 服务代码
+# 假设您的代码在 GitHub 上
+# git clone https://github.com/goldenhawksu/sider2api.git .
+# 或者直接复制代码文件
+
+# 4. 设置环境变量
+cat > .env << EOF
+SIDER_AUTH_TOKEN=your_sider_token_here
+AUTH_TOKEN=your_auth_token_here
+PORT=8000
+EOF
+
+# 5. 创建 systemd 服务
+cat > /etc/systemd/system/sider2api.service << EOF
+[Unit]
+Description=Sider2API Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/sider2api
+Environment=SIDER_AUTH_TOKEN=your_sider_token_here
+Environment=AUTH_TOKEN=your_auth_token_here
+Environment=PORT=8000
+ExecStart=/root/.deno/bin/deno run --allow-net --allow-env deno.ts
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 6. 启动服务
+systemctl daemon-reload
+systemctl enable sider2api
+systemctl start sider2api
+
+# 7. 检查服务状态
+systemctl status sider2api
+
+echo "服务已启动，监听端口 8000"
+echo "您可以通过 http://your-vps-ip:8000 访问服务"
+
