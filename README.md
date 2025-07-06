@@ -165,7 +165,7 @@ cd /opt/sider2api
 
 # 3. 下载您的 Deno 服务代码
 # 假设您的代码在 GitHub 上
-# git clone https://github.com/goldenhawksu/sider2api.git .
+git clone https://github.com/goldenhawksu/sider2api.git .
 # 或者直接复制代码文件
 
 # 4. 设置环境变量
