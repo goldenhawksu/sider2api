@@ -12,7 +12,7 @@ origin-main.go 用于在linux terminal 里直接启动运行
 
 main.go+vercel.json+go.mod 用于部署在vercel (不建议，对话会被vercel的免费60s限制截断，导致无法正常运行)
 
-deno.ts 用于在deno.com上部署
+deno.ts 用于在deno.com上部署 (deno_stream.ts是未经完全测试的流式响应支持版本)
 
 socks-main.go是在origin-main.go基础上添加了socks代理功能
 
