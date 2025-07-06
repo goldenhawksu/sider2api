@@ -150,11 +150,9 @@ model: Chrome->F12->应用程序->存储->扩展存储->Sider:ChatGPT侧边栏->
 
 如有任何问题或建议，请通过 Issue 与我们联系。
 
-
+## VPS 部署
 ~~~
 #!/bin/bash
-
-# VPS 部署脚本
 
 # 1. 安装 Deno
 echo "安装 Deno..."
