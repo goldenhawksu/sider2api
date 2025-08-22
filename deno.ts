@@ -30,21 +30,29 @@ const DEFAULT_JSON_TEMPLATE = {
 
 // 简化的模型映射配置
 const MODEL_MAPPING = {
-  "gpt-4o": { 
+  "gpt-4": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "gpt-4o" 
-  },
-  "gpt-4.1": { 
-    endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "gpt-4.1" 
+    model: "gpt-4" 
   },
   "gpt-4.5": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "gpt-4.5" 
   },
-  "gpt-4.1-mini": { 
+  "gpt-5": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "gpt-4.1-mini" 
+    model: "gpt-5" 
+  },
+  "gpt-5-think": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "gpt-5-think" 
+  },
+  "gpt-5-mini": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "gpt-5-mini" 
+  },
+  "claude-3.5-sonnet": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "claude-3.5-sonnet" 
   },
   "claude-3.7-sonnet": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
@@ -58,41 +66,17 @@ const MODEL_MAPPING = {
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "claude-4-sonnet-think" 
   },
-  "claude-4-opus": { 
+  "claude-4.1-opus": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "claude-4-opus" 
+    model: "claude-4.1-opus" 
   },
-  "claude-4-opus-think": { 
+  "claude-4.1-opus-think": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "claude-4-opus-think" 
+    model: "claude-4.1-opus-think" 
   },
   "deepseek-reasoner": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "deepseek-reasoner" 
-  },
-  "o1": { 
-    endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "o1" 
-  },
-  "o3": { 
-    endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "o3" 
-  },
-  "o3-mini": { 
-    endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "o3-mini" 
-  },
-  "o4-mini": { 
-    endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "o4-mini" 
-  },
-  "llama-3.1-405b": { 
-    endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "llama-3.1-405b" 
-  },
-  "gemini-2.0-pro": { 
-    endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "gemini-2.0-pro" 
   },
   "gemini-2.5-pro": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
@@ -109,6 +93,22 @@ const MODEL_MAPPING = {
   "gemini-2.5-flash-think": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "gemini-2.5-flash-think" 
+  },
+  "grok-4": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "grok-4" 
+  },
+  "kimi-k2": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "kimi-k2" 
+  },
+  "llama-3.1-405b": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "llama-3.1-405b" 
+  },
+  "o1-mini": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "o1-mini" 
   }
 };
 
