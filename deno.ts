@@ -76,11 +76,11 @@ const MODEL_MAPPING = {
   },
   "claude-4.5-sonnet": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "claude-4-sonnet" 
+    model: "claude-4.5-sonnet" 
   },
   "claude-4.5-sonnet-think": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "claude-4-sonnet-think" 
+    model: "claude-4.5-sonnet-think" 
   },  
   "deepseek-reasoner": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
