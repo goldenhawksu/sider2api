@@ -74,10 +74,26 @@ const MODEL_MAPPING = {
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "claude-4.1-opus-think" 
   },
+  "claude-4.5-sonnet": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "claude-4-sonnet" 
+  },
+  "claude-4.5-sonnet-think": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "claude-4-sonnet-think" 
+  },  
   "deepseek-reasoner": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "deepseek-reasoner" 
   },
+  "deepseek-v3.1": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "deepseek-v3.1" 
+  },
+  "deepseek-v3.1-think": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "deepseek-v3.1-think" 
+  },  
   "gemini-2.5-pro": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "gemini-2.5-pro" 
