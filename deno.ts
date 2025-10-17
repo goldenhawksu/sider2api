@@ -82,6 +82,14 @@ const MODEL_MAPPING = {
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "claude-4.5-sonnet-think" 
   },  
+  "claude-haiku-4.5": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "claude-haiku-4.5" 
+  },
+  "claude-haiku-4.5-think": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "claude-haiku-4.5-think" 
+  },    
   "deepseek-reasoner": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "deepseek-reasoner" 
