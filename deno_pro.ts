@@ -32,21 +32,16 @@ const DEFAULT_REQUEST_TEMPLATE = {
 // 模型映射配置(扩展版 - 包含更多模型)
 const MODEL_MAPPING: Record<string, string> = {
   // GPT 系列
-  "gpt-4": "gpt-4",
-  "gpt-4o": "gpt-4o",
-  "gpt-4.5": "gpt-4.5",
+  "gpt-4.1": "gpt-4.1",
   "gpt-5": "gpt-5",
   "gpt-5-think": "gpt-5-think",
   "gpt-5-mini": "gpt-5-mini",
-  "o1-mini": "o1-mini",
+  "gpt-5.1": "gpt-5.1",
+  "gpt-5.1-think": "gpt-5.1-think",
 
   // Claude 系列
-  "claude-3.5-sonnet": "claude-3.5-sonnet",
-  "claude-3.7-sonnet": "claude-3.7-sonnet",
-  "claude-4-sonnet": "claude-4-sonnet",
-  "claude-4-sonnet-think": "claude-4-sonnet-think",
-  "claude-4.1-opus": "claude-4.1-opus",
-  "claude-4.1-opus-think": "claude-4.1-opus-think",
+  "laude-opus-4.5": "laude-opus-4.5",
+  "claude-opus-4.5-think": "claude-opus-4.5-think",
   "claude-4.5-sonnet": "claude-4.5-sonnet",
   "claude-4.5-sonnet-think": "claude-4.5-sonnet-think",
   "claude-haiku-4.5": "claude-haiku-4.5",
@@ -58,6 +53,7 @@ const MODEL_MAPPING: Record<string, string> = {
   "gemini-2.5-pro-think": "gemini-2.5-pro-think",
   "gemini-2.5-flash-think": "gemini-2.5-flash-think",
   "gemini-3.0-pro": "gemini-3.0-pro",
+  "gemini-3.0-pro-think": "gemini-3.0-pro-think",
 
   // DeepSeek 系列
   "deepseek-v3.1": "deepseek-v3.1",
