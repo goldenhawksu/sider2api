@@ -75,12 +75,33 @@ const MODEL_MAPPING: Record<string, string> = {
   "sider": "sider"
 };
 
-// 支持的模型列表
+// 模型创建时间 (Unix 时间戳 - 使用 2024-01-01 作为基准)
+const MODEL_CREATED_TIMESTAMP = 1704067200;
+
+// 支持的模型列表 (完全兼容 OpenAI API 格式)
 const MODELS = Object.keys(MODEL_MAPPING).map(modelId => ({
   id: modelId,
   object: "model",
+  created: MODEL_CREATED_TIMESTAMP,
   owned_by: "sider",
-  permission: ["read"]
+  permission: [
+    {
+      id: `modelperm-${modelId}`,
+      object: "model_permission",
+      created: MODEL_CREATED_TIMESTAMP,
+      allow_create_engine: false,
+      allow_sampling: true,
+      allow_logprobs: true,
+      allow_search_indices: false,
+      allow_view: true,
+      allow_fine_tuning: false,
+      organization: "*",
+      group: null,
+      is_blocking: false
+    }
+  ],
+  root: modelId,
+  parent: null
 }));
 
 // 会话存储(用于多轮对话)
