@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.200.0/http/server.ts";
 
 // 默认 JSON 模板
@@ -30,13 +29,9 @@ const DEFAULT_JSON_TEMPLATE = {
 
 // 简化的模型映射配置
 const MODEL_MAPPING = {
-  "gpt-4": { 
+  "gpt-4.1": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "gpt-4" 
-  },
-  "gpt-4.5": { 
-    endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "gpt-4.5" 
+    model: "gpt-4.1" 
   },
   "gpt-5": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
@@ -50,29 +45,21 @@ const MODEL_MAPPING = {
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "gpt-5-mini" 
   },
-  "claude-3.5-sonnet": { 
+  "gpt-5.1": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "claude-3.5-sonnet" 
+    model: "gpt-5.1" 
   },
-  "claude-3.7-sonnet": { 
+  "gpt-5.1-think": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "claude-3.7-sonnet" 
+    model: "gpt-5.1-think" 
   },
-  "claude-4-sonnet": { 
+  "claude-opus-4.5": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "claude-4-sonnet" 
+    model: "claude-opus-4.5" 
   },
-  "claude-4-sonnet-think": { 
+  "claude-opus-4.5-think": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "claude-4-sonnet-think" 
-  },
-  "claude-4.1-opus": { 
-    endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "claude-4.1-opus" 
-  },
-  "claude-4.1-opus-think": { 
-    endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "claude-4.1-opus-think" 
+    model: "claude-opus-4.5-think" 
   },
   "claude-4.5-sonnet": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
@@ -89,7 +76,7 @@ const MODEL_MAPPING = {
   "claude-haiku-4.5-think": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "claude-haiku-4.5-think" 
-  },    
+  },  
   "deepseek-reasoner": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "deepseek-reasoner" 
@@ -118,6 +105,14 @@ const MODEL_MAPPING = {
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "gemini-2.5-flash-think" 
   },
+  "gemini-3.0-pro": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "gemini-3.0-pro" 
+  },
+  "gemini-3.0-pro-think": { 
+    endpoint: "https://api2.sider.ai/api/v3/completion/text",
+    model: "gemini-3.0-pro-think" 
+  },
   "grok-4": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "grok-4" 
@@ -129,10 +124,6 @@ const MODEL_MAPPING = {
   "llama-3.1-405b": { 
     endpoint: "https://api2.sider.ai/api/v3/completion/text",
     model: "llama-3.1-405b" 
-  },
-  "o1-mini": { 
-    endpoint: "https://api2.sider.ai/api/v3/completion/text",
-    model: "o1-mini" 
   }
 };
 
