@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sider2API 管理界面</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      padding: 20px;
+    }
+
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+
+    .header {
+      background: white;
+      padding: 30px;
+      border-radius: 15px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+      margin-bottom: 30px;
+    }
+
+    .header h1 {
+      color: #667eea;
+      margin-bottom: 10px;
+      font-size: 32px;
+    }
+
+    .header p {
+      color: #666;
+      font-size: 14px;
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 20px;
+      margin-bottom: 30px;
+    }
+
+    .stat-card {
+      background: white;
+      padding: 20px;
+      border-radius: 12px;
+      box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+      transition: transform 0.3s ease;
+    }
+
+    .stat-card:hover {
+      transform: translateY(-5px);
+    }
+
+    .stat-card .label {
+      color: #999;
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+
+    .stat-card .value {
+      color: #333;
+      font-size: 28px;
+      font-weight: bold;
+    }
+
+    .card {
+      background: white;
+      padding: 30px;
+      border-radius: 15px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+      margin-bottom: 30px;
+    }
+
+    .card h2 {
+      color: #333;
+      margin-bottom: 20px;
+      font-size: 24px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .card h2::before {
+      content: '';
+      width: 4px;
+      height: 24px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      border-radius: 2px;
+    }
+
+    .btn {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border: none;
+      padding: 12px 24px;
+      border-radius: 8px;
+      font-size: 14px;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+    }
+
+    .btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
+    }
+
+    .btn-secondary {
+      background: #f5f5f5;
+      color: #666;
+      box-shadow: none;
+    }
+
+    .btn-secondary:hover {
+      background: #e0e0e0;
+    }
+
+    .btn-danger {
+      background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+      box-shadow: 0 4px 15px rgba(245, 87, 108, 0.4);
+    }
+
+    .btn-danger:hover {
+      box-shadow: 0 6px 20px rgba(245, 87, 108, 0.6);
+    }
+
+    .model-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 15px;
+      margin-top: 20px;
+    }
+
+    .model-item {
+      background: #f8f9fa;
+      padding: 15px;
+      border-radius: 10px;
+      border-left: 4px solid #667eea;
+      transition: all 0.3s ease;
+    }
+
+    .model-item:hover {
+      background: #e9ecef;
+      transform: translateX(5px);
+    }
+
+    .model-item.custom {
+      border-left-color: #764ba2;
+    }
+
+    .model-item .model-name {
+      font-weight: bold;
+      color: #333;
+      margin-bottom: 5px;
+      font-size: 16px;
+    }
+
+    .model-item .model-info {
+      color: #666;
+      font-size: 12px;
+    }
+
+    .model-item .model-actions {
+      margin-top: 10px;
+      display: flex;
+      gap: 8px;
+    }
+
+    .model-item .model-actions button {
+      padding: 6px 12px;
+      font-size: 12px;
+    }
+
+    .form-group {
+      margin-bottom: 20px;
+    }
+
+    .form-group label {
+      display: block;
+      margin-bottom: 8px;
+      color: #333;
+      font-weight: 500;
+    }
+
+    .form-group input,
+    .form-group select {
+      width: 100%;
+      padding: 12px;
+      border: 2px solid #e0e0e0;
+      border-radius: 8px;
+      font-size: 14px;
+      transition: border-color 0.3s ease;
+    }
+
+    .form-group input:focus,
+    .form-group select:focus {
+      outline: none;
+      border-color: #667eea;
+    }
+
+    .modal {
+      display: none;
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0,0,0,0.6);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+      backdrop-filter: blur(5px);
+    }
+
+    .modal.active {
+      display: flex;
+    }
+
+    .modal-content {
+      background: white;
+      padding: 30px;
+      border-radius: 15px;
+      max-width: 500px;
+      width: 90%;
+      max-height: 80vh;
+      overflow-y: auto;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+    }
+
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+    }
+
+    .modal-header h3 {
+      color: #333;
+      font-size: 22px;
+    }
+
+    .close-btn {
+      background: none;
+      border: none;
+      font-size: 28px;
+      cursor: pointer;
+      color: #999;
+      padding: 0;
+      width: 30px;
+      height: 30px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 50%;
+      transition: all 0.3s ease;
+    }
+
+    .close-btn:hover {
+      background: #f0f0f0;
+      color: #333;
+    }
+
+    .form-actions {
+      display: flex;
+      gap: 10px;
+      justify-content: flex-end;
+      margin-top: 20px;
+    }
+
+    .alert {
+      padding: 12px 16px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      font-size: 14px;
+    }
+
+    .alert-success {
+      background: #d4edda;
+      color: #155724;
+      border-left: 4px solid #28a745;
+    }
+
+    .alert-error {
+      background: #f8d7da;
+      color: #721c24;
+      border-left: 4px solid #dc3545;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: bold;
+      margin-left: 8px;
+    }
+
+    .badge-built-in {
+      background: #e3f2fd;
+      color: #1976d2;
+    }
+
+    .badge-custom {
+      background: #f3e5f5;
+      color: #7b1fa2;
+    }
+
+    .search-box {
+      margin-bottom: 20px;
+    }
+
+    .search-box input {
+      width: 100%;
+      padding: 12px 20px;
+      border: 2px solid #e0e0e0;
+      border-radius: 25px;
+      font-size: 14px;
+      transition: all 0.3s ease;
+    }
+
+    .search-box input:focus {
+      outline: none;
+      border-color: #667eea;
+      box-shadow: 0 0 0 4px rgba(102, 126, 234, 0.1);
+    }
+
+    .tabs {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 20px;
+      border-bottom: 2px solid #e0e0e0;
+    }
+
+    .tab {
+      padding: 12px 24px;
+      background: none;
+      border: none;
+      color: #666;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 500;
+      transition: all 0.3s ease;
+      border-bottom: 3px solid transparent;
+    }
+
+    .tab:hover {
+      color: #667eea;
+    }
+
+    .tab.active {
+      color: #667eea;
+      border-bottom-color: #667eea;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: #999;
+    }
+
+    .empty-state svg {
+      width: 120px;
+      height: 120px;
+      margin-bottom: 20px;
+      opacity: 0.3;
+    }
+
+    @media (max-width: 768px) {
+      .header h1 {
+        font-size: 24px;
+      }
+
+      .model-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .stats {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- 头部 -->
+    <div class="header">
+      <h1>🚀 Sider2API 管理界面</h1>
+      <p>模型映射管理 · 自定义配置 · 服务监控</p>
+    </div>
+
+    <!-- 统计卡片 -->
+    <div class="stats">
+      <div class="stat-card">
+        <div class="label">内置模型</div>
+        <div class="value" id="builtInCount">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">自定义模型</div>
+        <div class="value" id="customCount">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">活跃会话</div>
+        <div class="value" id="sessionCount">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">服务状态</div>
+        <div class="value" style="font-size: 20px; color: #28a745;" id="serviceStatus">运行中</div>
+      </div>
+    </div>
+
+    <!-- 主内容区 -->
+    <div class="card">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+        <h2>模型映射管理</h2>
+        <button class="btn" onclick="openAddModal()">➕ 添加自定义模型</button>
+      </div>
+
+      <!-- 标签页 -->
+      <div class="tabs">
+        <button class="tab active" onclick="switchTab('all')">全部模型</button>
+        <button class="tab" onclick="switchTab('builtin')">内置模型</button>
+        <button class="tab" onclick="switchTab('custom')">自定义模型</button>
+      </div>
+
+      <!-- 搜索框 -->
+      <div class="search-box">
+        <input type="text" id="searchInput" placeholder="🔍 搜索模型名称..." oninput="filterModels()">
+      </div>
+
+      <!-- 模型列表 -->
+      <div class="model-grid" id="modelList"></div>
+    </div>
+  </div>
+
+  <!-- 添加/编辑模型模态框 -->
+  <div class="modal" id="modelModal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 id="modalTitle">添加自定义模型</h3>
+        <button class="close-btn" onclick="closeModal()">&times;</button>
+      </div>
+      <form id="modelForm" onsubmit="saveModel(event)">
+        <div class="form-group">
+          <label for="modelId">模型ID *</label>
+          <input type="text" id="modelId" name="modelId" required placeholder="例如: my-custom-model">
+        </div>
+        <div class="form-group">
+          <label for="modelName">Sider模型名称 *</label>
+          <input type="text" id="modelName" name="modelName" required placeholder="例如: gpt-4o">
+        </div>
+        <div class="form-group">
+          <label for="modelDescription">描述（可选）</label>
+          <input type="text" id="modelDescription" name="modelDescription" placeholder="简短描述此模型的用途">
+        </div>
+        <div class="form-actions">
+          <button type="button" class="btn btn-secondary" onclick="closeModal()">取消</button>
+          <button type="submit" class="btn">保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    let currentTab = 'all';
+    let builtInModels = [];
+    let customModels = [];
+    let editingModel = null;
+
+    // 初始化
+    async function init() {
+      await loadModels();
+      await loadStats();
+      renderModels();
+    }
+
+    // 加载模型列表
+    async function loadModels() {
+      try {
+        const response = await fetch('/api/admin/models');
+        const data = await response.json();
+        builtInModels = data.builtIn || [];
+        customModels = data.custom || [];
+        updateCounts();
+      } catch (error) {
+        console.error('加载模型失败:', error);
+        showAlert('加载模型列表失败', 'error');
+      }
+    }
+
+    // 加载统计信息
+    async function loadStats() {
+      try {
+        const response = await fetch('/api/admin/stats');
+        const data = await response.json();
+        document.getElementById('sessionCount').textContent = data.activeSessions || 0;
+      } catch (error) {
+        console.error('加载统计失败:', error);
+      }
+    }
+
+    // 更新统计数字
+    function updateCounts() {
+      document.getElementById('builtInCount').textContent = builtInModels.length;
+      document.getElementById('customCount').textContent = customModels.length;
+    }
+
+    // 渲染模型列表
+    function renderModels() {
+      const container = document.getElementById('modelList');
+      let models = [];
+
+      if (currentTab === 'all') {
+        models = [...builtInModels.map(m => ({...m, type: 'builtin'})),
+                  ...customModels.map(m => ({...m, type: 'custom'}))];
+      } else if (currentTab === 'builtin') {
+        models = builtInModels.map(m => ({...m, type: 'builtin'}));
+      } else {
+        models = customModels.map(m => ({...m, type: 'custom'}));
+      }
+
+      const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+      if (searchTerm) {
+        models = models.filter(m => m.id.toLowerCase().includes(searchTerm));
+      }
+
+      if (models.length === 0) {
+        container.innerHTML = `
+          <div class="empty-state">
+            <div style="font-size: 48px; margin-bottom: 10px;">📦</div>
+            <p style="font-size: 16px;">暂无模型</p>
+          </div>
+        `;
+        return;
+      }
+
+      container.innerHTML = models.map(model => `
+        <div class="model-item ${model.type}">
+          <div class="model-name">
+            ${model.id}
+            <span class="badge badge-${model.type}">
+              ${model.type === 'builtin' ? '内置' : '自定义'}
+            </span>
+          </div>
+          <div class="model-info">
+            Sider模型: ${model.model || model.name}
+            ${model.description ? `<br>${model.description}` : ''}
+          </div>
+          ${model.type === 'custom' ? `
+            <div class="model-actions">
+              <button class="btn btn-secondary" onclick='editModel(${JSON.stringify(model)})'>编辑</button>
+              <button class="btn btn-danger" onclick='deleteModel("${model.id}")'>删除</button>
+            </div>
+          ` : ''}
+        </div>
+      `).join('');
+    }
+
+    // 切换标签
+    function switchTab(tab) {
+      currentTab = tab;
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      event.target.classList.add('active');
+      renderModels();
+    }
+
+    // 过滤模型
+    function filterModels() {
+      renderModels();
+    }
+
+    // 打开添加模态框
+    function openAddModal() {
+      editingModel = null;
+      document.getElementById('modalTitle').textContent = '添加自定义模型';
+      document.getElementById('modelForm').reset();
+      document.getElementById('modelId').disabled = false;
+      document.getElementById('modelModal').classList.add('active');
+    }
+
+    // 编辑模型
+    function editModel(model) {
+      editingModel = model;
+      document.getElementById('modalTitle').textContent = '编辑自定义模型';
+      document.getElementById('modelId').value = model.id;
+      document.getElementById('modelId').disabled = true;
+      document.getElementById('modelName').value = model.model || model.name;
+      document.getElementById('modelDescription').value = model.description || '';
+      document.getElementById('modelModal').classList.add('active');
+    }
+
+    // 关闭模态框
+    function closeModal() {
+      document.getElementById('modelModal').classList.remove('active');
+    }
+
+    // 保存模型
+    async function saveModel(event) {
+      event.preventDefault();
+      const formData = new FormData(event.target);
+      const model = {
+        id: formData.get('modelId'),
+        model: formData.get('modelName'),
+        description: formData.get('modelDescription')
+      };
+
+      try {
+        const response = await fetch('/api/admin/models', {
+          method: editingModel ? 'PUT' : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(model)
+        });
+
+        if (response.ok) {
+          showAlert(editingModel ? '模型更新成功' : '模型添加成功', 'success');
+          closeModal();
+          await loadModels();
+          renderModels();
+        } else {
+          const error = await response.text();
+          showAlert(`操作失败: ${error}`, 'error');
+        }
+      } catch (error) {
+        console.error('保存模型失败:', error);
+        showAlert('保存失败，请检查网络连接', 'error');
+      }
+    }
+
+    // 删除模型
+    async function deleteModel(modelId) {
+      if (!confirm(`确定要删除模型 "${modelId}" 吗？`)) return;
+
+      try {
+        const response = await fetch(`/api/admin/models/${modelId}`, {
+          method: 'DELETE'
+        });
+
+        if (response.ok) {
+          showAlert('模型删除成功', 'success');
+          await loadModels();
+          renderModels();
+        } else {
+          const error = await response.text();
+          showAlert(`删除失败: ${error}`, 'error');
+        }
+      } catch (error) {
+        console.error('删除模型失败:', error);
+        showAlert('删除失败，请检查网络连接', 'error');
+      }
+    }
+
+    // 显示提示
+    function showAlert(message, type) {
+      const alertDiv = document.createElement('div');
+      alertDiv.className = `alert alert-${type}`;
+      alertDiv.textContent = message;
+      document.querySelector('.card').insertBefore(alertDiv, document.querySelector('.card').firstChild);
+      setTimeout(() => alertDiv.remove(), 3000);
+    }
+
+    // 页面加载时初始化
+    init();
+
+    // 定期刷新统计数据
+    setInterval(loadStats, 30000);
+  </script>
+</body>
+</html>
