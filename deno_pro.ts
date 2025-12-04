@@ -5,9 +5,7 @@ import { serve } from "https://deno.land/std@0.200.0/http/server.ts";
 const SIDER_API_ENDPOINT = "https://sider.ai/api/chat/v1/completions";
 
 // 从环境变量获取 Token,如果没有则使用默认值(仅用于测试)
-const SIDER_AUTH_TOKEN = Deno.env.get("SIDER_AUTH_TOKEN") ||
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoyMzM4NzQsInJlZ2lzdGVyX3R5cGUiOiJvYXV0aDIiLCJhcHBfbmFtZSI6IkNoaXRDaGF0X0Nocm9tZV9FeHQiLCJ0b2tlbl9pZCI6ImY2OGEwMmUzLTE5ZGMtNGZiYS05YTUzLTgwMGQ3MjVmMjIxZCIsImlzcyI6InNpZGVyLmFpIiwiYXVkIjpbIiJdLCJleHAiOjE3Njg5MDMzMzcsIm5iZiI6MTczNzc5OTMzNywiaWF0IjoxNzM3Nzk5MzM3fQ.erTjX1ytFH3bCRGFvyZGnJOoRzKOuChMcFNvgYYXPnE";
-
+const SIDER_AUTH_TOKEN = Deno.env.get("SIDER_AUTH_TOKEN") 
 // 服务端 API 认证 Token(可选)
 const AUTH_TOKEN = Deno.env.get("AUTH_TOKEN");
 
