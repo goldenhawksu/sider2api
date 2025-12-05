@@ -896,6 +896,22 @@ async function handleImageGeneration(req: Request): Promise<Response> {
             console.log(`🔍 [行${lineCount}] 原始 JSON:`, JSON.stringify(siderData).substring(0, 200));
           }
 
+          // 检查 Sider API 错误响应
+          if (siderData.code && siderData.code !== 0) {
+            console.error(`❌ Sider API 错误 [行${lineCount}]:`, {
+              code: siderData.code,
+              msg: siderData.msg
+            });
+
+            // 特殊处理:并发限制错误
+            if (siderData.code === 1101) {
+              throw new Error(`Sider API 限流: ${siderData.msg}。请等待当前请求完成后重试。`);
+            }
+
+            // 其他错误也应该抛出
+            throw new Error(`Sider API 错误 (${siderData.code}): ${siderData.msg}`);
+          }
+
           if (!siderData.data) {
             console.log(`⚠️ [行${lineCount}] 数据缺少 data 字段,跳过`);
             continue;
