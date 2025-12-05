@@ -798,12 +798,33 @@ async function handleImageGeneration(req: Request): Promise<Response> {
     const size = requestBody.size || "1024x1024";  // 支持: 256x256, 512x512, 1024x1024, 1024x1792, 1792x1024
     const quality = requestBody.quality || "standard";  // standard 或 hd
 
-    // response_format 验证 (OpenAI 标准: 只能是 "url" 或 "b64_json")
+    // response_format 验证
     const responseFormat = requestBody.response_format || "url";
-    if (responseFormat !== "url" && responseFormat !== "b64_json") {
+
+    // ⚠️ 暂时禁用 b64_json 格式
+    // Sider CDN 需要特殊的认证机制,标准的 Bearer Token 无法访问
+    // 详见: docs/HTTP403下载错误修复报告_20251205.md
+    if (responseFormat === "b64_json") {
       return new Response(JSON.stringify({
         error: {
-          message: `参数 'response_format' 必须是 'url' 或 'b64_json',收到: '${responseFormat}'`,
+          message: "参数 'response_format' 不支持 'b64_json' 格式。Sider CDN 认证机制限制,暂时只支持 'url' 格式。",
+          type: "invalid_request_error",
+          param: "response_format",
+          code: "b64_json_not_supported"
+        }
+      }), {
+        status: 400,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        }
+      });
+    }
+
+    if (responseFormat !== "url") {
+      return new Response(JSON.stringify({
+        error: {
+          message: `参数 'response_format' 必须是 'url',收到: '${responseFormat}'`,
           type: "invalid_request_error",
           param: "response_format"
         }
@@ -1065,75 +1086,14 @@ async function handleImageGeneration(req: Request): Promise<Response> {
 
     console.log(`✅ 成功收集到 ${imageUrls.length} 个图像`);
 
-    // 根据 response_format 处理响应
-    let responseData;
-
-    if (responseFormat === "b64_json") {
-      // redink 格式: 下载图片并转换为 Base64
-      console.log("📥 下载图片并转换为 Base64 格式...");
-      const b64Images = [];
-
-      for (let i = 0; i < Math.min(imageUrls.length, n); i++) {
-        const imageUrl = imageUrls[i];
-        console.log(`📥 下载图片 ${i + 1}/${n}: ${imageUrl.substring(0, 80)}...`);
-
-        try {
-          // 下载图片 (添加认证头部和请求头绕过 CDN 防盗链)
-          const imageResponse = await fetch(imageUrl, {
-            headers: {
-              "Authorization": `Bearer ${SIDER_AUTH_TOKEN}`,
-              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-              "Referer": "https://sider.ai/",
-              "Origin": "https://sider.ai",
-              "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"
-            }
-          });
-          if (!imageResponse.ok) {
-            throw new Error(`下载失败: HTTP ${imageResponse.status}`);
-          }
-
-          const imageBuffer = await imageResponse.arrayBuffer();
-          const imageBytes = new Uint8Array(imageBuffer);
-
-          // 转换为 Base64
-          const base64String = btoa(String.fromCharCode(...imageBytes));
-          const dataUri = `data:image/png;base64,${base64String}`;
-
-          console.log(`✅ 图片 ${i + 1} 转换完成: ${imageBytes.length} bytes`);
-
-          b64Images.push({
-            b64_json: dataUri,
-            revised_prompt: prompt
-          });
-        } catch (downloadError) {
-          console.error(`❌ 下载图片 ${i + 1} 失败:`, downloadError);
-          // 如果下载失败,继续尝试下一张
-          continue;
-        }
-      }
-
-      if (b64Images.length === 0) {
-        throw new Error("无法下载任何图片");
-      }
-
-      responseData = {
-        created: Math.floor(Date.now() / 1000),
-        data: b64Images
-      };
-
-      console.log(`✅ 成功转换 ${b64Images.length} 张图片为 Base64 格式`);
-
-    } else {
-      // 标准格式: 返回 URL
-      responseData = {
-        created: Math.floor(Date.now() / 1000),
-        data: imageUrls.slice(0, n).map(url => ({
-          url: url,
-          revised_prompt: prompt
-        }))
-      };
-    }
+    // 返回 URL 格式 (b64_json 已禁用)
+    const responseData = {
+      created: Math.floor(Date.now() / 1000),
+      data: imageUrls.slice(0, n).map(url => ({
+        url: url,
+        revised_prompt: prompt
+      }))
+    };
 
     return new Response(JSON.stringify(responseData), {
       headers: {
