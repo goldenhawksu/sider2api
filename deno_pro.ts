@@ -267,6 +267,13 @@ function shouldEnableThinkMode(modelName: string): boolean {
   return modelName.includes("-think");
 }
 
+// ==================== 图像生成互斥锁 ====================
+
+// 图像生成忙碌标志(防止并发请求)
+let isImageGenerating = false;
+let currentGenerationStartTime = 0;
+const IMAGE_GENERATION_TIMEOUT = 180000; // 3分钟超时
+
 // ==================== 认证中间件 ====================
 
 function authMiddleware(handler: (req: Request) => Promise<Response>): (req: Request) => Promise<Response> {
@@ -728,6 +735,39 @@ function handleStreamingResponse(
 
 // 处理图像生成请求(专用端点)
 async function handleImageGeneration(req: Request): Promise<Response> {
+  // ==================== 并发控制:检查是否已有图像生成进行中 ====================
+  if (isImageGenerating) {
+    const elapsedTime = Date.now() - currentGenerationStartTime;
+
+    // 检查是否超时(可能是僵尸锁)
+    if (elapsedTime > IMAGE_GENERATION_TIMEOUT) {
+      console.warn(`⚠️ 检测到超时的图像生成锁,自动释放 (已运行 ${Math.floor(elapsedTime/1000)} 秒)`);
+      isImageGenerating = false;
+    } else {
+      // 拒绝并发请求
+      console.log(`🚫 拒绝并发请求: 已有图像生成进行中 (已运行 ${Math.floor(elapsedTime/1000)} 秒)`);
+      return new Response(JSON.stringify({
+        error: {
+          message: `服务器正在处理其他图像生成请求,请稍后重试。当前请求已运行 ${Math.floor(elapsedTime/1000)} 秒。`,
+          type: "rate_limit_error",
+          code: "concurrent_request_rejected"
+        }
+      }), {
+        status: 429,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+          "Retry-After": "10"
+        }
+      });
+    }
+  }
+
+  // 设置忙碌标志
+  isImageGenerating = true;
+  currentGenerationStartTime = Date.now();
+  console.log(`🔒 设置图像生成锁 (时间戳: ${currentGenerationStartTime})`);
+
   try {
     const requestBody = await req.json();
     console.log("🎨 收到图像生成请求:", requestBody);
@@ -1114,6 +1154,11 @@ async function handleImageGeneration(req: Request): Promise<Response> {
         "Access-Control-Allow-Origin": "*"
       }
     });
+  } finally {
+    // 释放锁 (无论成功还是失败)
+    isImageGenerating = false;
+    const totalTime = Date.now() - currentGenerationStartTime;
+    console.log(`🔓 释放图像生成锁 (总耗时: ${Math.floor(totalTime/1000)} 秒)`);
   }
 }
 
