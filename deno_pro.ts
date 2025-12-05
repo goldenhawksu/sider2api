@@ -782,7 +782,7 @@ async function handleImageGeneration(req: Request): Promise<Response> {
       throw new Error(`Sider API 错误: ${siderResponse.status} - ${errorText}`);
     }
 
-    // 收集图像 URL
+    // 收集图像 URL (改进的流处理逻辑)
     const imageUrls: string[] = [];
     const reader = siderResponse.body?.getReader();
     if (!reader) {
@@ -791,49 +791,155 @@ async function handleImageGeneration(req: Request): Promise<Response> {
 
     const lineReader = new SSELineReader();
     let lineCount = 0;
+    let hasToolCall = false;
+    let hasDoneMarker = false;
+    const maxWaitTime = 60000; // 最多等待60秒
+    const startTime = Date.now();
 
-    for await (const line of lineReader.readLines(reader)) {
-      lineCount++;
-      const trimmedLine = line.trim();
+    console.log("📡 开始读取 SSE 流...");
 
-      if (trimmedLine === '[DONE]') {
-        console.log(`📊 读取完成,共 ${lineCount} 行,找到 ${imageUrls.length} 个图像`);
-        break;
-      }
+    try {
+      for await (const line of lineReader.readLines(reader)) {
+        lineCount++;
+        const trimmedLine = line.trim();
 
-      if (!trimmedLine) continue;
-
-      const dataLine = trimmedLine.startsWith('data:')
-        ? trimmedLine.substring(5).trim()
-        : trimmedLine;
-
-      if (!dataLine) continue;
-
-      try {
-        const siderData = JSON.parse(dataLine);
-
-        // 输出调试信息
-        if (siderData.data) {
-          console.log(`📦 收到数据类型: ${siderData.data.type}`);
+        // 超时检查
+        if (Date.now() - startTime > maxWaitTime) {
+          console.warn("⚠️ 等待超时,停止读取");
+          break;
         }
 
-        if (siderData.data?.type === "file" && siderData.data.file.type === "image") {
-          imageUrls.push(siderData.data.file.url);
-          console.log(`✅ 图像生成成功 (${imageUrls.length}/${n}):`, siderData.data.file.url);
+        if (trimmedLine === '[DONE]') {
+          console.log(`📊 收到 [DONE] 标记 (行 ${lineCount})`);
+          hasDoneMarker = true;
 
-          // 如果已收集足够数量的图像,停止
-          if (imageUrls.length >= n) {
+          // 如果已经有图像了,可以退出
+          if (imageUrls.length > 0) {
+            console.log(`✅ 已收集到 ${imageUrls.length} 个图像,准备结束`);
+            break;
+          }
+
+          // 如果还没有图像,继续等待一小段时间
+          if (hasToolCall) {
+            console.log("⚠️ 已看到工具调用但未收到图像,继续等待...");
+            continue;
+          } else {
+            console.warn("⚠️ 收到 [DONE] 但未看到工具调用,可能图像生成失败");
             break;
           }
         }
-      } catch (parseError) {
-        console.warn(`⚠️ 解析失败 (行${lineCount}):`, dataLine.substring(0, 50));
+
+        if (!trimmedLine) continue;
+
+        const dataLine = trimmedLine.startsWith('data:')
+          ? trimmedLine.substring(5).trim()
+          : trimmedLine;
+
+        if (!dataLine) continue;
+
+        try {
+          const siderData = JSON.parse(dataLine);
+
+          if (!siderData.data) continue;
+
+          const dataType = siderData.data.type;
+          console.log(`📦 [行${lineCount}] 收到数据类型: ${dataType}`);
+
+          switch (dataType) {
+            case "message_start":
+              console.log("🚀 会话开始");
+              break;
+
+            case "tool_call":
+              hasToolCall = true;
+              console.log(`🔧 工具调用: ${siderData.data.tool_call.status}`);
+              if (siderData.data.tool_call.status === "processing") {
+                console.log("⏳ 图像生成中...");
+              }
+              break;
+
+            case "file":
+              if (siderData.data.file.type === "image") {
+                imageUrls.push(siderData.data.file.url);
+                console.log(`✅ 图像生成成功 (${imageUrls.length}/${n}):`, siderData.data.file.url);
+                console.log(`📏 图像尺寸: ${siderData.data.file.width}x${siderData.data.file.height}`);
+
+                // 如果已收集足够数量的图像,可以退出
+                if (imageUrls.length >= n) {
+                  console.log(`✅ 已收集到所需数量 (${n}) 的图像,准备结束`);
+                  break;
+                }
+              }
+              break;
+
+            case "pulse":
+              // 心跳信号,表示还在处理中
+              console.log("💓 心跳信号 (处理中...)");
+              break;
+
+            case "credit_info":
+              console.log("💳 额度信息");
+              break;
+
+            case "text":
+              // 某些情况下可能有文本响应
+              if (siderData.data.text) {
+                console.log("💬 文本内容:", siderData.data.text.substring(0, 50));
+              }
+              break;
+
+            default:
+              console.log(`ℹ️ 未处理的数据类型: ${dataType}`);
+          }
+
+          // 如果已经收集到足够的图像,退出
+          if (imageUrls.length >= n) {
+            console.log(`🎯 目标达成: 收集到 ${imageUrls.length} 个图像`);
+            break;
+          }
+
+        } catch (parseError) {
+          console.warn(`⚠️ 解析失败 (行${lineCount}):`, dataLine.substring(0, 100));
+        }
       }
+
+      console.log(`\n📊 流处理完成统计:`);
+      console.log(`   - 总行数: ${lineCount}`);
+      console.log(`   - 是否有工具调用: ${hasToolCall ? "是" : "否"}`);
+      console.log(`   - 是否收到 [DONE]: ${hasDoneMarker ? "是" : "否"}`);
+      console.log(`   - 收集到的图像数: ${imageUrls.length}`);
+
+    } catch (streamError) {
+      console.error("❌ 流处理错误:", streamError);
+      throw streamError;
     }
 
+    // 增强的错误处理
     if (imageUrls.length === 0) {
-      throw new Error("未能获取生成的图像");
+      // 提供更详细的错误信息
+      let errorMessage = "未能获取生成的图像";
+      const debugInfo = {
+        totalLines: lineCount,
+        hadToolCall: hasToolCall,
+        hadDone: hasDoneMarker,
+        timeElapsed: Date.now() - startTime
+      };
+
+      if (!hasToolCall) {
+        errorMessage += " - 未检测到图像生成工具调用";
+      } else if (hasDoneMarker) {
+        errorMessage += " - 流已正常结束但未收到图像数据";
+      } else {
+        errorMessage += " - 流异常结束";
+      }
+
+      console.error(`❌ ${errorMessage}`);
+      console.error("🔍 调试信息:", debugInfo);
+
+      throw new Error(`${errorMessage}。调试信息: ${JSON.stringify(debugInfo)}`);
     }
+
+    console.log(`✅ 成功收集到 ${imageUrls.length} 个图像`)
 
     // 返回 OpenAI 图像生成格式
     const openAIImageResponse = {
