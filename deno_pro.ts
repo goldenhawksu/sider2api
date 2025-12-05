@@ -978,6 +978,11 @@ async function handleImageGeneration(req: Request): Promise<Response> {
           }
 
         } catch (parseError) {
+          // 如果是我们主动抛出的 API 错误,需要重新抛出
+          if (parseError instanceof Error && parseError.message.includes('Sider API')) {
+            throw parseError;
+          }
+          // 否则是 JSON 解析错误,记录警告后继续
           console.warn(`⚠️ 解析失败 (行${lineCount}):`, dataLine.substring(0, 100));
         }
       }
