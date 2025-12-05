@@ -732,17 +732,62 @@ async function handleImageGeneration(req: Request): Promise<Response> {
     const requestBody = await req.json();
     console.log("🎨 收到图像生成请求:", requestBody);
 
-    const prompt = requestBody.prompt || "";
-    const model = requestBody.model || "sider";
-    const n = requestBody.n || 1;
-    const size = requestBody.size || "1024x1024";
-    const quality = requestBody.quality || "standard";
+    // ==================== 参数验证和标准化 (OpenAI API 兼容) ====================
 
-    // 构建 Sider 请求
+    // 必需参数
+    const prompt = requestBody.prompt;
+    if (!prompt || typeof prompt !== "string" || prompt.trim() === "") {
+      return new Response(JSON.stringify({
+        error: {
+          message: "参数 'prompt' 是必需的,且必须是非空字符串",
+          type: "invalid_request_error",
+          param: "prompt"
+        }
+      }), {
+        status: 400,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        }
+      });
+    }
+
+    // 可选参数 - 完全符合 OpenAI 标准
+    const model = requestBody.model || "dall-e-3";  // 默认模型
+    const n = Math.min(Math.max(parseInt(requestBody.n) || 1, 1), 10);  // 1-10 之间
+    const size = requestBody.size || "1024x1024";  // 支持: 256x256, 512x512, 1024x1024, 1024x1792, 1792x1024
+    const quality = requestBody.quality || "standard";  // standard 或 hd
+
+    // response_format 验证 (OpenAI 标准: 只能是 "url" 或 "b64_json")
+    const responseFormat = requestBody.response_format || "url";
+    if (responseFormat !== "url" && responseFormat !== "b64_json") {
+      return new Response(JSON.stringify({
+        error: {
+          message: `参数 'response_format' 必须是 'url' 或 'b64_json',收到: '${responseFormat}'`,
+          type: "invalid_request_error",
+          param: "response_format"
+        }
+      }), {
+        status: 400,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        }
+      });
+    }
+
+    console.log("✅ 参数验证通过:", {
+      model, n, size, quality, responseFormat,
+      promptLength: prompt.length
+    });
+
+    // ==================== 构建 Sider 请求 ====================
+
     const siderRequest = JSON.parse(JSON.stringify(DEFAULT_REQUEST_TEMPLATE));
 
-    // 为专用图像接口添加明确的图像生成指令
-    const imagePrompt = `画一张图片: ${prompt}`;
+    // ✅ 优化: 强化图像生成提示词,确保 100% 触发工具调用
+    // 使用明确的图像生成指令 + 原始提示词
+    const imagePrompt = `请使用图像生成工具创建图片。图片内容: ${prompt}`;
 
     siderRequest.multi_content = [{
       type: "text",
@@ -750,11 +795,13 @@ async function handleImageGeneration(req: Request): Promise<Response> {
       user_input_text: imagePrompt
     }];
 
+    // ✅ 优化: 设置工具配置,强制使用图像生成工具
     siderRequest.tools = {
       image: {
         quality_level: quality === "hd" ? "nano_banana_pro" : "nano_banana"
       },
-      auto: ["create_image", "data_analysis", "search"]
+      // 将 create_image 放在第一位,提高优先级
+      auto: ["create_image"]
     };
 
     siderRequest.model = MODEL_MAPPING[model] || "sider";
@@ -939,18 +986,70 @@ async function handleImageGeneration(req: Request): Promise<Response> {
       throw new Error(`${errorMessage}。调试信息: ${JSON.stringify(debugInfo)}`);
     }
 
-    console.log(`✅ 成功收集到 ${imageUrls.length} 个图像`)
+    console.log(`✅ 成功收集到 ${imageUrls.length} 个图像`);
 
-    // 返回 OpenAI 图像生成格式
-    const openAIImageResponse = {
-      created: Math.floor(Date.now() / 1000),
-      data: imageUrls.slice(0, n).map(url => ({
-        url: url,
-        revised_prompt: prompt // OpenAI 会返回修改后的提示词,这里直接返回原始的
-      }))
-    };
+    // 根据 response_format 处理响应
+    let responseData;
 
-    return new Response(JSON.stringify(openAIImageResponse), {
+    if (responseFormat === "b64_json") {
+      // redink 格式: 下载图片并转换为 Base64
+      console.log("📥 下载图片并转换为 Base64 格式...");
+      const b64Images = [];
+
+      for (let i = 0; i < Math.min(imageUrls.length, n); i++) {
+        const imageUrl = imageUrls[i];
+        console.log(`📥 下载图片 ${i + 1}/${n}: ${imageUrl.substring(0, 80)}...`);
+
+        try {
+          // 下载图片
+          const imageResponse = await fetch(imageUrl);
+          if (!imageResponse.ok) {
+            throw new Error(`下载失败: HTTP ${imageResponse.status}`);
+          }
+
+          const imageBuffer = await imageResponse.arrayBuffer();
+          const imageBytes = new Uint8Array(imageBuffer);
+
+          // 转换为 Base64
+          const base64String = btoa(String.fromCharCode(...imageBytes));
+          const dataUri = `data:image/png;base64,${base64String}`;
+
+          console.log(`✅ 图片 ${i + 1} 转换完成: ${imageBytes.length} bytes`);
+
+          b64Images.push({
+            b64_json: dataUri,
+            revised_prompt: prompt
+          });
+        } catch (downloadError) {
+          console.error(`❌ 下载图片 ${i + 1} 失败:`, downloadError);
+          // 如果下载失败,继续尝试下一张
+          continue;
+        }
+      }
+
+      if (b64Images.length === 0) {
+        throw new Error("无法下载任何图片");
+      }
+
+      responseData = {
+        created: Math.floor(Date.now() / 1000),
+        data: b64Images
+      };
+
+      console.log(`✅ 成功转换 ${b64Images.length} 张图片为 Base64 格式`);
+
+    } else {
+      // 标准格式: 返回 URL
+      responseData = {
+        created: Math.floor(Date.now() / 1000),
+        data: imageUrls.slice(0, n).map(url => ({
+          url: url,
+          revised_prompt: prompt
+        }))
+      };
+    }
+
+    return new Response(JSON.stringify(responseData), {
       headers: {
         "Content-Type": "application/json",
         "Access-Control-Allow-Origin": "*"
