@@ -806,6 +806,12 @@ async function handleImageGeneration(req: Request): Promise<Response> {
     siderRequest.stream = true; // 图像生成必须使用流式以接收图像
 
     console.log("🚀 发送图像生成请求到 Sider");
+    console.log("📋 请求配置:", {
+      tools: siderRequest.tools,
+      model: siderRequest.model,
+      stream: siderRequest.stream,
+      promptLength: imagePrompt.length
+    });
 
     const siderResponse = await fetch(SIDER_API_ENDPOINT, {
       method: "POST",
@@ -885,7 +891,15 @@ async function handleImageGeneration(req: Request): Promise<Response> {
         try {
           const siderData = JSON.parse(dataLine);
 
-          if (!siderData.data) continue;
+          // 🐛 调试: 打印完整 JSON 结构
+          if (lineCount <= 10) {
+            console.log(`🔍 [行${lineCount}] 原始 JSON:`, JSON.stringify(siderData).substring(0, 200));
+          }
+
+          if (!siderData.data) {
+            console.log(`⚠️ [行${lineCount}] 数据缺少 data 字段,跳过`);
+            continue;
+          }
 
           const dataType = siderData.data.type;
           console.log(`📦 [行${lineCount}] 收到数据类型: ${dataType}`);
@@ -897,9 +911,13 @@ async function handleImageGeneration(req: Request): Promise<Response> {
 
             case "tool_call":
               hasToolCall = true;
-              console.log(`🔧 工具调用: ${siderData.data.tool_call.status}`);
+              console.log(`🔧 工具调用: ${siderData.data.tool_call.status} (hasToolCall 已设置为 true)`);
               if (siderData.data.tool_call.status === "processing") {
                 console.log("⏳ 图像生成中...");
+              } else if (siderData.data.tool_call.status === "start") {
+                console.log("🎬 工具调用已启动");
+              } else if (siderData.data.tool_call.status === "finish") {
+                console.log("✅ 工具调用已完成");
               }
               break;
 
