@@ -1001,8 +1001,15 @@ async function handleImageGeneration(req: Request): Promise<Response> {
         console.log(`📥 下载图片 ${i + 1}/${n}: ${imageUrl.substring(0, 80)}...`);
 
         try {
-          // 下载图片
-          const imageResponse = await fetch(imageUrl);
+          // 下载图片 (添加请求头绕过 CDN 防盗链)
+          const imageResponse = await fetch(imageUrl, {
+            headers: {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+              "Referer": "https://sider.ai/",
+              "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"
+            }
+          });
           if (!imageResponse.ok) {
             throw new Error(`下载失败: HTTP ${imageResponse.status}`);
           }
