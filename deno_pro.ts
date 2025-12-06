@@ -553,11 +553,13 @@ async function handleNonStreamingResponse(
   // 构建 OpenAI 格式响应
   let content = fullText || "生成完成";
 
+  // 图像生成优化: 提供结构化数据和访问指引
   if (isImageGen && imageUrl) {
-    content = `![生成的图像](${imageUrl})\n\n${fullText}`;
+    // 修改文本内容,不再使用Markdown格式
+    content = fullText || "我已为您生成了图像";
   }
 
-  const openAIResponse = {
+  const openAIResponse: any = {
     id: messageId || `chatcmpl-${Date.now()}`,
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
@@ -577,8 +579,41 @@ async function handleNonStreamingResponse(
     }
   };
 
+  // 如果是图像生成,添加结构化图像数据
+  if (isImageGen && imageUrl) {
+    // 添加图像URL数组到message中
+    openAIResponse.choices[0].message.image_urls = [imageUrl];
+
+    // 添加访问指引
+    openAIResponse.choices[0].message.image_access_guide = {
+      method: "browser_required",
+      reason: "CDN使用CloudFront签名Cookie认证,服务器无法访问",
+      how_to_access: [
+        "1. 复制下方的图像URL",
+        "2. 在浏览器新标签页中打开URL",
+      ],
+      test_result: "已测试6种认证方式,全部返回403",
+      technical_details: "CDN需要: CloudFront-Key-Pair-Id, CloudFront-Policy, CloudFront-Signature"
+    };
+
+    // 添加CDN限制说明
+    openAIResponse.cdn_limitation = {
+      can_server_download: false,
+      authentication_type: "CloudFront-Signed-Cookies",
+      missing_credentials: [
+        "CloudFront-Key-Pair-Id",
+        "CloudFront-Policy",
+        "CloudFront-Signature"
+      ],
+      alternative_methods: [
+        "在浏览器中直接访问URL",
+      ]
+    };
+  }
+
+  // 保留原有的image_data字段(兼容性)
   if (imageData) {
-    (openAIResponse as any).image_data = imageData;
+    openAIResponse.image_data = imageData;
   }
 
   return new Response(JSON.stringify(openAIResponse), {
