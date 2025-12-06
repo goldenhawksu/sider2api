@@ -587,10 +587,12 @@ async function handleNonStreamingResponse(
     // 添加访问指引
     openAIResponse.choices[0].message.image_access_guide = {
       method: "browser_required",
-      reason: "CDN使用CloudFront签名Cookie认证,服务器无法访问",
+      reason: "Sider CDN使用CloudFront签名Cookie认证,服务器无法访问",
       how_to_access: [
         "1. 复制下方的图像URL",
         "2. 在浏览器新标签页中打开URL",
+        "3. 如已登录Sider插件,图像将正常显示",
+        "4. 也可访问 sider.ai 查看生成历史"
       ],
       test_result: "已测试6种认证方式,全部返回403",
       technical_details: "CDN需要: CloudFront-Key-Pair-Id, CloudFront-Policy, CloudFront-Signature"
@@ -606,7 +608,9 @@ async function handleNonStreamingResponse(
         "CloudFront-Signature"
       ],
       alternative_methods: [
-        "在浏览器中直接访问URL",
+        "在浏览器中直接访问URL(需登录Sider插件)",
+        "访问Sider官网查看生成历史",
+        "使用Sider官方客户端"
       ]
     };
   }
@@ -646,6 +650,8 @@ function handleStreamingResponse(
       const lineReader = new SSELineReader();
       const encoder = new TextEncoder();
       let hasStarted = false;
+      let imageUrls: string[] = [];  // 收集图像URL
+      let imageDataList: any[] = [];  // 收集图像数据
 
       try {
         for await (const line of lineReader.readLines(reader)) {
@@ -657,6 +663,55 @@ function handleStreamingResponse(
             : trimmedLine;
 
           if (dataLine === '[DONE]') {
+            // 如果是图像生成且收集到了图像,在DONE前发送元数据chunk
+            if (isImageGen && imageUrls.length > 0) {
+              const metadataChunk = {
+                id: `chatcmpl-${Date.now()}`,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: modelName,
+                choices: [{
+                  delta: {
+                    // 不添加content,仅添加元数据
+                  },
+                  finish_reason: null,
+                  index: 0
+                }],
+                // 添加图像元数据
+                image_urls: imageUrls,
+                image_access_guide: {
+                  method: "browser_required",
+                  reason: "Sider CDN使用CloudFront签名Cookie认证,服务器无法访问",
+                  how_to_access: [
+                    "1. 复制下方的图像URL",
+                    "2. 在浏览器新标签页中打开URL",
+                    "3. 如已登录Sider插件,图像将正常显示",
+                    "4. 也可访问 sider.ai 查看生成历史"
+                  ],
+                  test_result: "已测试6种认证方式,全部返回403",
+                  technical_details: "CDN需要: CloudFront-Key-Pair-Id, CloudFront-Policy, CloudFront-Signature"
+                },
+                cdn_limitation: {
+                  can_server_download: false,
+                  authentication_type: "CloudFront-Signed-Cookies",
+                  missing_credentials: [
+                    "CloudFront-Key-Pair-Id",
+                    "CloudFront-Policy",
+                    "CloudFront-Signature"
+                  ],
+                  alternative_methods: [
+                    "在浏览器中直接访问URL(需登录Sider插件)",
+                    "访问Sider官网查看生成历史",
+                    "使用Sider官方客户端"
+                  ]
+                },
+                image_data: imageDataList.length > 0 ? imageDataList : undefined
+              };
+
+              const metaChunk = `data: ${JSON.stringify(metadataChunk)}\n\n`;
+              controller.enqueue(encoder.encode(metaChunk));
+            }
+
             controller.enqueue(encoder.encode("data: [DONE]\n\n"));
             controller.close();
             return;
@@ -706,7 +761,14 @@ function handleStreamingResponse(
 
               case "file":
                 if (siderData.data.file.type === "image") {
-                  console.log("🖼️ 流式收到图像:", siderData.data.file.url);
+                  const imageUrl = siderData.data.file.url;
+                  console.log("🖼️ 流式收到图像:", imageUrl);
+
+                  // 收集图像URL和数据,不再发送Markdown
+                  imageUrls.push(imageUrl);
+                  imageDataList.push(siderData.data.file);
+
+                  // 发送文本提示而非Markdown
                   openAIChunk = {
                     id: `chatcmpl-${Date.now()}`,
                     object: "chat.completion.chunk",
@@ -714,7 +776,7 @@ function handleStreamingResponse(
                     model: modelName,
                     choices: [{
                       delta: {
-                        content: `\n![生成的图像](${siderData.data.file.url})\n`
+                        content: `\n我已为您生成了图像\n`
                       },
                       finish_reason: null,
                       index: 0
