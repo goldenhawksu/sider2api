@@ -5,7 +5,7 @@ import { serve } from "https://deno.land/std@0.200.0/http/server.ts";
 const SIDER_API_ENDPOINT = "https://sider.ai/api/chat/v1/completions";
 
 // 从环境变量获取 Token,如果没有则使用默认值(仅用于测试)
-const SIDER_AUTH_TOKEN = Deno.env.get("SIDER_AUTH_TOKEN") 
+const SIDER_AUTH_TOKEN = Deno.env.get("SIDER_AUTH_TOKEN")
 // 服务端 API 认证 Token(可选)
 const AUTH_TOKEN = Deno.env.get("AUTH_TOKEN");
 
@@ -710,9 +710,15 @@ function handleStreamingResponse(
 
               const metaChunk = `data: ${JSON.stringify(metadataChunk)}\n\n`;
               controller.enqueue(encoder.encode(metaChunk));
+
+              // 等待一小段时间确保数据被flush到网络
+              await new Promise(resolve => setTimeout(resolve, 100));
             }
 
             controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+
+            // 在关闭前再次等待确保所有数据都已flush
+            await new Promise(resolve => setTimeout(resolve, 50));
             controller.close();
             return;
           }
