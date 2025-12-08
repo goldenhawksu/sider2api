@@ -553,10 +553,9 @@ async function handleNonStreamingResponse(
   // 构建 OpenAI 格式响应
   let content = fullText || "生成完成";
 
-  // 图像生成优化: 提供结构化数据和访问指引
+  // 图像生成优化: 在文本中添加Markdown格式的图片URL (双保险)
   if (isImageGen && imageUrl) {
-    // 修改文本内容,不再使用Markdown格式
-    content = fullText || "我已为您生成了图像";
+    content = `${fullText || "我已为您生成了图像"}\n\n![图片](${imageUrl})`;
   }
 
   const openAIResponse: any = {
@@ -768,13 +767,12 @@ function handleStreamingResponse(
               case "file":
                 if (siderData.data.file.type === "image") {
                   const imageUrl = siderData.data.file.url;
-                  console.log("🖼️ 流式收到图像:", imageUrl);
 
-                  // 收集图像URL和数据,不再发送Markdown
+                  // 收集图像URL和数据
                   imageUrls.push(imageUrl);
                   imageDataList.push(siderData.data.file);
 
-                  // 发送文本提示而非Markdown
+                  // 发送文本提示 + Markdown格式的图片URL (双保险)
                   openAIChunk = {
                     id: `chatcmpl-${Date.now()}`,
                     object: "chat.completion.chunk",
@@ -782,7 +780,7 @@ function handleStreamingResponse(
                     model: modelName,
                     choices: [{
                       delta: {
-                        content: `\n我已为您生成了图像\n`
+                        content: `\n我已为您生成了图像\n\n![图片](${imageUrl})\n`
                       },
                       finish_reason: null,
                       index: 0
