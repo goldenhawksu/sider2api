@@ -54,6 +54,8 @@ const MODEL_MAPPING: Record<string, string> = {
   "gemini-2.5-flash": "gemini-2.5-flash",
   "gemini-2.5-pro-think": "gemini-2.5-pro-think",
   "gemini-2.5-flash-think": "gemini-2.5-flash-think",
+  "gemini-3.0-flash": "gemini-3.0-flash",
+  "gemini-3.0-flash-think": "gemini-3.0-flash-think",
   "gemini-3.0-pro": "gemini-3.0-pro",
   "gemini-3.0-pro-think": "gemini-3.0-pro-think",
 
