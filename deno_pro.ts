@@ -42,8 +42,10 @@ const MODEL_MAPPING: Record<string, string> = {
   "gpt-5.2-think": "gpt-5.2-think",  
 
   // Claude 系列
-  "claude-opus-4.5": "claude-opus-4.5",
-  "claude-opus-4.5-think": "claude-opus-4.5-think",
+  "claude-opus-4.5": "claude-opus-4.6",
+  "claude-opus-4.5-think": "claude-opus-4.6-think",
+  "claude-opus-4.6": "claude-opus-4.6",
+  "claude-opus-4.6-think": "claude-opus-4.6-think",
   "claude-4.5-sonnet": "claude-4.5-sonnet",
   "claude-4.5-sonnet-think": "claude-4.5-sonnet-think",
   "claude-haiku-4.5": "claude-haiku-4.5",
@@ -60,8 +62,8 @@ const MODEL_MAPPING: Record<string, string> = {
   "gemini-3.0-pro-think": "gemini-3.0-pro-think",
 
   // DeepSeek 系列
-  "deepseek-v3.1": "deepseek-v3.1",
-  "deepseek-v3.1-think": "deepseek-v3.1-think",
+  "deepseek-v3.2": "deepseek-v3.2",
+  "deepseek-v3.2-think": "deepseek-v3.2-think",
   "deepseek-reasoner": "deepseek-reasoner",
 
   // 其他模型
