@@ -48,6 +48,8 @@ const MODEL_MAPPING: Record<string, string> = {
   "claude-opus-4.6-think": "claude-opus-4.6-think",
   "claude-4.5-sonnet": "claude-4.5-sonnet",
   "claude-4.5-sonnet-think": "claude-4.5-sonnet-think",
+  "claude-4.6-sonnet": "claude-4.6-sonnet",
+  "claude-4.6-sonnet-think": "claude-4.6-sonnet-think",  
   "claude-haiku-4.5": "claude-haiku-4.5",
   "claude-haiku-4.5-think": "claude-haiku-4.5-think",
 
@@ -60,7 +62,9 @@ const MODEL_MAPPING: Record<string, string> = {
   "gemini-3.0-flash-think": "gemini-3.0-flash-think",
   "gemini-3.0-pro": "gemini-3.0-pro",
   "gemini-3.0-pro-think": "gemini-3.0-pro-think",
-
+  "gemini-3.1-pro": "gemini-3.1-pro",
+  "gemini-3.1-pro-think": "gemini-3.1-pro-think",
+  
   // DeepSeek 系列
   "deepseek-v3.2": "deepseek-v3.2",
   "deepseek-v3.2-think": "deepseek-v3.2-think",
@@ -68,6 +72,9 @@ const MODEL_MAPPING: Record<string, string> = {
 
   // 其他模型
   "grok-4": "grok-4",
+  "glm-5": "glm-5",
+  "glm-5-think": "glm-5-think",
+  "qwen3-max": "qwen3-max",  
   "kimi-k2": "kimi-k2",
   "llama-3.1-405b": "llama-3.1-405b",
 
