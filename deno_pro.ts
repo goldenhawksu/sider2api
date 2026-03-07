@@ -38,8 +38,8 @@ const MODEL_MAPPING: Record<string, string> = {
   "gpt-5-mini": "gpt-5-mini",
   "gpt-5.1": "gpt-5.1",
   "gpt-5.1-think": "gpt-5.1-think",
-  "gpt-5.2": "gpt-5.2",
-  "gpt-5.2-think": "gpt-5.2-think",  
+  "gpt-5.4": "gpt-5.4",
+  "gpt-5.4-think": "gpt-5.4-think",  
 
   // Claude 系列
   "claude-opus-4.5": "claude-opus-4.6",
