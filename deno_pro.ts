@@ -379,7 +379,36 @@ async function handleChatCompletion(req: Request): Promise<Response> {
     const isStreaming = requestBody.stream ?? false;
     const messages = requestBody.messages || [];
     const lastMessage = messages[messages.length - 1];
-    const userPrompt = lastMessage?.content || "";
+
+    // OpenAI-compatible: `message.content` can be either a string or an array of content blocks.
+    // Some clients (e.g., newer OpenClaw versions) send: [{"type":"text","text":"..."}, ...]
+    // We keep this gateway backward-compatible by flattening array content into a single string.
+    function flattenMessageContent(content: any): string {
+      if (typeof content === "string") return content;
+      if (!content) return "";
+
+      // If content is an array of blocks, concatenate all text blocks.
+      if (Array.isArray(content)) {
+        return content
+          .map((part) => {
+            if (!part) return "";
+            if (typeof part === "string") return part;
+            if (part.type === "text" && typeof part.text === "string") return part.text;
+            // Some clients may use {type:"input_text", text:"..."}
+            if ((part.type === "input_text" || part.type === "inputText") && typeof part.text === "string") return part.text;
+            // Unknown block types (images/tool calls/etc.) are ignored for prompt flattening.
+            return "";
+          })
+          .filter(Boolean)
+          .join("\n");
+      }
+
+      // Fallback: common shapes
+      if (typeof content.text === "string") return content.text;
+      return String(content);
+    }
+
+    const userPrompt = flattenMessageContent(lastMessage?.content);
 
     // 获取或创建会话ID(从请求头或生成新的)
     const sessionId = req.headers.get("X-Session-ID") || `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
