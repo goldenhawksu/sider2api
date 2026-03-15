@@ -9,6 +9,12 @@ const SIDER_AUTH_TOKEN = Deno.env.get("SIDER_AUTH_TOKEN")
 // 服务端 API 认证 Token(可选)
 const AUTH_TOKEN = Deno.env.get("AUTH_TOKEN");
 
+// ==================== 性能/兼容性开关 ====================
+// 上游请求超时(毫秒) - 避免长时间挂起放大尾延迟
+const UPSTREAM_TIMEOUT_MS = parseInt(Deno.env.get("UPSTREAM_TIMEOUT_MS") || "60000", 10);
+// 是否默认启用自动搜索(会显著影响 TTFT/长尾)
+const ENABLE_AUTO_SEARCH = (Deno.env.get("ENABLE_AUTO_SEARCH") || "false").toLowerCase() === "true";
+
 // 默认请求模板(基于真实成功的抓包数据)
 const DEFAULT_REQUEST_TEMPLATE = {
   "stream": true,
@@ -280,6 +286,13 @@ function shouldEnableThinkMode(modelName: string): boolean {
   return modelName.includes("-think");
 }
 
+// Decide whether to enable upstream auto-search for this prompt.
+// Default is OFF (reduces TTFT/long-tail), but can be enabled globally or by keyword.
+function shouldEnableAutoSearch(prompt: string): boolean {
+  if (ENABLE_AUTO_SEARCH) return true;
+  return /\b(search|查一下|查询|搜索|找一下|最新|新闻|link|citation|来源)\b/i.test(prompt);
+}
+
 // ==================== 图像生成互斥锁 ====================
 
 // 图像生成忙碌标志(防止并发请求)
@@ -456,8 +469,9 @@ async function handleChatCompletion(req: Request): Promise<Response> {
         auto: ["create_image", "data_analysis", "search"]
       };
     } else {
+      const enableSearch = shouldEnableAutoSearch(userPrompt);
       siderRequest.tools = {
-        auto: ["search", "data_analysis"]
+        auto: enableSearch ? ["search", "data_analysis"] : ["data_analysis"]
       };
     }
 
@@ -469,9 +483,13 @@ async function handleChatCompletion(req: Request): Promise<Response> {
       hasCid: !!siderRequest.cid
     });
 
-    // 发送请求
+    // 发送请求 (带超时控制，避免长时间挂起放大尾延迟)
+    const upstreamController = new AbortController();
+    const upstreamTimeout = setTimeout(() => upstreamController.abort(), UPSTREAM_TIMEOUT_MS);
+
     const siderResponse = await fetch(SIDER_API_ENDPOINT, {
       method: "POST",
+      signal: upstreamController.signal,
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${SIDER_AUTH_TOKEN}`,
@@ -484,6 +502,8 @@ async function handleChatCompletion(req: Request): Promise<Response> {
       },
       body: JSON.stringify(siderRequest)
     });
+
+    clearTimeout(upstreamTimeout);
 
     if (!siderResponse.ok) {
       const errorText = await siderResponse.text();
@@ -691,6 +711,8 @@ function handleStreamingResponse(
       const lineReader = new SSELineReader();
       const encoder = new TextEncoder();
       let hasStarted = false;
+      let firstChunkAt: number | null = null;
+      const streamT0 = Date.now();
       let imageUrls: string[] = [];  // 收集图像URL
       let imageDataList: any[] = [];  // 收集图像数据
 
@@ -791,6 +813,10 @@ function handleStreamingResponse(
                 if (!hasStarted) {
                   hasStarted = true;
                 }
+                if (firstChunkAt === null) {
+                  firstChunkAt = Date.now();
+                  console.log("⏱️ TTFT(ms):", firstChunkAt - streamT0);
+                }
                 openAIChunk = {
                   id: `chatcmpl-${Date.now()}`,
                   object: "chat.completion.chunk",
@@ -814,6 +840,10 @@ function handleStreamingResponse(
                   imageUrls.push(imageUrl);
                   imageDataList.push(siderData.data.file);
 
+                  if (firstChunkAt === null) {
+                    firstChunkAt = Date.now();
+                    console.log("⏱️ TTFT(ms):", firstChunkAt - streamT0);
+                  }
                   // 发送文本提示 + Markdown格式的图片URL (双保险)
                   openAIChunk = {
                     id: `chatcmpl-${Date.now()}`,
@@ -1017,8 +1047,12 @@ async function handleImageGeneration(req: Request): Promise<Response> {
       promptLength: imagePrompt.length
     });
 
+    const imgUpstreamController = new AbortController();
+    const imgUpstreamTimeout = setTimeout(() => imgUpstreamController.abort(), UPSTREAM_TIMEOUT_MS);
+
     const siderResponse = await fetch(SIDER_API_ENDPOINT, {
       method: "POST",
+      signal: imgUpstreamController.signal,
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${SIDER_AUTH_TOKEN}`,
@@ -1030,6 +1064,8 @@ async function handleImageGeneration(req: Request): Promise<Response> {
       },
       body: JSON.stringify(siderRequest)
     });
+
+    clearTimeout(imgUpstreamTimeout);
 
     if (!siderResponse.ok) {
       const errorText = await siderResponse.text();
