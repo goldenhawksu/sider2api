@@ -14,6 +14,8 @@ const AUTH_TOKEN = Deno.env.get("AUTH_TOKEN");
 const UPSTREAM_TIMEOUT_MS = parseInt(Deno.env.get("UPSTREAM_TIMEOUT_MS") || "60000", 10);
 // 是否默认启用自动搜索(会显著影响 TTFT/长尾)
 const ENABLE_AUTO_SEARCH = (Deno.env.get("ENABLE_AUTO_SEARCH") || "true").toLowerCase() === "true";
+// Sider API 对 text/user_input_text 字段的字符上限，预留 500 字节安全余量
+const SIDER_MAX_CHARS = 49500;
 
 // 默认请求模板(基于真实成功的抓包数据)
 const DEFAULT_REQUEST_TEMPLATE = {
@@ -444,39 +446,67 @@ async function handleChatCompletion(req: Request): Promise<Response> {
 
     // 将完整的 messages[] 历史拼接为上下文，解决多轮对话上下文丢失问题。
     // 标准 OpenAI 客户端每轮都会携带完整历史，代理需全量注入而非只取最后一条。
+    // 优先级：system > 当前问题 > 历史（从最新往最旧填充），严格遵守 SIDER_MAX_CHARS 上限。
     function buildFullContext(msgs: any[]): string {
       if (!msgs || msgs.length === 0) return "";
 
-      // 仅有一条消息时直接返回，避免无意义的格式包装
+      const SEP = "\n\n---\n\n";
       const nonSystemMsgs = msgs.filter(m => m.role !== "system");
+
+      // 仅有一条消息且无 system 时直接返回
       if (nonSystemMsgs.length <= 1 && !msgs.find(m => m.role === "system")) {
         return flattenMessageContent(msgs[0]?.content || "");
       }
 
-      const parts: string[] = [];
-
-      // 1. 系统指令（system message）
+      // 固定部分：system（最高优先级）
       const systemMsg = msgs.find(m => m.role === "system");
-      if (systemMsg) {
-        const text = flattenMessageContent(systemMsg.content);
-        if (text) parts.push(`[System]\n${text}`);
-      }
+      const systemPart = systemMsg
+        ? `[System]\n${flattenMessageContent(systemMsg.content)}`
+        : "";
 
-      // 2. 历史对话（除最后一条用户消息外的全部轮次）
-      const historyMsgs = nonSystemMsgs.slice(0, -1);
-      if (historyMsgs.length > 0) {
-        const history = historyMsgs.map(m => {
-          const role = m.role === "assistant" ? "Assistant" : "User";
-          return `${role}: ${flattenMessageContent(m.content)}`;
-        }).join("\n\n");
-        parts.push(`[Conversation History]\n${history}`);
-      }
-
-      // 3. 当前用户问题
+      // 固定部分：当前问题（必须保留）
       const currentText = flattenMessageContent(nonSystemMsgs[nonSystemMsgs.length - 1]?.content);
-      parts.push(`[Current Question]\n${currentText}`);
+      const currentPart = `[Current Question]\n${currentText}`;
 
-      return parts.join("\n\n---\n\n");
+      // 计算固定部分已用字符数
+      const fixedChars =
+        (systemPart ? systemPart.length + SEP.length : 0) +
+        currentPart.length;
+
+      // 剩余预算分配给历史
+      const historyBudget = SIDER_MAX_CHARS - fixedChars - SEP.length - "[Conversation History]\n".length;
+
+      // 历史消息从最新到最旧逐条填充，超出预算则停止
+      const historyMsgs = nonSystemMsgs.slice(0, -1);
+      const selectedLines: string[] = [];
+      let usedChars = 0;
+      let truncated = false;
+
+      for (let i = historyMsgs.length - 1; i >= 0; i--) {
+        const m = historyMsgs[i];
+        const role = m.role === "assistant" ? "Assistant" : "User";
+        const line = `${role}: ${flattenMessageContent(m.content)}`;
+        const lineChars = line.length + (selectedLines.length > 0 ? "\n\n".length : 0);
+        if (historyBudget <= 0 || usedChars + lineChars > historyBudget) {
+          truncated = true;
+          break;
+        }
+        selectedLines.unshift(line);
+        usedChars += lineChars;
+      }
+
+      // 组装最终结果
+      const parts: string[] = [];
+      if (systemPart) parts.push(systemPart);
+      if (selectedLines.length > 0) {
+        const label = truncated
+          ? "[Conversation History (partial, oldest trimmed)]\n"
+          : "[Conversation History]\n";
+        parts.push(label + selectedLines.join("\n\n"));
+      }
+      parts.push(currentPart);
+
+      return parts.join(SEP);
     }
 
     // 当存在多轮历史时使用完整上下文，单轮时直接使用原始 prompt
