@@ -13,7 +13,7 @@ const AUTH_TOKEN = Deno.env.get("AUTH_TOKEN");
 // 上游请求超时(毫秒) - 避免长时间挂起放大尾延迟
 const UPSTREAM_TIMEOUT_MS = parseInt(Deno.env.get("UPSTREAM_TIMEOUT_MS") || "60000", 10);
 // 是否默认启用自动搜索(会显著影响 TTFT/长尾)
-const ENABLE_AUTO_SEARCH = (Deno.env.get("ENABLE_AUTO_SEARCH") || "false").toLowerCase() === "true";
+const ENABLE_AUTO_SEARCH = (Deno.env.get("ENABLE_AUTO_SEARCH") || "true").toLowerCase() === "true";
 
 // 默认请求模板(基于真实成功的抓包数据)
 const DEFAULT_REQUEST_TEMPLATE = {
