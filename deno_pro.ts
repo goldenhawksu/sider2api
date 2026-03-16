@@ -16,6 +16,8 @@ const UPSTREAM_TIMEOUT_MS = parseInt(Deno.env.get("UPSTREAM_TIMEOUT_MS") || "600
 const ENABLE_AUTO_SEARCH = (Deno.env.get("ENABLE_AUTO_SEARCH") || "true").toLowerCase() === "true";
 // Sider API 对 text/user_input_text 字段的字符上限，预留 500 字节安全余量
 const SIDER_MAX_CHARS = 49500;
+// Sider API 词数上限（实测 code:603 触发于长对话），保守估计设为 6000 词
+const SIDER_MAX_WORDS = 6000;
 
 // 默认请求模板(基于真实成功的抓包数据)
 const DEFAULT_REQUEST_TEMPLATE = {
@@ -285,6 +287,15 @@ function deriveSessionId(messages: any[], flattenFn: (c: any) => string): string
   return `conv-${simpleHash(systemText + "|" + firstUserText)}`;
 }
 
+// 估算文本词数：中日韩字符各计 1 词，其余按空白分词。
+// 用于防止触发 Sider code:603 "Too many words" 限制。
+function estimateWordCount(text: string): number {
+  const cjkChars = (text.match(/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g) || []).length;
+  const otherWords = text.replace(/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g, " ")
+    .trim().split(/\s+/).filter(Boolean).length;
+  return cjkChars + otherWords;
+}
+
 // 检测是否为图像生成请求
 function isImageGenerationRequest(prompt: string): boolean {
   const imageKeywords = [
@@ -476,10 +487,11 @@ async function handleChatCompletion(req: Request): Promise<Response> {
       // 剩余预算分配给历史
       const historyBudget = SIDER_MAX_CHARS - fixedChars - SEP.length - "[Conversation History]\n".length;
 
-      // 历史消息从最新到最旧逐条填充，超出预算则停止
+      // 历史消息从最新到最旧逐条填充，超出字符或词数预算则停止
       const historyMsgs = nonSystemMsgs.slice(0, -1);
       const selectedLines: string[] = [];
       let usedChars = 0;
+      let usedWords = estimateWordCount((systemPart ? systemPart + "\n\n" : "") + currentPart);
       let truncated = false;
 
       for (let i = historyMsgs.length - 1; i >= 0; i--) {
@@ -487,12 +499,14 @@ async function handleChatCompletion(req: Request): Promise<Response> {
         const role = m.role === "assistant" ? "Assistant" : "User";
         const line = `${role}: ${flattenMessageContent(m.content)}`;
         const lineChars = line.length + (selectedLines.length > 0 ? "\n\n".length : 0);
-        if (historyBudget <= 0 || usedChars + lineChars > historyBudget) {
+        const lineWords = estimateWordCount(line);
+        if (historyBudget <= 0 || usedChars + lineChars > historyBudget || usedWords + lineWords > SIDER_MAX_WORDS) {
           truncated = true;
           break;
         }
         selectedLines.unshift(line);
         usedChars += lineChars;
+        usedWords += lineWords;
       }
 
       // 组装最终结果
