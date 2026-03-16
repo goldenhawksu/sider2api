@@ -264,6 +264,25 @@ function deleteCustomModel(modelId: string): void {
 
 // ==================== 工具函数 ====================
 
+// 轻量级字符串哈希（djb2 变体），用于会话指纹
+function simpleHash(str: string): string {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) + hash) ^ str.charCodeAt(i);
+    hash = hash >>> 0; // 保持 32-bit 无符号
+  }
+  return hash.toString(36);
+}
+
+// 从 messages[] 推导稳定的会话指纹 ID。
+// 同一对话的所有轮次共享相同的「系统消息 + 第一条用户消息」，
+// 因此可作为跨轮次的稳定标识，无需客户端主动发送 X-Session-ID。
+function deriveSessionId(messages: any[], flattenFn: (c: any) => string): string {
+  const systemText = flattenFn(messages.find(m => m.role === "system")?.content ?? "");
+  const firstUserText = flattenFn(messages.find(m => m.role === "user")?.content ?? "");
+  return `conv-${simpleHash(systemText + "|" + firstUserText)}`;
+}
+
 // 检测是否为图像生成请求
 function isImageGenerationRequest(prompt: string): boolean {
   const imageKeywords = [
@@ -423,24 +442,65 @@ async function handleChatCompletion(req: Request): Promise<Response> {
 
     const userPrompt = flattenMessageContent(lastMessage?.content);
 
-    // 获取或创建会话ID(从请求头或生成新的)
-    const sessionId = req.headers.get("X-Session-ID") || `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    // 将完整的 messages[] 历史拼接为上下文，解决多轮对话上下文丢失问题。
+    // 标准 OpenAI 客户端每轮都会携带完整历史，代理需全量注入而非只取最后一条。
+    function buildFullContext(msgs: any[]): string {
+      if (!msgs || msgs.length === 0) return "";
+
+      // 仅有一条消息时直接返回，避免无意义的格式包装
+      const nonSystemMsgs = msgs.filter(m => m.role !== "system");
+      if (nonSystemMsgs.length <= 1 && !msgs.find(m => m.role === "system")) {
+        return flattenMessageContent(msgs[0]?.content || "");
+      }
+
+      const parts: string[] = [];
+
+      // 1. 系统指令（system message）
+      const systemMsg = msgs.find(m => m.role === "system");
+      if (systemMsg) {
+        const text = flattenMessageContent(systemMsg.content);
+        if (text) parts.push(`[System]\n${text}`);
+      }
+
+      // 2. 历史对话（除最后一条用户消息外的全部轮次）
+      const historyMsgs = nonSystemMsgs.slice(0, -1);
+      if (historyMsgs.length > 0) {
+        const history = historyMsgs.map(m => {
+          const role = m.role === "assistant" ? "Assistant" : "User";
+          return `${role}: ${flattenMessageContent(m.content)}`;
+        }).join("\n\n");
+        parts.push(`[Conversation History]\n${history}`);
+      }
+
+      // 3. 当前用户问题
+      const currentText = flattenMessageContent(nonSystemMsgs[nonSystemMsgs.length - 1]?.content);
+      parts.push(`[Current Question]\n${currentText}`);
+
+      return parts.join("\n\n---\n\n");
+    }
+
+    // 当存在多轮历史时使用完整上下文，单轮时直接使用原始 prompt
+    const fullContext = messages.length > 1 ? buildFullContext(messages) : userPrompt;
+
+    // 优先使用客户端显式传入的 X-Session-ID，
+    // 否则从 messages[] 指纹推导稳定 ID，确保同一对话多轮复用同一 Sider 服务端会话。
+    const sessionId = req.headers.get("X-Session-ID") || deriveSessionId(messages, flattenMessageContent);
     let session = conversationSessions.get(sessionId);
 
     // 构建 Sider 请求
     const siderRequest = JSON.parse(JSON.stringify(DEFAULT_REQUEST_TEMPLATE));
 
-    // 判断是否为图像生成请求
+    // 判断是否为图像生成请求（基于原始用户输入，不含历史上下文）
     const isImageGen = isImageGenerationRequest(userPrompt);
 
     // 检查是否启用 Think 模式
     const enableThink = shouldEnableThinkMode(modelName);
 
-    // 设置 multi_content(所有请求都需要)
+    // 设置 multi_content：注入完整上下文确保多轮对话连贯性
     siderRequest.multi_content = [{
       type: "text",
-      text: userPrompt,
-      user_input_text: userPrompt
+      text: fullContext,
+      user_input_text: fullContext
     }];
 
     // 设置模型
@@ -515,7 +575,7 @@ async function handleChatCompletion(req: Request): Promise<Response> {
 
     // 非流式响应
     if (!isStreaming) {
-      return await handleNonStreamingResponse(siderResponse, modelName, userPrompt, isImageGen, sessionId);
+      return await handleNonStreamingResponse(siderResponse, modelName, fullContext, isImageGen, sessionId);
     }
 
     // 流式响应
