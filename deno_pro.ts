@@ -76,9 +76,10 @@ const MODEL_MAPPING: Record<string, string> = {
   "gemini-3.1-pro-think": "gemini-3.1-pro-think",
   
   // DeepSeek 系列
-  "deepseek-v3.2": "deepseek-v3.2",
-  "deepseek-v3.2-think": "deepseek-v3.2-think",
-  "deepseek-reasoner": "deepseek-reasoner",
+  "deepseek-v4-flash": "deepseek-v4-flash",
+  "deepseek-v4-flash-think": "deepseek-v4-flash-think",
+  "deepseek-v4-pro": "deepseek-v4-pro",
+  "deepseek-v4-pro-think": "deepseek-v4-pro-think",
 
   // 其他模型
   "grok-4": "grok-4",
