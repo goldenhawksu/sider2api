@@ -27,6 +27,8 @@ import requests
 
 import config
 from upstream_client import UpstreamClient, load_token
+from prompt_bank import _pick, CONNECTIVITY_PROMPTS, TEXT_PROMPTS, THINK_PROMPTS, \
+    IMAGE_PROMPTS, IMAGE_QUALITY_PROMPTS, SEARCH_PROMPTS, MODEL_PROMPTS
 
 # Windows 控制台安全输出中文/emoji
 try:
@@ -77,7 +79,7 @@ def _evi(res):
 # ---------------- 各维度探测 ----------------
 
 def probe_connectivity(client):
-    res = client.send(prompt="回复ok两个字", model="sider", stream=True)
+    res = client.send(prompt=_pick(CONNECTIVITY_PROMPTS), model="sider", stream=True)
     if res.transport_error:
         return DimensionResult("连通性与额度", ERROR, f"网络异常: {res.transport_error}", _evi(res))
     if not res.ok:
@@ -97,7 +99,7 @@ def probe_connectivity(client):
 
 
 def probe_text(client):
-    res = client.send(prompt="用一句话介绍杭州。", model="sider", stream=True)
+    res = client.send(prompt=_pick(TEXT_PROMPTS), model="sider", stream=True)
     if not res.ok:
         return DimensionResult("文本对话", ERROR, f"code {res.error_code}: {res.error_msg}", _evi(res))
     status = SUPPORTED if res.text else PARTIAL
@@ -107,18 +109,17 @@ def probe_text(client):
 
 def probe_think(client):
     model = config.REPRESENTATIVE_THINK_MODEL  # 例 gpt-5.5-think
-    res = client.send(prompt="9.11 和 9.9 哪个更大? 简述推理。", model=model, think=True, max_seconds=90)
+    res = client.send(prompt=_pick(THINK_PROMPTS), model=model, think=True, max_seconds=90)
     if not res.ok:
         return DimensionResult("Think 模式", ERROR, f"code {res.error_code}: {res.error_msg}", _evi(res))
     has_reasoning = "reasoning_content" in res.event_types or bool(res.reasoning)
-    correct = "9.9" in res.text
     if has_reasoning:
         status = SUPPORTED
-        note = f"上游独立流式返回 reasoning_content (思考流 {len(res.reasoning)} 字), 答案正确={correct}"
-    elif correct:
-        status, note = PARTIAL, "think 参数被接受, 答案正确, 但无独立思考事件流"
+        note = f"上游独立流式返回 reasoning_content (思考流 {len(res.reasoning)} 字)"
+    elif res.text:
+        status, note = UNKNOWN, "think 参数被接受, 但未观察到 reasoning_content 事件流(随机题未触发深度思考)"
     else:
-        status, note = UNKNOWN, "think 参数被接受, 但未观察到明确思考证据"
+        status, note = ERROR, "think 参数被接受但无任何文本或推理输出"
     evi = _evi(res)
     evi["reasoning_chars"] = len(res.reasoning)
     evi["reasoning_preview"] = res.reasoning[:160]
@@ -129,7 +130,7 @@ def probe_think(client):
 def probe_image(client):
     tools = {"image": {"quality_level": "nano_banana"},
              "auto": ["create_image", "data_analysis", "search"]}
-    res = client.send(prompt="请画一只可爱的橘猫", model="sider", tools=tools, max_seconds=120)
+    res = client.send(prompt=_pick(IMAGE_PROMPTS), model="sider", tools=tools, max_seconds=120)
     if not res.ok:
         return DimensionResult("图像生成", ERROR, f"code {res.error_code}: {res.error_msg}", _evi(res))
     imgs = [f for f in res.files if f.get("type") == "image"]
@@ -145,13 +146,15 @@ def probe_image(client):
 
 def probe_image_quality(client):
     """探测图像质量级别是否被上游接受 (不报错即接受)。"""
-    levels = ["nano_banana", "nano_banana_lite", "nano_banana_pro"]
+    # 经上游探针确认: nano_banana_lite 是非法值, 合法枚举为 low/medium/high/nano_banana/nano_banana_pro/nano_banana_2
+    levels = ["nano_banana", "nano_banana_2", "nano_banana_pro"]
     accepted = {}
     for lv in levels:
         tools = {"image": {"quality_level": lv}, "auto": ["create_image", "data_analysis", "search"]}
-        res = client.send(prompt="画一个红色圆形", model="sider", tools=tools, max_seconds=120)
+        res = client.send(prompt=_pick(IMAGE_QUALITY_PROMPTS), model="sider", tools=tools, max_seconds=120)
         imgs = [f for f in res.files if f.get("type") == "image"]
-        accepted[lv] = {"ok": res.ok, "error_code": res.error_code, "got_image": bool(imgs)}
+        accepted[lv] = {"ok": res.ok, "error_code": res.error_code,
+                        "error_msg": res.error_msg[:160], "got_image": bool(imgs)}
     ok_levels = [k for k, v in accepted.items() if v["got_image"]]
     status = SUPPORTED if ok_levels else (PARTIAL if any(v["ok"] for v in accepted.values()) else UNKNOWN)
     return DimensionResult("图像质量级别", status, f"出图级别: {ok_levels}", {"levels": accepted})
@@ -159,7 +162,7 @@ def probe_image_quality(client):
 
 def probe_search(client):
     tools = {"auto": ["search", "data_analysis"]}
-    res = client.send(prompt="搜索一下: 2025年诺贝尔物理学奖得主是谁?", model="sider", tools=tools, max_seconds=90)
+    res = client.send(prompt=_pick(SEARCH_PROMPTS), model="sider", tools=tools, max_seconds=90)
     if not res.ok:
         return DimensionResult("联网搜索", ERROR, f"code {res.error_code}: {res.error_msg}", _evi(res))
     extra_types = set(res.event_types) - {"message_start", "text", "credit_info", "pulse"}
@@ -231,12 +234,13 @@ def probe_models(client, models):
     """模型可用性矩阵: 逐个最小请求, 记录可用性与上游回显。"""
     rows = []
     for m in models:
-        res = client.send(prompt="回复ok", model=m, stream=True, max_seconds=60)
+        res = client.send(prompt=_pick(MODEL_PROMPTS), model=m, stream=True, max_seconds=60)
         echo = sorted(res.model_echo)
         # 上游回显非请求模型 (且非空) 视为可能回退
         fell_back = bool(echo) and m not in echo and "sider" in echo and m != "sider"
         rows.append({"model": m, "ok": res.ok, "error_code": res.error_code,
-                     "has_text": bool(res.text), "echo": echo, "fell_back": fell_back,
+                     "error_msg": res.error_msg[:160], "has_text": bool(res.text),
+                     "echo": echo, "fell_back": fell_back,
                      "ttft_s": res.ttft_s})
     usable = [r["model"] for r in rows if r["ok"] and r["has_text"]]
     fb = [r["model"] for r in rows if r["fell_back"]]
@@ -251,6 +255,23 @@ def probe_models(client, models):
 
 
 # ---------------- 编排与报告 ----------------
+
+def _collect_error_codes(obj, codes):
+    """递归收集 evidence 中所有 error_code 字段(非 0/None), 供错误码字典使用。
+
+    兼容任意嵌套结构: 顶层(各维度) / rows(模型矩阵) / levels(图像质量级别) 等,
+    避免硬编码每处结构而漏码 (曾漏收图像质量级别的 code:1000)。
+    """
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "error_code" and v not in (None, 0):
+                codes.add(v)
+            elif isinstance(v, (dict, list)):
+                _collect_error_codes(v, codes)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_error_codes(item, codes)
+
 
 def fetch_all_model_ids():
     r = requests.get(config.DEFAULT_BASE_URL + "/v1/models", timeout=20)
@@ -341,13 +362,8 @@ def main():
         except Exception as e:  # noqa: BLE001
             r = DimensionResult(label, ERROR, f"探测异常: {type(e).__name__}: {e}")
         results.append(r)
-        # 收集观察到的错误码
-        ec = r.evidence.get("error_code")
-        if ec not in (None, 0):
-            observed_codes.add(ec)
-        for row in r.evidence.get("rows", []):
-            if row.get("error_code") not in (None, 0):
-                observed_codes.add(row["error_code"])
+        # 收集观察到的错误码 (递归扫描 evidence 任意嵌套结构, 含 rows/levels)
+        _collect_error_codes(r.evidence, observed_codes)
         print(f"    -> {r.status}: {r.summary}")
 
     ts, report_md = build_report(results, observed_codes)
