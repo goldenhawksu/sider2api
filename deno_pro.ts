@@ -2053,6 +2053,247 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
   }
 }
 
+// ==================== OpenAI Responses API 格式处理 ====================
+
+// Responses API 入站适配: input(字符串/数组) + instructions → messages[]
+function responsesToMessages(body: any): { messages: any[]; prompt: string } {
+  const messages: any[] = [];
+
+  // instructions → system message
+  if (body.instructions && typeof body.instructions === "string" && body.instructions.trim()) {
+    messages.push({ role: "system", content: body.instructions });
+  }
+
+  // input
+  const input = body.input;
+  if (typeof input === "string") {
+    messages.push({ role: "user", content: input });
+  } else if (Array.isArray(input)) {
+    for (const m of input) {
+      const role = m.role === "assistant" ? "assistant" : "user";
+      let content = "";
+      if (typeof m.content === "string") {
+        content = m.content;
+      } else if (Array.isArray(m.content)) {
+        content = m.content.filter((b: any) => b.type === "text")
+          .map((b: any) => b.text || "").join("\n");
+      }
+      messages.push({ role, content });
+    }
+  }
+
+  const lastContent = messages[messages.length - 1]?.content;
+  const prompt = typeof lastContent === "string" ? lastContent : "";
+  return { messages, prompt };
+}
+
+// Responses API 非流式响应构建
+function buildResponsesResponse(
+  id: string, content: string, modelName: string, reasoning: string,
+): any {
+  const output: any[] = [];
+  // 如果有推理内容, 先放 reasoning
+  if (reasoning) {
+    output.push({
+      type: "reasoning", id: `rs_${Date.now()}`, summary: [],
+      content: [{ type: "reasoning_text", text: reasoning }],
+    });
+  }
+  output.push({
+    type: "message", role: "assistant", id: `msg_${Date.now()}`,
+    content: [{ type: "output_text", text: content }],
+  });
+
+  return {
+    id, object: "response",
+    model: modelName,
+    output,
+    usage: {
+      input_tokens: 0,
+      output_tokens: content.length,
+      total_tokens: content.length,
+    },
+  };
+}
+
+async function handleOpenAIResponse(req: Request): Promise<Response> {
+  try {
+    const body = await req.json();
+    const isStream = body.stream === true;
+    console.log(`📥 Responses ${isStream ? "stream" : "nonstream"}: model=${body.model}`);
+
+    const { messages, prompt } = responsesToMessages(body);
+    if (!messages.length) {
+      return new Response(JSON.stringify({
+        error: { message: "input is required", type: "invalid_request_error", param: "input" },
+      }), { status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+    }
+
+    const modelName = body.model || "sider";
+    const siderModel = MODEL_MAPPING[modelName] || "sider";
+    const isThink = shouldEnableThinkMode(modelName);
+    const respId = `resp_${Date.now()}`;
+
+    // 上下文拼接
+    const fullContext = messages.length > 1
+      ? messages.map(m => {
+          const label = m.role === "system" ? "[System]"
+            : m.role === "assistant" ? "Assistant" : "User";
+          return `${label}: ${typeof m.content === "string" ? m.content : ""}`;
+        }).join("\n\n---\n\n")
+      : prompt;
+
+    const enableSearch = shouldEnableAutoSearch(prompt);
+
+    // 构建 Sider 上游请求
+    const siderRequest = JSON.parse(JSON.stringify(DEFAULT_REQUEST_TEMPLATE));
+    siderRequest.model = siderModel;
+    siderRequest.stream = true;
+    siderRequest.think_mode = { enable: isThink };
+    siderRequest.multi_content = [{
+      type: "text", text: fullContext, user_input_text: fullContext,
+    }];
+    siderRequest.tools = {
+      auto: enableSearch ? ["search", "data_analysis"] : ["data_analysis"],
+    };
+
+    const upstreamController = new AbortController();
+    const upstreamTimeout = setTimeout(() => upstreamController.abort(), UPSTREAM_TIMEOUT_MS);
+    const siderResp = await fetch(SIDER_API_ENDPOINT, {
+      method: "POST", signal: upstreamController.signal,
+      headers: {
+        "Content-Type": "application/json", Authorization: `Bearer ${SIDER_AUTH_TOKEN}`,
+        "Accept": "*/*", "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Origin": "chrome-extension://dhoenijjpgpeimemopealfcbiecgceod",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "X-App-Name": "ChitChat_Edge_Ext", "X-App-Version": "5.21.2",
+      },
+      body: JSON.stringify(siderRequest),
+    });
+    clearTimeout(upstreamTimeout);
+
+    if (!siderResp.ok) {
+      return new Response(JSON.stringify({
+        error: { message: `上游错误: ${siderResp.status}`, type: "api_error" },
+      }), { status: 502, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+    }
+
+    // ---- 非流式 ----
+    if (!isStream) {
+      let fullText = "", reasoningAcc = "";
+      const reader = siderResp.body?.getReader();
+      if (!reader) throw new Error("无法获取响应流");
+      const lineReader = new SSELineReader();
+      for await (const line of lineReader.readLines(reader)) {
+        const tl = line.trim();
+        if (!tl || tl === "[DONE]") continue;
+        const dl = tl.startsWith("data:") ? tl.substring(5).trim() : tl;
+        if (!dl) continue;
+        try {
+          const sd = JSON.parse(dl);
+          if (sd.code && sd.code !== 0) continue;
+          const d = sd.data; if (!d) continue;
+          if (d.type === "text" && d.text) fullText += d.text;
+          if (d.type === "reasoning_content") {
+            const rc = d.reasoning_content;
+            if (typeof rc === "object" && rc !== null && "text" in rc) {
+              reasoningAcc += (rc as Record<string, unknown>).text as string || "";
+            }
+          }
+        } catch { /* skip */ }
+      }
+      const respData = buildResponsesResponse(respId, fullText || "生成完成", modelName, reasoningAcc);
+      return new Response(JSON.stringify(respData), {
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+
+    // ---- 流式: Responses API SSE ----
+    const respStream = new ReadableStream({
+      async start(controller) {
+        const reader = siderResp.body?.getReader();
+        if (!reader) { controller.error(new Error("无响应流")); return; }
+        const lineReader = new SSELineReader();
+        const encoder = new TextEncoder();
+
+        const sendEvent = (event: string, data: any) => {
+          controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+        };
+
+        const initialResp: any = {
+          object: "response", id: respId, model: modelName,
+          output: [], status: "in_progress",
+        };
+        sendEvent("response.created", { type: "response.created", response: initialResp });
+
+        let textStarted = false;
+        sendEvent("response.output_text.delta", { type: "response.output_text.delta", delta: "" });
+
+        try {
+          for await (const line of lineReader.readLines(reader)) {
+            const tl = line.trim();
+            if (!tl) continue;
+            const dl = tl.startsWith("data:") ? tl.substring(5).trim() : tl;
+            if (dl === "[DONE]") {
+              const completedResp = {
+                ...initialResp,
+                status: "completed",
+                output: [{
+                  type: "message", role: "assistant",
+                  content: [{ type: "output_text", text: textStarted ? "" : "" }],
+                }],
+                usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+              };
+              sendEvent("response.completed", { type: "response.completed", response: completedResp });
+              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              controller.close(); return;
+            }
+            if (!dl) continue;
+            try {
+              const sd = JSON.parse(dl);
+              if (sd.code && sd.code !== 0) {
+                sendEvent("error", {
+                  type: "error",
+                  error: { type: "api_error", message: sd.msg || `code=${sd.code}` },
+                });
+                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                controller.close(); return;
+              }
+              const d = sd.data; if (!d) continue;
+              if (d.type === "text" && d.text) {
+                if (!textStarted) textStarted = true;
+                sendEvent("response.output_text.delta", {
+                  type: "response.output_text.delta",
+                  item_id: respId,
+                  output_index: 0,
+                  content_index: 0,
+                  delta: d.text,
+                });
+              }
+              // reasoning_content ignored in responses stream (kept simple)
+            } catch { /* skip */ }
+          }
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        } catch (err: any) { console.error("❌ Responses流错误:", err); controller.error(err); }
+      },
+    });
+
+    return new Response(respStream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache", "Connection": "keep-alive",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  } catch (error: any) {
+    console.error("❌ Responses处理错误:", error);
+    return new Response(JSON.stringify({
+      error: { message: `处理请求失败: ${error.message}`, type: "server_error" },
+    }), { status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+  }
+}
+
 // ==================== 内嵌管理界面HTML (Deploy环境) ====================
 
 function getEmbeddedAdminHTML(): string {
@@ -2395,6 +2636,14 @@ async function handleRequest(req: Request): Promise<Response> {
   if (req.method === "POST" && path === "/v1/messages") {
     return authMiddleware(async (req: Request) =>
       handleAnthropicMessage(req)
+    )(req);
+  }
+
+  // ==================== OpenAI Responses API 格式端点 ====================
+  // POST /v1/responses (OpenAI Responses API, 非流式 + 流式 stream:true)
+  if (req.method === "POST" && path === "/v1/responses") {
+    return authMiddleware(async (req: Request) =>
+      handleOpenAIResponse(req)
     )(req);
   }
 
