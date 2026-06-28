@@ -1246,11 +1246,19 @@ async function handleImageGeneration(req: Request): Promise<Response> {
     }];
 
     // 设置工具配置
-    // OpenAI quality → Sider 映射: standard→nano_banana, hd→nano_banana_pro
+    // OpenAI quality → Sider 映射:
+    //   standard → nano_banana, hd → nano_banana_pro
+    //   非标扩展: quality="fast" → nano_banana_2 (低质量/快速出图)
     // 上游合法枚举: nano_banana / nano_banana_2 / nano_banana_pro (经探针确认)
+    let qualityLevel = "nano_banana";
+    if (quality === "hd") {
+      qualityLevel = "nano_banana_pro";
+    } else if (quality === "fast") {
+      qualityLevel = "nano_banana_2";
+    }
     siderRequest.tools = {
       image: {
-        quality_level: quality === "hd" ? "nano_banana_pro" : "nano_banana"
+        quality_level: qualityLevel
       },
       auto: ["create_image", "data_analysis", "search"]
     };
@@ -1519,6 +1527,256 @@ async function handleImageGeneration(req: Request): Promise<Response> {
     isImageGenerating = false;
     const totalTime = Date.now() - currentGenerationStartTime;
     console.log(`🔓 释放图像生成锁 (总耗时: ${Math.floor(totalTime/1000)} 秒)`);
+  }
+}
+
+// ==================== Gemini 格式处理 ====================
+
+// Gemini 格式: contents[] → messages[] 入站适配
+function geminiToMessages(body: any): { messages: any[] } {
+  const messages: any[] = [];
+
+  // systemInstruction
+  if (body.systemInstruction && body.systemInstruction.parts) {
+    const text = body.systemInstruction.parts.map((p: any) => p.text || "").join("\n");
+    if (text) {
+      messages.push({ role: "system", content: text });
+    }
+  }
+
+  // contents[]
+  for (const c of (body.contents || [])) {
+    const role = c.role === "model" ? "assistant" : (c.role || "user");
+    const parts = c.parts || [];
+    const textParts: string[] = [];
+    for (const p of parts) {
+      if (p.text !== undefined) {
+        textParts.push(p.text);
+      }
+    }
+    messages.push({ role, content: textParts.join("\n") });
+  }
+
+  return { messages };
+}
+
+// Gemini 非流式响应构建
+function buildGeminiResponse(
+  content: string, reasoning: string, modelName: string,
+  finishReason = "STOP"
+): any {
+  const parts: any[] = [];
+  if (content) {
+    parts.push({ text: content });
+  } else {
+    parts.push({ text: "" });
+  }
+
+  const resp: any = {
+    candidates: [{
+      content: { role: "model", parts },
+      finishReason,
+      index: 0,
+    }],
+    usageMetadata: {
+      promptTokenCount: 0,
+      candidatesTokenCount: content.length,
+      totalTokenCount: content.length,
+    },
+  };
+  // Gemini 扩展: thought (思考内容)
+  if (reasoning) {
+    resp.candidates[0].thought = reasoning;
+  }
+  return resp;
+}
+
+// 处理 Gemini 请求 (非流式 + 流式)
+async function handleGeminiGenerate(
+  req: Request, geminiModel: string, isStream: boolean
+): Promise<Response> {
+  try {
+    const body = await req.json();
+    console.log(`📥 Gemini ${isStream ? "stream" : "generate"}: model=${geminiModel}`);
+
+    // 入站适配: Gemini → messages[]
+    const { messages } = geminiToMessages(body);
+
+    if (!messages.length) {
+      return new Response(JSON.stringify({
+        error: { message: "contents array is empty or invalid", type: "invalid_request_error" }
+      }), { status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+    }
+
+    const siderModel = MODEL_MAPPING[geminiModel] || "sider";
+    const isThink = shouldEnableThinkMode(geminiModel);
+    const lastMsg = messages[messages.length - 1];
+    const prompt = typeof lastMsg?.content === "string" ? lastMsg.content : "";
+
+    // 上下文拼接
+    const fullContext = messages.length > 1
+      ? (messages.map(m => {
+          const label = m.role === "system" ? "[System]" : m.role === "assistant" ? "Assistant" : "User";
+          return `${label}: ${typeof m.content === "string" ? m.content : ""}`;
+        }).join("\n\n---\n\n"))
+      : prompt;
+
+    // 构建 Sider 上游请求
+    const siderRequest = JSON.parse(JSON.stringify(DEFAULT_REQUEST_TEMPLATE));
+    siderRequest.model = siderModel;
+    siderRequest.stream = true; // 始终流式读上游
+    siderRequest.think_mode = { enable: isThink };
+    siderRequest.multi_content = [{
+      type: "text", text: fullContext, user_input_text: fullContext,
+    }];
+
+    const enableSearch = shouldEnableAutoSearch(prompt);
+    siderRequest.tools = {
+      auto: enableSearch ? ["search", "data_analysis"] : ["data_analysis"]
+    };
+
+    // 发送上游请求
+    const upstreamController = new AbortController();
+    const upstreamTimeout = setTimeout(() => upstreamController.abort(), UPSTREAM_TIMEOUT_MS);
+
+    const siderResponse = await fetch(SIDER_API_ENDPOINT, {
+      method: "POST",
+      signal: upstreamController.signal,
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${SIDER_AUTH_TOKEN}`,
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Origin": "chrome-extension://dhoenijjpgpeimemopealfcbiecgceod",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "X-App-Name": "ChitChat_Edge_Ext",
+        "X-App-Version": "5.21.2"
+      },
+      body: JSON.stringify(siderRequest)
+    });
+    clearTimeout(upstreamTimeout);
+
+    if (!siderResponse.ok) {
+      const errorText = await siderResponse.text();
+      console.error("❌ Gemini上游错误:", errorText);
+      return new Response(JSON.stringify({
+        error: { message: `上游错误: ${siderResponse.status}`, type: "upstream_error" }
+      }), { status: 502, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+    }
+
+    // ===== 非流式: 消费上游流, 聚合后返回 Gemini 格式 =====
+    if (!isStream) {
+      let fullText = "", reasoningAcc = "";
+      const reader = siderResponse.body?.getReader();
+      if (!reader) throw new Error("无法获取响应流");
+      const lineReader = new SSELineReader();
+      for await (const line of lineReader.readLines(reader)) {
+        const tl = line.trim();
+        if (!tl || tl === "[DONE]") continue;
+        const dl = tl.startsWith("data:") ? tl.substring(5).trim() : tl;
+        if (!dl) continue;
+        try {
+          const sd = JSON.parse(dl);
+          if (sd.code && sd.code !== 0) continue;
+          const d = sd.data;
+          if (!d) continue;
+          if (d.type === "text" && d.text) fullText += d.text;
+          if (d.type === "reasoning_content") {
+            const rc = d.reasoning_content;
+            if (typeof rc === "object" && rc !== null && "text" in rc) {
+              reasoningAcc += (rc as Record<string, unknown>).text as string || "";
+            }
+          }
+        } catch { /* skip */ }
+      }
+      const geminiResp = buildGeminiResponse(fullText || "生成完成", reasoningAcc, geminiModel);
+      return new Response(JSON.stringify(geminiResp), {
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
+    }
+
+    // ===== 流式: SSE 逐块翻译 =====
+    const stream = new ReadableStream({
+      async start(controller) {
+        const reader = siderResponse.body?.getReader();
+        if (!reader) { controller.error(new Error("无法获取响应流")); return; }
+        const lineReader = new SSELineReader();
+        const encoder = new TextEncoder();
+
+        try {
+          for await (const line of lineReader.readLines(reader)) {
+            const tl = line.trim();
+            if (!tl) continue;
+            const dl = tl.startsWith("data:") ? tl.substring(5).trim() : tl;
+            if (dl === "[DONE]") {
+              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              controller.close();
+              return;
+            }
+            if (!dl) continue;
+            try {
+              const sd = JSON.parse(dl);
+              if (sd.code && sd.code !== 0) {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                  error: { code: sd.code, message: sd.msg || "" }
+                })}\n\n`));
+                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                controller.close();
+                return;
+              }
+              const d = sd.data;
+              if (!d) continue;
+
+              let geminiChunk: any = null;
+              if (d.type === "text" && d.text) {
+                geminiChunk = {
+                  candidates: [{
+                    content: { role: "model", parts: [{ text: d.text }] },
+                    index: 0,
+                  }],
+                };
+              } else if (d.type === "reasoning_content") {
+                const rc = d.reasoning_content;
+                const rt = (typeof rc === "object" && rc !== null && "text" in rc)
+                  ? (rc as Record<string, unknown>).text as string : "";
+                if (rt) {
+                  geminiChunk = {
+                    candidates: [{
+                      content: { role: "model", parts: [] },
+                      thought: rt,
+                      index: 0,
+                    }],
+                  };
+                }
+              }
+
+              if (geminiChunk) {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(geminiChunk)}\n\n`));
+              }
+            } catch { /* skip */ }
+          }
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        } catch (err: any) {
+          console.error("❌ Gemini流式错误:", err);
+          controller.error(err);
+        }
+      }
+    });
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Access-Control-Allow-Origin": "*",
+      }
+    });
+  } catch (error: any) {
+    console.error("❌ Gemini处理错误:", error);
+    return new Response(JSON.stringify({
+      error: { message: `处理请求失败: ${error.message}`, type: "server_error" }
+    }), { status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
   }
 }
 
@@ -1845,6 +2103,18 @@ async function handleRequest(req: Request): Promise<Response> {
   // 专用图像生成端点
   if (req.method === "POST" && path === "/v1/images/generations") {
     return authMiddleware(handleImageGeneration)(req);
+  }
+
+  // ==================== Gemini 格式端点 ====================
+  // 匹配 /v1beta/models/{model}:generateContent 或 :streamGenerateContent
+  const geminiMatch = path.match(/^\/v1beta\/models\/(.+):(generateContent|streamGenerateContent)$/);
+  if (req.method === "POST" && geminiMatch) {
+    const geminiModel = geminiMatch[1];
+    const geminiAction = geminiMatch[2];
+    const isStream = geminiAction === "streamGenerateContent";
+    return authMiddleware(async (req: Request) =>
+      handleGeminiGenerate(req, geminiModel, isStream)
+    )(req);
   }
 
   // ==================== 管理界面路由 ====================
