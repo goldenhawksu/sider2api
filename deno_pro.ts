@@ -1967,5 +1967,3 @@ console.log("\n🔐 安全配置:");
 console.log(`   - SIDER_AUTH_TOKEN: ${SIDER_AUTH_TOKEN ? "✅ 已配置" : "❌ 未配置"}`);
 console.log(`   - AUTH_TOKEN: ${AUTH_TOKEN ? "✅ 已启用认证" : "⚠️ 未启用认证(开发模式)"}`);
 
-// 加载自定义模型
-await loadCustomModels();
