@@ -1929,8 +1929,24 @@ async function handleRequest(req: Request): Promise<Response> {
 }
 
 // ==================== 启动服务 ====================
+// 迁移到console.deno.com以后用原生deno.serve -- Weihong 2026/06/28
+const PORT = parseInt(Deno.env.get("PORT") || "8000");
 
+// 1. 先定义启动逻辑
 console.log("🚀 启动 Sider2API 集成代理服务器...");
+
+// 2. 立即启动服务 (不要被 await loadCustomModels 阻塞)
+Deno.serve({
+  port: PORT,
+  hostname: "0.0.0.0",
+  onListen({ port, hostname }) {
+    console.log(`📍 监听地址: http://${hostname}:${port}`);
+    console.log(`💬 聊天接口: POST /v1/chat/completions`);
+    // 服务启动成功后，再在后台加载自定义模型
+    loadCustomModels().catch(err => console.error("⚠️ 自定义模型加载失败:", err));
+  }
+}, handleRequest);
+
 console.log("📍 监听端口: 8000");
 console.log("🔗 主页: http://localhost:8000");
 console.log("🎛️ 管理界面: http://localhost:8000/admin");
@@ -1953,16 +1969,3 @@ console.log(`   - AUTH_TOKEN: ${AUTH_TOKEN ? "✅ 已启用认证" : "⚠️ 未
 
 // 加载自定义模型
 await loadCustomModels();
-
-// 迁移到console.deno.com以后用原生deno.serve -- Weihong 2026/06/28
-// serve(handleRequest, { port: 8000 });
-const PORT = parseInt(Deno.env.get("PORT") || "8000");
-
-// 使用 Deno.serve (这是 Deno Deploy 推荐的原生方式)
-Deno.serve({
-  port: PORT,
-  hostname: "0.0.0.0", // 显式指定 0.0.0.0 以确保外部可访问
-  onListen({ port, hostname }) {
-    console.log(`📍 监听地址: http://${hostname}:${port}`);
-  }
-}, handleRequest);
