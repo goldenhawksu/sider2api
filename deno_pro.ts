@@ -314,9 +314,11 @@ function isImageGenerationRequest(prompt: string): boolean {
 }
 
 // 检测图像质量需求
+// 合法枚举 (经上游探针确认): nano_banana / nano_banana_2 / nano_banana_pro
+// 非法值 nano_banana_lite 已移除 (上游返回 code:1000 "QualityLevel must be one of [...]")
 function detectImageQuality(prompt: string): string {
-  if (/4k|高清|ultra|hd|高质量/i.test(prompt)) return "nano_banana_pro";
-  if (/快速|draft|sketch/i.test(prompt)) return "nano_banana_lite";
+  if (/4k|高清|ultra|hd|高质量|pro/i.test(prompt)) return "nano_banana_pro";
+  if (/快速|draft|sketch|草稿|lite|低质量/i.test(prompt)) return "nano_banana_2";
   return "nano_banana"; // 默认标准质量
 }
 
@@ -619,7 +621,44 @@ async function handleChatCompletion(req: Request): Promise<Response> {
     if (!siderResponse.ok) {
       const errorText = await siderResponse.text();
       console.error("❌ Sider API 错误响应:", errorText);
-      throw new Error(`Sider API 错误: ${siderResponse.status} - ${errorText}`);
+      // 翻译上游错误码为 OpenAI 兼容格式
+      let errorPayload;
+      try {
+        errorPayload = JSON.parse(errorText);
+      } catch {
+        errorPayload = null;
+      }
+      const upstreamCode = errorPayload?.code;
+      const upstreamMsg = errorPayload?.msg || "";
+      let statusCode = siderResponse.status;
+      let message = `Sider API 错误: ${siderResponse.status} - ${errorText}`;
+      let type = "upstream_error";
+      if (upstreamCode === 603) {
+        statusCode = 400;
+        message = upstreamMsg || "请求内容超出词数上限, 请缩短 prompt 或缩减对话历史。";
+        type = "context_length_exceeded";
+      } else if (upstreamCode === 1001) {
+        statusCode = 401;
+        message = "上游 Token 无效或已过期。";
+        type = "auth_error";
+      } else if (upstreamCode === 1101) {
+        statusCode = 429;
+        message = upstreamMsg || "上游并发/限流, 请稍后重试。";
+        type = "rate_limit_error";
+      } else if (upstreamCode === 1135) {
+        statusCode = 429;
+        message = upstreamMsg || "上游模型使用额度已达上限, 请稍后重试。";
+        type = "rate_limit_error";
+      }
+      return new Response(JSON.stringify({
+        error: { message, type, upstream_code: upstreamCode }
+      }), {
+        status: statusCode,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        }
+      });
     }
 
     console.log("✅ Sider 响应状态:", siderResponse.status);
@@ -632,7 +671,7 @@ async function handleChatCompletion(req: Request): Promise<Response> {
     // 流式响应
     return handleStreamingResponse(siderResponse, modelName, isImageGen, sessionId);
 
-  } catch (error) {
+  } catch (error: any) {
     console.error("❌ 处理聊天请求错误:", error);
     return new Response(JSON.stringify({
       error: {
@@ -658,6 +697,7 @@ async function handleNonStreamingResponse(
   sessionId: string
 ): Promise<Response> {
   let fullText = "";
+  let reasoningContentAcc = "";
   let imageUrl = "";
   let imageData: any = null;
   let conversationId = "";
@@ -714,6 +754,14 @@ async function handleNonStreamingResponse(
           }
           break;
 
+        case "reasoning_content":
+          // Think 模式: 收集上游思考流 (经探针确认 SUPPORTED)
+          const rc2 = siderData.data.reasoning_content;
+          if (typeof rc2 === "object" && rc2 !== null && "text" in rc2) {
+            reasoningContentAcc += (rc2 as Record<string,unknown>).text as string || "";
+          }
+          break;
+
         case "tool_call":
           console.log("🔧 工具调用:", siderData.data.tool_call);
           break;
@@ -750,6 +798,11 @@ async function handleNonStreamingResponse(
       total_tokens: userPrompt.length + fullText.length
     }
   };
+
+  // 携带推理内容 (think 模式非流式), 兼容 Anthropic/Ollama 风格
+  if (reasoningContentAcc) {
+    openAIResponse.choices[0].message.reasoning_content = reasoningContentAcc;
+  }
 
   // 如果是图像生成,添加结构化图像数据
   if (isImageGen && imageUrl) {
@@ -976,6 +1029,36 @@ function handleStreamingResponse(
                 console.log("🔧 工具调用状态:", siderData.data.tool_call.status);
                 break;
 
+              case "reasoning_content":
+                // Think 模式: 上游独立流式返回思考过程 (经探针确认 SUPPORTED)
+                if (firstChunkAt === null) {
+                  firstChunkAt = Date.now();
+                  console.log("⏱️ TTFT(ms) (reasoning):", firstChunkAt - streamT0);
+                }
+                const rc = siderData.data.reasoning_content;
+                const reasoningText = (typeof rc === "object" && rc !== null && "text" in rc)
+                  ? (rc as Record<string,unknown>).text as string
+                  : "";
+                if (reasoningText) {
+                  openAIChunk = {
+                    id: `chatcmpl-${Date.now()}`,
+                    object: "chat.completion.chunk",
+                    created: Math.floor(Date.now() / 1000),
+                    model: modelName,
+                    choices: [{
+                      delta: {
+                        // 使用 OpenAI 兼容字段 (非标准扩展): reasoning_content
+                        // 上游 reasoning_content 结构与 text 事件类似,
+                        // 在 delta 中暴露 reasoning_content 字符串供前端使用
+                        reasoning_content: reasoningText
+                      },
+                      finish_reason: null,
+                      index: 0
+                    }]
+                  };
+                }
+                break;
+
               case "pulse":
                 // 心跳,忽略
                 break;
@@ -983,6 +1066,29 @@ function handleStreamingResponse(
               case "credit_info":
                 console.log("💳 额度信息:", siderData.data.credit_info);
                 break;
+            }
+
+            // 上游流内错误码检测 (SSE 顶层 code 非 0/null, 如 1135 限流)
+            if (siderData.code && siderData.code !== 0) {
+              const errCode = siderData.code;
+              const errMsg = siderData.msg || "";
+              console.error(`❌ 上游流内错误: code=${errCode} msg=${errMsg}`);
+              const errChunk = {
+                id: `chatcmpl-${Date.now()}`,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: modelName,
+                choices: [{
+                  delta: {},
+                  finish_reason: "error",
+                  index: 0
+                }],
+                error: { code: errCode, message: errMsg }
+              };
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
+              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              controller.close();
+              return;
             }
 
             if (openAIChunk) {
@@ -1140,6 +1246,8 @@ async function handleImageGeneration(req: Request): Promise<Response> {
     }];
 
     // 设置工具配置
+    // OpenAI quality → Sider 映射: standard→nano_banana, hd→nano_banana_pro
+    // 上游合法枚举: nano_banana / nano_banana_2 / nano_banana_pro (经探针确认)
     siderRequest.tools = {
       image: {
         quality_level: quality === "hd" ? "nano_banana_pro" : "nano_banana"
@@ -1392,7 +1500,7 @@ async function handleImageGeneration(req: Request): Promise<Response> {
       }
     });
 
-  } catch (error) {
+  } catch (error: any) {
     console.error("❌ 图像生成错误:", error);
     return new Response(JSON.stringify({
       error: {

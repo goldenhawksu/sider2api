@@ -89,6 +89,14 @@ def extract_content(resp_json: dict) -> str:
         return ""
 
 
+def extract_reasoning(resp_json: dict) -> str:
+    """从 OpenAI 非流式响应里取 reasoning_content (think 模式)。"""
+    try:
+        return resp_json["choices"][0]["message"].get("reasoning_content", "") or ""
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
 def iter_sse(resp) -> Iterator[dict]:
     """逐块解析 SSE 'data: {json}' 行, 跳过 [DONE] 与无法解析的行。"""
     resp.encoding = "utf-8"  # SSE 为 UTF-8, 避免 CJK 乱码
@@ -114,6 +122,21 @@ def _delta_piece(obj: dict):
         return None
 
 
+def _delta_piece(obj: dict):
+    try:
+        return obj["choices"][0].get("delta", {}).get("content")
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _delta_reasoning(obj: dict):
+    """从流式 chunk 取 reasoning_content (think 模式流式)。"""
+    try:
+        return obj["choices"][0].get("delta", {}).get("reasoning_content")
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
 def _finish_reason(obj: dict):
     try:
         return obj["choices"][0].get("finish_reason")
@@ -122,13 +145,13 @@ def _finish_reason(obj: dict):
 
 
 def parse_stream(resp) -> dict:
-    """消费一个流式响应, 返回累计内容/块数/finish_reason/done (不含 TTFT 计时)。
+    """消费一个流式响应, 返回累计内容/块数/finish_reason/done/reasoning (不含 TTFT 计时)。
 
     done 表示是否收到 [DONE] 终止信号。
     注: 当前 deno_pro 不发送 finish_reason='stop' 终止块, 仅以 [DONE] 结束。
     """
     resp.encoding = "utf-8"
-    pieces, chunks, finish, done = [], 0, None, False
+    pieces, reasoning_pieces, chunks, finish, done = [], [], 0, None, False
     for raw in resp.iter_lines(decode_unicode=True):
         if not raw:
             continue
@@ -150,7 +173,16 @@ def parse_stream(resp) -> dict:
         if piece:
             pieces.append(piece)
             chunks += 1
-    return {"content": "".join(pieces), "chunks": chunks, "finish_reason": finish, "done": done}
+        rpiece = _delta_reasoning(obj)
+        if rpiece:
+            reasoning_pieces.append(rpiece)
+    return {
+        "content": "".join(pieces),
+        "reasoning": "".join(reasoning_pieces),
+        "chunks": chunks,
+        "finish_reason": finish,
+        "done": done,
+    }
 
 
 def retry(call, ok, attempts: int = 3, delay: float = 4.0):
