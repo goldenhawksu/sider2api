@@ -1780,6 +1780,279 @@ async function handleGeminiGenerate(
   }
 }
 
+// ==================== Anthropic 格式处理 ====================
+
+// Anthropic Messages API 入站适配: messages[] + system → 内部 messages[]
+function anthropicToMessages(body: any): { messages: any[] } {
+  const messages: any[] = [];
+
+  // System 字段 (支持 string 和数组 [{type:"text",text:"..."}])
+  const sys = body.system;
+  if (typeof sys === "string" && sys.trim()) {
+    messages.push({ role: "system", content: sys });
+  } else if (Array.isArray(sys)) {
+    const text = sys.map((s: any) => s.text || "").join("\n");
+    if (text.trim()) messages.push({ role: "system", content: text });
+  }
+
+  // Messages[]
+  for (const m of (body.messages || [])) {
+    const role = m.role === "assistant" ? "assistant" : "user";
+    let content = "";
+    if (typeof m.content === "string") {
+      content = m.content;
+    } else if (Array.isArray(m.content)) {
+      // Anthropic content 块: [{type:"text",text:"..."}]
+      content = m.content
+        .filter((b: any) => b.type === "text")
+        .map((b: any) => b.text || "")
+        .join("\n");
+    }
+    messages.push({ role, content });
+  }
+
+  return { messages };
+}
+
+// Anthropic 非流式响应构建
+function buildAnthropicResponse(
+  id: string, content: string, modelName: string, reasoning: string,
+  stopReason = "end_turn", usage: any = null,
+): any {
+  const resp: any = {
+    id,
+    type: "message",
+    role: "assistant",
+    model: modelName,
+    content: [{ type: "text", text: content }],
+    stop_reason: stopReason,
+  };
+  if (reasoning) {
+    resp.content.unshift({ type: "thinking", thinking: reasoning });
+  }
+  resp.usage = usage || { input_tokens: 0, output_tokens: content.length };
+  return resp;
+}
+
+// 处理 Anthropic 请求 (非流式 + 流式)
+async function handleAnthropicMessage(req: Request): Promise<Response> {
+  try {
+    const body = await req.json();
+    const isStream = body.stream === true;
+    console.log(`📥 Anthropic ${isStream ? "stream" : "message"}: model=${body.model}`);
+
+    const { messages } = anthropicToMessages(body);
+    if (!messages.length) {
+      return new Response(JSON.stringify({
+        type: "error",
+        error: { type: "invalid_request_error", message: "messages array is empty or invalid" },
+      }), { status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+    }
+
+    const anthroModel = body.model || "claude-sonnet-4.6";
+    const siderModel = MODEL_MAPPING[anthroModel] || "sider";
+    const isThink = shouldEnableThinkMode(anthroModel);
+    const msgId = `msg_${Date.now()}`;
+    const lastContent = messages[messages.length - 1]?.content;
+    const prompt = typeof lastContent === "string" ? lastContent : "";
+
+    // 上下文拼接
+    const fullContext = messages.length > 1
+      ? messages.map(m => {
+          const label = m.role === "system" ? "[System]"
+            : m.role === "assistant" ? "Assistant" : "User";
+          return `${label}: ${typeof m.content === "string" ? m.content : ""}`;
+        }).join("\n\n---\n\n")
+      : prompt;
+
+    const enableSearch = shouldEnableAutoSearch(prompt);
+
+    // 构建 Sider 上游请求
+    const siderRequest = JSON.parse(JSON.stringify(DEFAULT_REQUEST_TEMPLATE));
+    siderRequest.model = siderModel;
+    siderRequest.stream = true;
+    siderRequest.think_mode = { enable: isThink };
+    siderRequest.multi_content = [{
+      type: "text", text: fullContext, user_input_text: fullContext,
+    }];
+    siderRequest.tools = {
+      auto: enableSearch ? ["search", "data_analysis"] : ["data_analysis"],
+    };
+
+    const upstreamController = new AbortController();
+    const upstreamTimeout = setTimeout(() => upstreamController.abort(), UPSTREAM_TIMEOUT_MS);
+    const siderResp = await fetch(SIDER_API_ENDPOINT, {
+      method: "POST", signal: upstreamController.signal,
+      headers: {
+        "Content-Type": "application/json", Authorization: `Bearer ${SIDER_AUTH_TOKEN}`,
+        "Accept": "*/*", "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Origin": "chrome-extension://dhoenijjpgpeimemopealfcbiecgceod",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "X-App-Name": "ChitChat_Edge_Ext", "X-App-Version": "5.21.2",
+      },
+      body: JSON.stringify(siderRequest),
+    });
+    clearTimeout(upstreamTimeout);
+
+    if (!siderResp.ok) {
+      const errorText = await siderResp.text();
+      console.error("❌ Anthropic上游错误:", errorText);
+      return new Response(JSON.stringify({
+        type: "error",
+        error: { type: "api_error", message: `上游错误: ${siderResp.status}` },
+      }), { status: 502, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+    }
+
+    // ---- 非流式 ----
+    if (!isStream) {
+      let fullText = "", reasoningAcc = "";
+      const reader = siderResp.body?.getReader();
+      if (!reader) throw new Error("无法获取响应流");
+      const lineReader = new SSELineReader();
+      for await (const line of lineReader.readLines(reader)) {
+        const tl = line.trim();
+        if (!tl || tl === "[DONE]") continue;
+        const dl = tl.startsWith("data:") ? tl.substring(5).trim() : tl;
+        if (!dl) continue;
+        try {
+          const sd = JSON.parse(dl);
+          if (sd.code && sd.code !== 0) continue;
+          const d = sd.data; if (!d) continue;
+          if (d.type === "text" && d.text) fullText += d.text;
+          if (d.type === "reasoning_content") {
+            const rc = d.reasoning_content;
+            if (typeof rc === "object" && rc !== null && "text" in rc) {
+              reasoningAcc += (rc as Record<string, unknown>).text as string || "";
+            }
+          }
+        } catch { /* skip */ }
+      }
+      const resp = buildAnthropicResponse(msgId, fullText || "生成完成", anthroModel, reasoningAcc);
+      return new Response(JSON.stringify(resp), {
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+
+    // ---- 流式: Anthropic SSE 事件序列 ----
+    let streamContentPieces: string[] = [];
+    let streamReasoningPieces: string[] = [];
+    let streamStarted = false;
+    let contentBlockIndex = 0;
+
+    const sstream = new ReadableStream({
+      async start(controller) {
+        const reader = siderResp.body?.getReader();
+        if (!reader) { controller.error(new Error("无响应流")); return; }
+        const lineReader = new SSELineReader();
+        const encoder = new TextEncoder();
+
+        const sendEvent = (event: string, data: any) => {
+          controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+        };
+
+        try {
+          sendEvent("message_start", {
+            type: "message_start",
+            message: { id: msgId, type: "message", role: "assistant", model: anthroModel,
+                       content: [], stop_reason: null, usage: null },
+          });
+          sendEvent("content_block_start", {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "text", text: "" },
+          });
+
+          for await (const line of lineReader.readLines(reader)) {
+            const tl = line.trim();
+            if (!tl) continue;
+            const dl = tl.startsWith("data:") ? tl.substring(5).trim() : tl;
+            if (dl === "[DONE]") {
+              sendEvent("content_block_stop", { type: "content_block_stop", index: 0 });
+              sendEvent("message_delta", {
+                type: "message_delta",
+                delta: { stop_reason: "end_turn", stop_sequence: null },
+                usage: { output_tokens: streamContentPieces.join("").length },
+              });
+              sendEvent("message_stop", { type: "message_stop" });
+              controller.close(); return;
+            }
+            if (!dl) continue;
+            try {
+              const sd = JSON.parse(dl);
+              if (sd.code && sd.code !== 0) {
+                sendEvent("error", {
+                  type: "error",
+                  error: { type: "api_error", message: sd.msg || `code=${sd.code}` },
+                });
+                sendEvent("message_stop", { type: "message_stop" });
+                controller.close(); return;
+              }
+              const d = sd.data; if (!d) continue;
+              if (d.type === "text" && d.text) {
+                streamContentPieces.push(d.text);
+                if (!streamStarted) {
+                  sendEvent("content_block_start", {
+                    type: "content_block_start", index: 0,
+                    content_block: { type: "text", text: "" },
+                  });
+                  streamStarted = true;
+                }
+                sendEvent("content_block_delta", {
+                  type: "content_block_delta",
+                  index: 0,
+                  delta: { type: "text_delta", text: d.text },
+                });
+              } else if (d.type === "reasoning_content") {
+                const rc = d.reasoning_content;
+                const rt = (typeof rc === "object" && rc !== null && "text" in rc)
+                  ? (rc as Record<string, unknown>).text as string : "";
+                if (rt) {
+                  streamReasoningPieces.push(rt);
+                  if (streamReasoningPieces.length === 1) {
+                    // 第一个推理块: 发送 thinking block start
+                    sendEvent("content_block_start", {
+                      type: "content_block_start", index: 1,
+                      content_block: { type: "thinking", thinking: "" },
+                    });
+                  }
+                  sendEvent("content_block_delta", {
+                    type: "content_block_delta",
+                    index: 1,
+                    delta: { type: "thinking_delta", thinking: rt },
+                  });
+                }
+              }
+            } catch { /* skip */ }
+          }
+
+          sendEvent("content_block_stop", { type: "content_block_stop", index: streamStarted ? 0 : -1 });
+          sendEvent("message_delta", {
+            type: "message_delta",
+            delta: { stop_reason: "end_turn", stop_sequence: null },
+            usage: { output_tokens: streamContentPieces.join("").length },
+          });
+          sendEvent("message_stop", { type: "message_stop" });
+          controller.close();
+        } catch (err: any) { console.error("❌ Anthropic流错误:", err); controller.error(err); }
+      },
+    });
+
+    return new Response(sstream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache", "Connection": "keep-alive",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  } catch (error: any) {
+    console.error("❌ Anthropic处理错误:", error);
+    return new Response(JSON.stringify({
+      type: "error",
+      error: { type: "api_error", message: `处理请求失败: ${error.message}` },
+    }), { status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+  }
+}
+
 // ==================== 内嵌管理界面HTML (Deploy环境) ====================
 
 function getEmbeddedAdminHTML(): string {
@@ -2114,6 +2387,14 @@ async function handleRequest(req: Request): Promise<Response> {
     const isStream = geminiAction === "streamGenerateContent";
     return authMiddleware(async (req: Request) =>
       handleGeminiGenerate(req, geminiModel, isStream)
+    )(req);
+  }
+
+  // ==================== Anthropic 格式端点 ====================
+  // POST /v1/messages (Anthropic Messages API, 非流式 + 流式 stream:true)
+  if (req.method === "POST" && path === "/v1/messages") {
+    return authMiddleware(async (req: Request) =>
+      handleAnthropicMessage(req)
     )(req);
   }
 
