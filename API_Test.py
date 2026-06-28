@@ -2,10 +2,15 @@
 import requests
 import json
 import time
+import os
+from dotenv import load_dotenv
 
-# Deno Deploy API 地址
-BASE_URL = "https://deno-sider2api.spdt.work"
-AUTH_TOKEN = "sk-deno-free-key-123456"
+# 从仓库根 .env 读取配置 (优先级: 进程环境变量 > .env > 默认)
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+# Deno Deploy API 地址与服务端鉴权 Token (代码仅含占位值; 真实值在 .env 的 BASE_URL / AUTH_TOKEN)
+BASE_URL = os.getenv("BASE_URL", "https://deno-sider2api.spdt.work")
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "sk-deno-free-key-123456")
 
 # 模型列表
 MODELS = [

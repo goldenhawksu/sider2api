@@ -1,0 +1,6 @@
+# sider2api test framework dependencies
+# install: d:\Anaconda3\envs\python310\python.exe -m pip install -r requirements-test.txt
+requests>=2.31.0
+pytest>=7.4.0
+pytest-html>=4.1.0
+python-dotenv>=1.0.0

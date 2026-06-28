@@ -1,0 +1,18 @@
+# 环境变量（含敏感凭证）
+.env
+.env.local
+.env.*.local
+
+# 本地测试产物
+/tmp/
+*.log
+
+# pytest 运行产物
+.pytest_cache/
+__pycache__/
+test/reports/
+test/local_test_output.txt
+
+# IDE 个人配置
+.vscode/
+.spec-workflow/
