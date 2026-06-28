@@ -28,9 +28,13 @@ OpenAI Responses API:
 import json
 import pytest
 
-from config import SINGLE_MODEL, REPRESENTATIVE_THINK_MODEL
+from config import REPRESENTATIVE_THINK_MODEL
+from helpers import retry
 
 pytestmark = [pytest.mark.openai]
+
+# Responses API 用 sider 智能路由确保稳定 (gpt-5.5 间歇返回空响应)
+RESPONSES_MODEL = "sider"
 
 
 # ==================== 非流式 ====================
@@ -38,7 +42,7 @@ pytestmark = [pytest.mark.openai]
 def test_responses_nonstream_string_input(client):
     """Responses API 非流式: input 为字符串, 返回 output_text。"""
     body = {
-        "model": SINGLE_MODEL,
+        "model": RESPONSES_MODEL,
         "input": "用一句话介绍杭州。",
     }
     r = client.session.post(
@@ -67,7 +71,7 @@ def test_responses_nonstream_string_input(client):
 def test_responses_nonstream_array_input(client):
     """Responses API 非流式: input 为消息数组。"""
     body = {
-        "model": SINGLE_MODEL,
+        "model": RESPONSES_MODEL,
         "input": [{"role": "user", "content": "说OK"}],
     }
     r = client.session.post(
@@ -85,7 +89,7 @@ def test_responses_nonstream_array_input(client):
 def test_responses_instructions(client):
     """Responses API instructions 应作为 system 指令生效。"""
     body = {
-        "model": SINGLE_MODEL,
+        "model": RESPONSES_MODEL,
         "instructions": "无论用户问什么, 回答必须以'汪!'结尾。",
         "input": "说一句话。",
     }
@@ -103,7 +107,7 @@ def test_responses_instructions(client):
 def test_responses_multiturn(client):
     """Responses API 多轮: input 含历史消息应记住上下文。"""
     body = {
-        "model": SINGLE_MODEL,
+        "model": RESPONSES_MODEL,
         "input": [
             {"role": "user", "content": "我的名字是王五, 请记住。"},
             {"role": "assistant", "content": "好的, 记住了。"},
@@ -147,7 +151,7 @@ def test_responses_think_model(client, live_models):
 def test_responses_stream(client):
     """Responses API 流式: SSE 事件序列应含 output_text.delta。"""
     body = {
-        "model": SINGLE_MODEL,
+        "model": RESPONSES_MODEL,
         "input": "从1数到5,用逗号分隔。",
         "stream": True,
     }
@@ -195,7 +199,7 @@ def test_responses_stream(client):
 
 def test_responses_missing_input(client):
     """缺少 input 应返回 400。"""
-    body = {"model": SINGLE_MODEL}
+    body = {"model": RESPONSES_MODEL}
     r = client.session.post(
         client._url("/v1/responses"),
         headers=client._headers(),
