@@ -1,4 +1,5 @@
-import { serve } from "https://deno.land/std@0.200.0/http/server.ts";
+// 迁移到console.deno.com以后用原生deno.serve -- Weihong 2026/06/28
+// import { serve } from "https://deno.land/std@0.200.0/http/server.ts";
 
 // ==================== 配置常量 ====================
 
@@ -1953,4 +1954,15 @@ console.log(`   - AUTH_TOKEN: ${AUTH_TOKEN ? "✅ 已启用认证" : "⚠️ 未
 // 加载自定义模型
 await loadCustomModels();
 
-serve(handleRequest, { port: 8000 });
+// 迁移到console.deno.com以后用原生deno.serve -- Weihong 2026/06/28
+// serve(handleRequest, { port: 8000 });
+const PORT = parseInt(Deno.env.get("PORT") || "8000");
+
+// 使用 Deno.serve (这是 Deno Deploy 推荐的原生方式)
+Deno.serve({
+  port: PORT,
+  hostname: "0.0.0.0", // 显式指定 0.0.0.0 以确保外部可访问
+  onListen({ port, hostname }) {
+    console.log(`📍 监听地址: http://${hostname}:${port}`);
+  }
+}, handleRequest);
