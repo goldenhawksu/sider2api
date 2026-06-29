@@ -434,6 +434,20 @@ async function handleChatCompletion(req: Request): Promise<Response> {
     const messages = requestBody.messages || [];
     const lastMessage = messages[messages.length - 1];
 
+    // 能力门控 (CLAUDE.md 铁律): 上游 sider 不支持自定义 function calling。
+    // 经 test/probe_tools.py 探针确认: 顶层 tools=[{type:function}] 报 code:1000,
+    // functions[] 被静默忽略。上游只支持内置工具 (search/data_analysis/create_image)。
+    // 处理策略: 不 fake (绝不伪造 tool_calls), 优雅降级为纯文本, 并在响应中显式告知。
+    const hasCustomTools = Array.isArray(requestBody.tools) &&
+      requestBody.tools.some((t: any) => t && t.type === "function");
+    const hasLegacyFunctions = Array.isArray(requestBody.functions) && requestBody.functions.length > 0;
+    const customToolsRequested = hasCustomTools || hasLegacyFunctions;
+    const toolChoiceNone = requestBody.tool_choice === "none";
+    if (customToolsRequested && !toolChoiceNone) {
+      console.warn("⚠️ 收到自定义 function tools, 但上游 sider 不支持自定义函数调用; " +
+        "已降级为纯文本对话 (不伪造 tool_calls)。");
+    }
+
     // OpenAI-compatible: `message.content` can be either a string or an array of content blocks.
     // Some clients (e.g., newer OpenClaw versions) send: [{"type":"text","text":"..."}, ...]
     // We keep this gateway backward-compatible by flattening array content into a single string.
@@ -665,7 +679,8 @@ async function handleChatCompletion(req: Request): Promise<Response> {
 
     // 非流式响应
     if (!isStreaming) {
-      return await handleNonStreamingResponse(siderResponse, modelName, fullContext, isImageGen, sessionId);
+      return await handleNonStreamingResponse(siderResponse, modelName, fullContext, isImageGen, sessionId,
+        customToolsRequested && !toolChoiceNone);
     }
 
     // 流式响应
@@ -694,7 +709,8 @@ async function handleNonStreamingResponse(
   modelName: string,
   userPrompt: string,
   isImageGen: boolean,
-  sessionId: string
+  sessionId: string,
+  customToolsDegraded = false
 ): Promise<Response> {
   let fullText = "";
   let reasoningContentAcc = "";
@@ -802,6 +818,16 @@ async function handleNonStreamingResponse(
   // 携带推理内容 (think 模式非流式), 兼容 Anthropic/Ollama 风格
   if (reasoningContentAcc) {
     openAIResponse.choices[0].message.reasoning_content = reasoningContentAcc;
+  }
+
+  // 能力门控显式告知: 客户端请求了自定义 function tools, 但上游不支持, 已降级纯文本。
+  // 不伪造 tool_calls (铁律: 不 fake), 用扩展字段透明告知调用方。
+  if (customToolsDegraded) {
+    openAIResponse.warning = {
+      type: "tools_not_supported",
+      message: "上游 sider 不支持自定义 function calling, 已降级为纯文本对话。" +
+        "内置工具 (联网搜索/图像生成) 由模型自主触发, 无需显式传 tools。",
+    };
   }
 
   // 如果是图像生成,添加结构化图像数据
