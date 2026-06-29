@@ -322,6 +322,43 @@ function detectImageQuality(prompt: string): string {
   return "nano_banana"; // 默认标准质量
 }
 
+// 检测请求是否包含视觉输入 (图像) 块。
+// 能力门控 (CLAUDE.md): 经 test/probe_vision.py 探针确认上游不支持视觉输入,
+// 收到图像应返回标准 not_supported, 不静默丢弃让上游幻觉。
+// 兼容 OpenAI (image_url) / Anthropic (image source) / Gemini (inline_data/file_data)。
+function detectVisionInput(messages: any[]): boolean {
+  for (const m of (messages || [])) {
+    const c = m?.content;
+    if (!Array.isArray(c)) continue;
+    for (const part of c) {
+      if (!part || typeof part !== "object") continue;
+      const t = part.type;
+      if (t === "image_url" || t === "image" || t === "input_image") return true;
+      // Anthropic: {type:"image", source:{...}}; Gemini: {inline_data}/{file_data}
+      if (part.source && (part.source.type === "base64" || part.source.type === "url")) return true;
+      if (part.inline_data || part.inlineData || part.file_data || part.fileData) return true;
+    }
+  }
+  return false;
+}
+
+// 标准化 not_supported 错误响应 (能力门控统一出口)
+function notSupportedResponse(message: string, code = "vision_not_supported"): Response {
+  return new Response(JSON.stringify({
+    error: {
+      message,
+      type: "not_supported",
+      code,
+    }
+  }), {
+    status: 422,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*"
+    }
+  });
+}
+
 // 检测是否启用 Think 模式
 function shouldEnableThinkMode(modelName: string): boolean {
   return modelName.includes("-think");
@@ -433,6 +470,17 @@ async function handleChatCompletion(req: Request): Promise<Response> {
     const isStreaming = requestBody.stream ?? false;
     const messages = requestBody.messages || [];
     const lastMessage = messages[messages.length - 1];
+
+    // 能力门控 (CLAUDE.md 铁律): 上游 sider 不支持视觉输入。
+    // 经 test/probe_vision.py 决定性判别确认 (读不出图中文字, 仅幻觉)。
+    // 收到图像块直接返回标准 not_supported, 绝不静默丢给上游让其幻觉。
+    if (detectVisionInput(messages)) {
+      console.warn("⛔ 收到视觉输入(图像), 但上游 sider 不支持视觉理解; 返回 not_supported。");
+      return notSupportedResponse(
+        "上游 sider 不支持视觉输入 (图像理解)。请仅发送文本内容。" +
+        "如需图像生成, 请用绘图关键词描述 (如'画一只猫') 或调用 /v1/images/generations。"
+      );
+    }
 
     // 能力门控 (CLAUDE.md 铁律): 上游 sider 不支持自定义 function calling。
     // 经 test/probe_tools.py 探针确认: 顶层 tools=[{type:function}] 报 code:1000,
@@ -1628,6 +1676,15 @@ async function handleGeminiGenerate(
     // 入站适配: Gemini → messages[]
     const { messages } = geminiToMessages(body);
 
+    // 能力门控: Gemini contents.parts 内含 inline_data/file_data (图像) => not_supported
+    const geminiHasVision = (body.contents || []).some((c: any) =>
+      Array.isArray(c?.parts) && c.parts.some((p: any) =>
+        p && (p.inline_data || p.inlineData || p.file_data || p.fileData)));
+    if (geminiHasVision) {
+      console.warn("⛔ Gemini 收到视觉输入, 上游不支持; 返回 not_supported。");
+      return notSupportedResponse("上游 sider 不支持视觉输入 (图像理解)。请仅发送文本。");
+    }
+
     if (!messages.length) {
       return new Response(JSON.stringify({
         error: { message: "contents array is empty or invalid", type: "invalid_request_error" }
@@ -1868,6 +1925,19 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
     console.log(`📥 Anthropic ${isStream ? "stream" : "message"}: model=${body.model}`);
 
     const { messages } = anthropicToMessages(body);
+
+    // 能力门控: Anthropic content 块含 {type:"image",source:{...}} => not_supported
+    const anthroHasVision = (body.messages || []).some((m: any) =>
+      Array.isArray(m?.content) && m.content.some((b: any) =>
+        b && (b.type === "image" || b.source)));
+    if (anthroHasVision) {
+      console.warn("⛔ Anthropic 收到视觉输入, 上游不支持; 返回 not_supported。");
+      return new Response(JSON.stringify({
+        type: "error",
+        error: { type: "not_supported", message: "上游 sider 不支持视觉输入 (图像理解)。请仅发送文本。" },
+      }), { status: 422, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+    }
+
     if (!messages.length) {
       return new Response(JSON.stringify({
         type: "error",
@@ -2149,6 +2219,16 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
     console.log(`📥 Responses ${isStream ? "stream" : "nonstream"}: model=${body.model}`);
 
     const { messages, prompt } = responsesToMessages(body);
+
+    // 能力门控: Responses input 数组含 input_image 块 => not_supported
+    const respHasVision = Array.isArray(body.input) && body.input.some((m: any) =>
+      Array.isArray(m?.content) && m.content.some((b: any) =>
+        b && (b.type === "input_image" || b.type === "image_url" || b.image_url)));
+    if (respHasVision) {
+      console.warn("⛔ Responses 收到视觉输入, 上游不支持; 返回 not_supported。");
+      return notSupportedResponse("上游 sider 不支持视觉输入 (图像理解)。请仅发送文本。");
+    }
+
     if (!messages.length) {
       return new Response(JSON.stringify({
         error: { message: "input is required", type: "invalid_request_error", param: "input" },
