@@ -77,6 +77,8 @@ class ProbeResult:
     reasoning: str = ""                    # think 模式的 reasoning_content 累积
     files: list = field(default_factory=list)         # file 事件: {type,url,mimetype,width,height,...}
     tool_calls: list = field(default_factory=list)    # tool_call 状态序列
+    tool_names: set = field(default_factory=set)      # tool_call.name 去重集 (内置工具名挖掘)
+    tool_details: list = field(default_factory=list)  # tool_call 明细: {name,status,arguments}
     model_echo: set = field(default_factory=set)      # data.model 回显
     credits: list = field(default_factory=list)       # credit_info 列表
     ttft_s: Optional[float] = None
@@ -209,6 +211,13 @@ class UpstreamClient:
             elif t == "tool_call":
                 tc = d.get("tool_call", {})
                 res.tool_calls.append(tc.get("status") or tc)
+                if isinstance(tc, dict):
+                    if tc.get("name"):
+                        res.tool_names.add(tc["name"])
+                    res.tool_details.append({
+                        "name": tc.get("name"), "status": tc.get("status"),
+                        "arguments": (tc.get("arguments") or "")[:200],
+                    })
             elif t == "credit_info":
                 res.credits.append(d.get("credit_info"))
         res.total_s = round(time.perf_counter() - t0, 3)
