@@ -28,15 +28,8 @@ powershell -NoProfile -Command "
 - Deno 可执行:`~/.deno/bin/deno.exe`
 
 ### 1.2 Python 测试环境(anaconda3)
-- 解释器:`D:\ProgramData\anaconda3\python.exe`(Python 3.13.5,含 requests)
-- ⚠️ **本机坑**:git-bash 访问 D 盘该路径**间歇性失败**(`No such file or directory` / 退出码 127)。
-  推荐用 Windows 原生方式调用,或失败即重试:
-  ```bash
-  # 方式一:cmd 原生(最稳)
-  cmd //c "D:\ProgramData\anaconda3\python.exe test\local_test.py"
-  # 方式二:bash 直调(可能需重试 1-2 次)
-  "/d/ProgramData/anaconda3/python.exe" test/local_test.py
-  ```
+- 虚拟环境:`python310`(Python 3.10.18,含 requests),`conda activate python310` 激活后用 `python`。
+- ⚠️ 需先 `conda init` 初始化过对应 shell(PowerShell/cmd/bash),重开终端后 `conda activate` 方可用。
 
 ### 1.3 凭证 `.env`(已被 .gitignore 排除,切勿提交)
 ```ini
@@ -82,15 +75,16 @@ grep -a "SIDER_AUTH_TOKEN\|监听地址" server.log   # 必须看到 "SIDER_AUTH
 ```bash
 B=http://localhost:8000
 curl -s -o /dev/null -w "主页 %{http_code}\n" $B/
-curl -s $B/v1/models | "/d/ProgramData/anaconda3/python.exe" -c "import sys,json;print('模型数',len(json.load(sys.stdin)['data']))"
+curl -s $B/v1/models | python -c "import sys,json;print('模型数',len(json.load(sys.stdin)['data']))"
 curl -s -X OPTIONS $B/v1/chat/completions -D - -o /dev/null | grep -i access-control   # CORS
 curl -s $B/api/admin/stats                                                              # 管理统计
 curl -s -o /dev/null -w "404 %{http_code}\n" $B/nope                                    # 404
 ```
 
-**B. 真实业务回归(anaconda python,依赖有效 token):**
+**B. 真实业务回归(anaconda python310,依赖有效 token):**
 ```bash
-cmd //c "D:\ProgramData\anaconda3\python.exe test\local_test.py > test\local_test_output.txt 2>&1"
+conda activate python310
+python test\local_test.py > test\local_test_output.txt 2>&1
 ```
 [test/local_test.py](../test/local_test.py) 覆盖:跨模型非流式、流式 SSE、多轮会话记忆、Think 模式、图像生成。
 退出码 0 = 全通过。
@@ -109,7 +103,8 @@ git push                 # ← 必须用户同意;push 即触发 deno.com 部署
 ```bash
 sleep 30   # 等待 deno.com 部署(约 30s)
 # 用 API_Test.py(指向 .env 配置的 BASE_URL,token 在 deno.com 后台已配)
-cmd //c "D:\ProgramData\anaconda3\python.exe API_Test.py"
+conda activate python310
+python API_Test.py
 ```
 - 模型清单可直接从部署域名 `GET /v1/models` 获取。
 

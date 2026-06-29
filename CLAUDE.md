@@ -44,7 +44,7 @@
 2. **上游能力探针 (upstream probe)**：`test/probe_upstream.py`(+`test/upstream_client.py`) 直连 sider.ai, 系统化发现上游真实能力(模型/对话/think reasoning/图像/搜索/参数边界/错误码), 产出 `test/reports/upstream_capabilities_*.md`。**探针结果反过来定义 `deno_pro.ts` 该实现什么、测试该断言什么。**
 
 约定：
-- pytest，marker 分层：`smoke`/`cost`/`chat`/`stream`/`multiturn`/`think`/`image`/`perf`，并预留 `openai`/`gemini`/`anthropic`/`tools`/`vision`。命令见 [test/README.md](test/README.md)。
+- pytest，marker 分层：`smoke`/`cost`/`chat`/`stream`/`multiturn`/`think`/`image`/`perf`/`openai`/`gemini`/`anthropic`/`tools`/`vision`（全部已有对应测试覆盖）。命令见 [test/README.md](test/README.md)。
 - **额度意识**：`cost` 类用例消耗真实 sider 额度；默认跑代表子集，快速验证用 `-m smoke`（零额度）。
 - **上游限频(铁律)**：探针直连 sider.ai 内置全局节流（`--min-interval`，默认5s）。**严禁短时间高频直连上游**——会触发 sider.ai 的 IP 级封禁（实测连续高频探测后本地直连被阻断 `WinError 10051`，而 deno 部署实例仍正常，印证 middleware/分布式出口的价值）。优先通过 deno 实例间接测试，仅在必须发现上游真实能力时才低频直连。
 - 路线图扩展按 **TDD**：先写红灯（基于 probe 确认的上游能力），再实现，再转绿。上游确实不支持的，写成断言"返回标准 not_supported"。
@@ -57,6 +57,6 @@
 
 ## 六、工程约束
 
-- Python 一律用 anaconda3 的 `d:\Anaconda3\envs\python310` 运行。
+- Python 一律用 anaconda3 管理的 `python310` 虚拟环境运行（`conda activate python310` 后用 `python`）。
 - **推送主分支/远端必须经用户明确同意**（推送即上线生产）。
 - Windows 注意：跑 python 测试设 `PYTHONIOENCODING=utf-8`；`requirements*.txt` 注释保持 ASCII（pip 用 GBK 解码会报错）；联网用 `requests`（verify=True 正常），anaconda 自带 `urllib` 因 certifi 过期会证书校验失败。

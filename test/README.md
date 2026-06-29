@@ -1,12 +1,15 @@
 # sider2api 测试框架
 
 针对 `deno_pro.ts` 部署实例的 pytest 回归测试框架。覆盖当前已实现能力:
-模型清单、对话生成(流式/非流式)、多轮会话、think 模式、图像生成、错误处理、性能度量。
+OpenAI Chat / Anthropic Messages / Gemini generateContent / OpenAI Responses /
+多轮会话 / think 模式 / 图像生成 / Function Calling 降级 / Vision 门控 /
+错误处理 / 性能度量。
 
 ## 安装
 
 ```bash
-d:/Anaconda3/envs/python310/python.exe -m pip install -r ../requirements-test.txt
+conda activate python310     # 激活 anaconda3 的 python310 虚拟环境
+python -m pip install -r requirements-test.txt
 ```
 
 ## 运行(在仓库根目录执行)
@@ -43,8 +46,19 @@ BASE_URL=http://localhost:8000 pytest                    # 进程环境变量覆
 
 代表模型、超时、性能阈值见 [config.py](config.py),均可经环境变量覆盖。
 
-## 扩展(路线图)
+## 测试文件索引
 
-把 `deno_pro.ts` 扩展为多格式/多能力时,新增 `test_gemini_format.py` /
-`test_anthropic_format.py` / `test_tools.py` / `test_vision.py`,复用已注册的
-`gemini` / `anthropic` / `tools` / `vision` marker。按 TDD: 先写红灯,再实现。
+| 文件 | marker | 覆盖能力 |
+|---|---|---|
+| `test_meta.py` | `smoke` | 主页 / 模型清单契约 / CORS / 404 |
+| `test_chat.py` | `chat` | 非流式 6 模型 / 流式 / system 消息 / content 数组 |
+| `test_errors.py` | — | 缺参 400 / 鉴权 401 / 未知模型回退 / 并发 429 |
+| `test_multiturn.py` | `multiturn` | X-Session-ID 多轮记忆 |
+| `test_think.py` | `think` | -think 后缀推理 (非流式+流式) |
+| `test_image.py` | `image` | 图像生成端点 + 对话触发图像 |
+| `test_anthropic_format.py` | `anthropic` | Anthropic Messages API (7 条) |
+| `test_gemini_format.py` | `gemini` | Gemini generateContent (6 条) |
+| `test_openai_responses.py` | `openai` | OpenAI Responses API (7 条) |
+| `test_tools.py` | `tools` | Function Calling 降级 + tool_choice=none |
+| `test_vision.py` | `vision` | Vision 输入 → not_supported (4 端点) |
+| `test_performance.py` | `perf` | 非流式延迟 + 流式 TTFT/吞吐 |

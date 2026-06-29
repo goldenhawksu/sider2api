@@ -63,6 +63,8 @@ pass=26 fail=2 skip=2 err=0
 1. **流式 `reasoning_content` 非标准**: OpenAI API 不在 delta 中定义此字段，主流客户端可能忽略。当前以扩展字段暴露，供 aware 前端使用。
 2. **code:1135 语义待确认**: 仅为限流提示 `"try again after N minutes"`，已归入 rate_limit_error。若后续探针发现它是模型永不可用而非瞬时限流，需调整。
 3. **测试对上游非确定性的容错**: think 测试依赖模型是否触发推理管道，已用 retry+skip 容错，但牺牲了"每次必验推理"的刚性。
+4. **流式 `finish_reason:"stop"` 终止块缺失** (OpenAI 兼容缺口): 流式最后内容 chunk 的 `finish_reason` 仍为 `null`，
+   直接以 `data: [DONE]` 终结。主流 SDK (openai-python 等) 已兼容 `[DONE]` 终结，影响有限；低优先级。
 
 ## 已修改文件
 
