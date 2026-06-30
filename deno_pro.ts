@@ -1187,7 +1187,7 @@ function handleStreamingResponse(
 
   return new Response(stream, {
     headers: {
-      "Content-Type": "text/event-stream",
+      "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache",
       "Connection": "keep-alive",
       "Access-Control-Allow-Origin": "*",
@@ -1849,7 +1849,7 @@ async function handleGeminiGenerate(
 
     return new Response(stream, {
       headers: {
-        "Content-Type": "text/event-stream",
+        "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
         "Access-Control-Allow-Origin": "*",
@@ -2135,7 +2135,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
 
     return new Response(sstream, {
       headers: {
-        "Content-Type": "text/event-stream",
+        "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache", "Connection": "keep-alive",
         "Access-Control-Allow-Origin": "*",
       },
@@ -2387,7 +2387,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
 
     return new Response(respStream, {
       headers: {
-        "Content-Type": "text/event-stream",
+        "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache", "Connection": "keep-alive",
         "Access-Control-Allow-Origin": "*",
       },

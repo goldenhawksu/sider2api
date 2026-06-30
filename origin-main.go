@@ -272,7 +272,7 @@ func forwardToSider(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 流式响应
-	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)

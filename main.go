@@ -251,7 +251,7 @@ func forwardToSider(w http.ResponseWriter, r *http.Request, userStream bool, pro
 	} else {
 		fmt.Println("Entering Streaming Branch")
 		// 流式响应 - This branch should NOT be reached on Vercel due to forced stream=false
-		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(http.StatusOK)
