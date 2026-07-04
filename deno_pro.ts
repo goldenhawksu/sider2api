@@ -68,6 +68,8 @@ const MODEL_MAPPING: Record<string, string> = {
   "claude-4.5-sonnet-think": "claude-4.5-sonnet-think",
   "claude-sonnet-4.6": "claude-sonnet-4.6",
   "claude-sonnet-4.6-think": "claude-sonnet-4.6-think",  
+  "claude-sonnet-5": "claude-sonnet-5",  
+  "claude-sonnet-5-think": "claude-sonnet-5-think", 
   "claude-haiku-4.5": "claude-haiku-4.5",
   "claude-haiku-4.5-think": "claude-haiku-4.5-think",
 
