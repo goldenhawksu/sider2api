@@ -19,6 +19,10 @@ const ENABLE_AUTO_SEARCH = (Deno.env.get("ENABLE_AUTO_SEARCH") || "true").toLowe
 const SIDER_MAX_CHARS = 49500;
 // Sider API 词数上限（实测 code:603 触发于长对话），保守估计设为 6000 词
 const SIDER_MAX_WORDS = 6000;
+// SSE 心跳间隔(毫秒)：流式空闲(如 think 长思考、上游首字延迟)时定期发送 ping 帧，
+// 防止 nginx / 负载均衡 / 客户端在无字节间隔时掐断连接。0 关闭心跳。
+// 默认 15s，小于常见 30~60s 代理空闲超时。
+const SSE_PING_INTERVAL_MS = parseInt(Deno.env.get("SSE_PING_INTERVAL_MS") || "15000", 10);
 
 // 默认请求模板(基于真实成功的抓包数据)
 const DEFAULT_REQUEST_TEMPLATE = {
@@ -454,6 +458,54 @@ class SSELineReader {
     }
   }
 }
+
+// SSE 流安全写入 + 心跳辅助。
+// 统一维护 closed 守卫(避免 close 后再 enqueue / 二次 close 抛错)与定时 ping。
+// pingFrame 由各协议决定:
+//   - OpenAI / Gemini / Responses 用 SSE 注释行 ": ping\n\n"(所有兼容解析器忽略);
+//   - Anthropic 用官方 "event: ping\ndata: {\"type\":\"ping\"}\n\n"。
+function createSSEHeartbeat(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  encoder: TextEncoder,
+  pingFrame: string,
+) {
+  let closed = false;
+  const timer = SSE_PING_INTERVAL_MS > 0
+    ? setInterval(() => {
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(pingFrame));
+        } catch {
+          closed = true;
+        }
+      }, SSE_PING_INTERVAL_MS)
+    : undefined;
+
+  return {
+    get closed() {
+      return closed;
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      if (timer) clearInterval(timer);
+      try {
+        controller.close();
+      } catch { /* 已关闭 */ }
+    },
+    fail(err: unknown) {
+      if (closed) return;
+      closed = true;
+      if (timer) clearInterval(timer);
+      try {
+        controller.error(err);
+      } catch { /* 已关闭 */ }
+    },
+  };
+}
+
+const ANTHROPIC_PING_FRAME = `event: ping\ndata: ${JSON.stringify({ type: "ping" })}\n\n`;
+const COMMENT_PING_FRAME = ": ping\n\n";
 
 // ==================== 请求处理器 ====================
 
@@ -950,6 +1002,7 @@ function handleStreamingResponse(
 
       const lineReader = new SSELineReader();
       const encoder = new TextEncoder();
+      const hb = createSSEHeartbeat(controller, encoder, COMMENT_PING_FRAME);
       let hasStarted = false;
       let firstChunkAt: number | null = null;
       const streamT0 = Date.now();
@@ -1022,7 +1075,7 @@ function handleStreamingResponse(
 
             // 在关闭前再次等待确保所有数据都已flush
             await new Promise(resolve => setTimeout(resolve, 50));
-            controller.close();
+            hb.close();
             return;
           }
 
@@ -1163,7 +1216,7 @@ function handleStreamingResponse(
               };
               controller.enqueue(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
               controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-              controller.close();
+              hb.close();
               return;
             }
 
@@ -1178,11 +1231,11 @@ function handleStreamingResponse(
         }
 
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-        controller.close();
+        hb.close();
 
       } catch (error) {
         console.error("❌ 流式处理错误:", error);
-        controller.error(error);
+        hb.fail(error);
       }
     }
   });
@@ -1787,6 +1840,7 @@ async function handleGeminiGenerate(
         if (!reader) { controller.error(new Error("无法获取响应流")); return; }
         const lineReader = new SSELineReader();
         const encoder = new TextEncoder();
+        const hb = createSSEHeartbeat(controller, encoder, COMMENT_PING_FRAME);
 
         try {
           for await (const line of lineReader.readLines(reader)) {
@@ -1795,7 +1849,7 @@ async function handleGeminiGenerate(
             const dl = tl.startsWith("data:") ? tl.substring(5).trim() : tl;
             if (dl === "[DONE]") {
               controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-              controller.close();
+              hb.close();
               return;
             }
             if (!dl) continue;
@@ -1806,7 +1860,7 @@ async function handleGeminiGenerate(
                   error: { code: sd.code, message: sd.msg || "" }
                 })}\n\n`));
                 controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                controller.close();
+                hb.close();
                 return;
               }
               const d = sd.data;
@@ -1841,10 +1895,10 @@ async function handleGeminiGenerate(
             } catch { /* skip */ }
           }
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-          controller.close();
+          hb.close();
         } catch (err: any) {
           console.error("❌ Gemini流式错误:", err);
-          controller.error(err);
+          hb.fail(err);
         }
       }
     });
@@ -2031,73 +2085,99 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
       });
     }
 
-    // ---- 流式: Anthropic SSE 事件序列 ----
-    let streamContentPieces: string[] = [];
-    let streamReasoningPieces: string[] = [];
-    let streamStarted = false;
-    let contentBlockIndex = 0;
-
-    const sstream = new ReadableStream({
+    // ---- 流式: Anthropic SSE 事件序列 (content-block 状态机) ----
+    // 惰性开块 + 单调 index + 成对 start/stop; reasoning_content->thinking, text->text。
+    const sstream = new ReadableStream<Uint8Array>({
       async start(controller) {
         const reader = siderResp.body?.getReader();
         if (!reader) { controller.error(new Error("无响应流")); return; }
         const lineReader = new SSELineReader();
         const encoder = new TextEncoder();
+        const hb = createSSEHeartbeat(controller, encoder, ANTHROPIC_PING_FRAME);
 
         const sendEvent = (event: string, data: any) => {
+          if (hb.closed) return;
           controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
         };
 
-        try {
+        // 状态机: started 保证 message_start 只发一次; blockIndex 单调递增;
+        // currentBlock 记录当前开启的块类型, 切换类型前先 closeBlock。
+        let started = false;
+        let blockIndex = -1;
+        let currentBlock: "text" | "thinking" | null = null;
+        let outputChars = 0;
+
+        const ensureStart = () => {
+          if (started) return;
+          started = true;
           sendEvent("message_start", {
             type: "message_start",
-            message: { id: msgId, type: "message", role: "assistant", model: anthroModel,
-                       content: [], stop_reason: null, usage: null },
+            message: {
+              id: msgId, type: "message", role: "assistant", model: anthroModel,
+              content: [], stop_reason: null, stop_sequence: null,
+              usage: { input_tokens: 0, output_tokens: 0 },
+            },
           });
+        };
+        const closeBlock = () => {
+          if (currentBlock !== null) {
+            sendEvent("content_block_stop", { type: "content_block_stop", index: blockIndex });
+            currentBlock = null;
+          }
+        };
+        const openBlock = (type: "text" | "thinking") => {
+          closeBlock();
+          blockIndex += 1;
+          currentBlock = type;
           sendEvent("content_block_start", {
             type: "content_block_start",
-            index: 0,
-            content_block: { type: "text", text: "" },
+            index: blockIndex,
+            content_block: type === "thinking"
+              ? { type: "thinking", thinking: "" }
+              : { type: "text", text: "" },
           });
+        };
+        const finishOk = () => {
+          ensureStart();
+          closeBlock();
+          sendEvent("message_delta", {
+            type: "message_delta",
+            delta: { stop_reason: "end_turn", stop_sequence: null },
+            // token 估算 (约 4 字符/token), 避免用字符数直填 usage。
+            usage: { output_tokens: Math.max(1, Math.ceil(outputChars / 4)) },
+          });
+          sendEvent("message_stop", { type: "message_stop" });
+          hb.close();
+        };
+
+        try {
+          ensureStart();
 
           for await (const line of lineReader.readLines(reader)) {
             const tl = line.trim();
             if (!tl) continue;
             const dl = tl.startsWith("data:") ? tl.substring(5).trim() : tl;
-            if (dl === "[DONE]") {
-              sendEvent("content_block_stop", { type: "content_block_stop", index: 0 });
-              sendEvent("message_delta", {
-                type: "message_delta",
-                delta: { stop_reason: "end_turn", stop_sequence: null },
-                usage: { output_tokens: streamContentPieces.join("").length },
-              });
-              sendEvent("message_stop", { type: "message_stop" });
-              controller.close(); return;
-            }
+            if (dl === "[DONE]") { finishOk(); return; }
             if (!dl) continue;
             try {
               const sd = JSON.parse(dl);
               if (sd.code && sd.code !== 0) {
+                closeBlock();
                 sendEvent("error", {
                   type: "error",
                   error: { type: "api_error", message: sd.msg || `code=${sd.code}` },
                 });
                 sendEvent("message_stop", { type: "message_stop" });
-                controller.close(); return;
+                hb.close();
+                return;
               }
               const d = sd.data; if (!d) continue;
               if (d.type === "text" && d.text) {
-                streamContentPieces.push(d.text);
-                if (!streamStarted) {
-                  sendEvent("content_block_start", {
-                    type: "content_block_start", index: 0,
-                    content_block: { type: "text", text: "" },
-                  });
-                  streamStarted = true;
-                }
+                if (currentBlock !== "text") openBlock("text");
+                outputChars += d.text.length;
                 sendEvent("content_block_delta", {
                   type: "content_block_delta",
-                  index: 0,
+                  index: blockIndex,
                   delta: { type: "text_delta", text: d.text },
                 });
               } else if (d.type === "reasoning_content") {
@@ -2105,33 +2185,31 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
                 const rt = (typeof rc === "object" && rc !== null && "text" in rc)
                   ? (rc as Record<string, unknown>).text as string : "";
                 if (rt) {
-                  streamReasoningPieces.push(rt);
-                  if (streamReasoningPieces.length === 1) {
-                    // 第一个推理块: 发送 thinking block start
-                    sendEvent("content_block_start", {
-                      type: "content_block_start", index: 1,
-                      content_block: { type: "thinking", thinking: "" },
-                    });
-                  }
+                  if (currentBlock !== "thinking") openBlock("thinking");
                   sendEvent("content_block_delta", {
                     type: "content_block_delta",
-                    index: 1,
+                    index: blockIndex,
                     delta: { type: "thinking_delta", thinking: rt },
                   });
                 }
               }
-            } catch { /* skip */ }
+            } catch { /* skip 单行解析错误 */ }
           }
 
-          sendEvent("content_block_stop", { type: "content_block_stop", index: streamStarted ? 0 : -1 });
-          sendEvent("message_delta", {
-            type: "message_delta",
-            delta: { stop_reason: "end_turn", stop_sequence: null },
-            usage: { output_tokens: streamContentPieces.join("").length },
-          });
-          sendEvent("message_stop", { type: "message_stop" });
-          controller.close();
-        } catch (err: any) { console.error("❌ Anthropic流错误:", err); controller.error(err); }
+          // 上游未显式发 [DONE] 就结束的兜底
+          finishOk();
+        } catch (err: any) {
+          console.error("❌ Anthropic流错误:", err);
+          if (!hb.closed) {
+            closeBlock();
+            sendEvent("error", {
+              type: "error",
+              error: { type: "api_error", message: err?.message || "stream error" },
+            });
+            sendEvent("message_stop", { type: "message_stop" });
+          }
+          hb.close();
+        }
       },
     });
 
@@ -2323,8 +2401,10 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
         if (!reader) { controller.error(new Error("无响应流")); return; }
         const lineReader = new SSELineReader();
         const encoder = new TextEncoder();
+        const hb = createSSEHeartbeat(controller, encoder, COMMENT_PING_FRAME);
 
         const sendEvent = (event: string, data: any) => {
+          if (hb.closed) return;
           controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
         };
 
@@ -2354,7 +2434,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
               };
               sendEvent("response.completed", { type: "response.completed", response: completedResp });
               controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-              controller.close(); return;
+              hb.close(); return;
             }
             if (!dl) continue;
             try {
@@ -2365,7 +2445,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
                   error: { type: "api_error", message: sd.msg || `code=${sd.code}` },
                 });
                 controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                controller.close(); return;
+                hb.close(); return;
               }
               const d = sd.data; if (!d) continue;
               if (d.type === "text" && d.text) {
@@ -2382,8 +2462,8 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
             } catch { /* skip */ }
           }
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-          controller.close();
-        } catch (err: any) { console.error("❌ Responses流错误:", err); controller.error(err); }
+          hb.close();
+        } catch (err: any) { console.error("❌ Responses流错误:", err); hb.fail(err); }
       },
     });
 
