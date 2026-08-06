@@ -109,7 +109,7 @@ const MODEL_MAPPING: Record<string, string> = {
   "grok-4": "grok-4",
   "glm-5": "glm-5",
   "glm-5-think": "glm-5-think",
-  "Qwen3.8-Max": "Qwen3.8-Max",
+  "qwen3.8-max": "qwen3.8-max",
   "kimi-k3": "kimi-k3",
   "llama-3.1-405b": "llama-3.1-405b",
 
