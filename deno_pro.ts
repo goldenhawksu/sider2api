@@ -96,6 +96,8 @@ const MODEL_MAPPING: Record<string, string> = {
   "gemini-3.5-flash-think": "gemini-3.5-flash-think",
   "gemini-3.6-flash": "gemini-3.6-flash",
   "gemini-3.6-flash-think": "gemini-3.6-flash-think",
+  "gemini-3.7-flash": "gemini-3.7-flash",
+  "gemini-3.7-flash-think": "gemini-3.7-flash-think",
   
   // DeepSeek 系列
   "deepseek-v4-flash": "deepseek-v4-flash",
@@ -105,6 +107,7 @@ const MODEL_MAPPING: Record<string, string> = {
 
   // 其他模型
   "grok-4": "grok-4",
+  "grok-4.6": "grok-4.6",
   "glm-5": "glm-5",
   "glm-5-think": "glm-5-think",
   "qwen3.8-max": "qwen3.8-max",  
