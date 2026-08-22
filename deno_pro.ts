@@ -3326,9 +3326,12 @@ function compactNum(n: number): string {
   return String(n);
 }
 
+// 时间显示统一使用 UTC+8 (北京/上海时区), 与部署服务器所在时区 (Deno Deploy 为 UTC) 无关。
+// 手动偏移 + getUTC* 比 toLocaleString(timeZone) 更可控, 不依赖 ICU/locale 数据。
 function hhmm(iso: string): string {
   const d = new Date(iso);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  const utc8 = new Date(d.getTime() + 8 * 3600_000);
+  return `${String(utc8.getUTCHours()).padStart(2, "0")}:${String(utc8.getUTCMinutes()).padStart(2, "0")}`;
 }
 
 // 分类槽位 1-8, 超出的模型折叠成「其他」而不是循环取色
@@ -3418,10 +3421,12 @@ function statsTrendChart(trend: TrendBucketRow[]): string {
   </svg>`;
 }
 
-// 渲染 /stats 页面
-function renderStatsPage(snapshot: StatsSnapshot): string {
-  const { totals } = snapshot;
-  // 超过槽位数的模型折叠为「其他」
+// ===== stats 区块 HTML 生成 (服务端渲染 + 前端 5s 局部刷新共用) =====
+// 各区块生成函数独立, /stats 首屏与 /stats.json 的 html 片段都调用它们,
+// 保证刷新前后渲染逻辑一致 (不会因两套模板产生闪烁/抖动)。
+
+/** 折叠模型: 超过槽位数的模型合并为「其他」。返回展示用模型数组。 */
+function statsShownModels(snapshot: StatsSnapshot): ModelStatRow[] {
   const shown = snapshot.models.slice(0, STATS_SERIES_COUNT);
   const rest = snapshot.models.slice(STATS_SERIES_COUNT);
   if (rest.length > 0) {
@@ -3433,36 +3438,91 @@ function renderStatsPage(snapshot: StatsSnapshot): string {
       totalChars: rest.reduce((s, m) => s + m.totalChars, 0),
     });
   }
+  return shown;
+}
 
-  const modelRows = shown.length === 0
-    ? `<tr><td colspan="4" class="empty-row">暂无数据</td></tr>`
-    : shown.map((m, i) => `<tr>
-        <td><i class="dot" style="background:var(--s${i + 1})"></i>${escHtml(m.model)}</td>
-        <td class="num">${m.requests}</td>
-        <td class="num">${compactNum(m.totalChars)}</td>
-        <td class="num muted">${compactNum(m.inputChars)} / ${compactNum(m.outputChars)}</td>
-      </tr>`).join("");
+/** 顶部三个统计卡。 */
+function statsTilesHtml(totals: StatsSnapshot["totals"]): string {
+  return `<div class="card tile"><div class="v">${totals.requests}</div><div class="k">上游请求</div></div>
+  <div class="card tile"><div class="v">${compactNum(totals.inputChars + totals.outputChars)}</div><div class="k">字符总量</div></div>
+  <div class="card tile"><div class="v">${totals.toolCalls}</div><div class="k">工具调用</div></div>`;
+}
 
-  const recentRows = snapshot.recent.length === 0
-    ? `<tr><td colspan="5" class="empty-row">暂无数据</td></tr>`
-    : snapshot.recent.map((r) => `<tr>
-        <td class="num muted">${hhmm(r.time)}</td>
-        <td>${escHtml(r.model)}</td>
-        <td>${r.stream ? '<span class="tag ghost">stream</span>' : ""}</td>
-        <td>${r.tools.length ? escHtml(r.tools.join(", ")) : '<span class="muted">—</span>'}</td>
-        <td class="num muted">${r.ms}ms</td>
-      </tr>`).join("");
+/** header 副标题 (时间起点 + 链接)。 */
+function statsSubHtml(snapshot: StatsSnapshot): string {
+  return `自 ${escHtml(hhmm(snapshot.since))} 起 · 近 24 小时趋势 · <a href="/">服务信息</a> · <a href="/admin">管理界面</a>`;
+}
 
-  const toolRows = snapshot.tools.length === 0
-    ? `<p class="muted small">暂无工具调用</p>`
-    : `<ul class="tools">${
-      snapshot.tools.map((t) => {
-        const max = snapshot.tools[0]?.count || 1;
-        return `<li><span class="tname">${escHtml(t.name)}</span>
-          <span class="tbar"><i style="width:${(t.count / max) * 100}%"></i></span>
-          <span class="tnum">${t.count}</span></li>`;
-      }).join("")
-    }</ul>`;
+/** 模型分布表 tbody 行。 */
+function statsModelRowsHtml(shown: ModelStatRow[]): string {
+  if (shown.length === 0) {
+    return `<tr><td colspan="4" class="empty-row">暂无数据</td></tr>`;
+  }
+  return shown.map((m, i) => `<tr>
+      <td><i class="dot" style="background:var(--s${i + 1})"></i>${escHtml(m.model)}</td>
+      <td class="num">${m.requests}</td>
+      <td class="num">${compactNum(m.totalChars)}</td>
+      <td class="num muted">${compactNum(m.inputChars)} / ${compactNum(m.outputChars)}</td>
+    </tr>`).join("");
+}
+
+/** 最近请求表 tbody 行。 */
+function statsRecentRowsHtml(recent: StatsSnapshot["recent"]): string {
+  if (recent.length === 0) {
+    return `<tr><td colspan="5" class="empty-row">暂无数据</td></tr>`;
+  }
+  return recent.map((r) => `<tr>
+      <td class="num muted">${hhmm(r.time)}</td>
+      <td>${escHtml(r.model)}</td>
+      <td>${r.stream ? '<span class="tag ghost">stream</span>' : ""}</td>
+      <td>${r.tools.length ? escHtml(r.tools.join(", ")) : '<span class="muted">—</span>'}</td>
+      <td class="num muted">${r.ms}ms</td>
+    </tr>`).join("");
+}
+
+/** 工具调用频次列表。 */
+function statsToolRowsHtml(tools: StatsSnapshot["tools"]): string {
+  if (tools.length === 0) {
+    return `<p class="muted small">暂无工具调用</p>`;
+  }
+  const max = tools[0]?.count || 1;
+  return `<ul class="tools">${tools.map((t) =>
+    `<li><span class="tname">${escHtml(t.name)}</span>
+      <span class="tbar"><i style="width:${(t.count / max) * 100}%"></i></span>
+      <span class="tnum">${t.count}</span></li>`).join("")}</ul>`;
+}
+
+/** 页脚说明 (含持久化状态)。 */
+function statsFooterHtml(snapshot: StatsSnapshot): string {
+  return `${escHtml(snapshot.note)}<br>
+  ${snapshot.persisted ? "聚合数据已持久化（Deno KV），跨实例、跨重启累计。" : "⚠️ 聚合数据未持久化：仅统计当前实例，且实例回收后清零。"}
+  流式请求 ${snapshot.totals.streaming} 次。字符数以请求文本长度估算（上游流式不回传 token 用量）。`;
+}
+
+/** 环形图整块 (含 svg 外壳)。 */
+function statsDonutBlock(shown: ModelStatRow[], total: number): string {
+  return `<svg viewBox="0 0 180 180" width="150" height="150" role="img" aria-label="按模型的请求数构成">${statsDonut(shown, total)}</svg>`;
+}
+
+/** 供 /stats.json 附带的预渲染片段 (前端 5s 刷新时直接替换 innerHTML)。 */
+function statsHtmlFragments(snapshot: StatsSnapshot) {
+  const shown = statsShownModels(snapshot);
+  return {
+    tiles: statsTilesHtml(snapshot.totals),
+    sub: statsSubHtml(snapshot),
+    donut: statsDonutBlock(shown, snapshot.totals.requests),
+    modelRows: statsModelRowsHtml(shown),
+    trend: statsTrendChart(snapshot.trend),
+    toolRows: statsToolRowsHtml(snapshot.tools),
+    recentRows: statsRecentRowsHtml(snapshot.recent),
+    footer: statsFooterHtml(snapshot),
+  };
+}
+
+// 渲染 /stats 页面 (首屏完整 HTML; 此后由前端每 5s 拉 /stats.json 局部刷新, 不整页刷新)
+function renderStatsPage(snapshot: StatsSnapshot): string {
+  const shown = statsShownModels(snapshot);
+  const { totals } = snapshot;
 
   return `<!DOCTYPE html>
 <html lang="zh-CN" data-theme="auto">
@@ -3567,23 +3627,19 @@ a { color: var(--s1); }
 <body>
 <header>
   <h1>Sider2API 用量统计</h1>
-  <span class="sub">自 ${escHtml(hhmm(snapshot.since))} 起 · 近 24 小时趋势 · <a href="/">服务信息</a> · <a href="/admin">管理界面</a></span>
+  <span class="sub" id="sub-since">${statsSubHtml(snapshot)}</span>
 </header>
 
-<div class="grid-3">
-  <div class="card tile"><div class="v">${totals.requests}</div><div class="k">上游请求</div></div>
-  <div class="card tile"><div class="v">${compactNum(totals.inputChars + totals.outputChars)}</div><div class="k">字符总量</div></div>
-  <div class="card tile"><div class="v">${totals.toolCalls}</div><div class="k">工具调用</div></div>
-</div>
+<div class="grid-3" id="tiles">${statsTilesHtml(totals)}</div>
 
 <div class="row">
   <div class="card">
     <h2>模型分布</h2>
     <div class="donut-wrap">
-      <svg viewBox="0 0 180 180" width="150" height="150" role="img" aria-label="按模型的请求数构成">${statsDonut(shown, totals.requests)}</svg>
+      <div id="donut">${statsDonutBlock(shown, totals.requests)}</div>
       <table>
         <thead><tr><th>模型</th><th class="num">请求</th><th class="num">字符</th><th class="num">输入/输出</th></tr></thead>
-        <tbody>${modelRows}</tbody>
+        <tbody id="modelRows">${statsModelRowsHtml(shown)}</tbody>
       </table>
     </div>
   </div>
@@ -3593,29 +3649,58 @@ a { color: var(--s1); }
       <span><i style="background:var(--s1)"></i>输入字符</span>
       <span><i style="background:var(--s2)"></i>输出字符</span>
     </div>
-    ${statsTrendChart(snapshot.trend)}
+    <div id="trend">${statsTrendChart(snapshot.trend)}</div>
   </div>
 </div>
 
 <div class="row">
   <div class="card">
     <h2>工具调用频次</h2>
-    ${toolRows}
+    <div id="toolRows">${statsToolRowsHtml(snapshot.tools)}</div>
   </div>
   <div class="card">
     <h2>最近请求</h2>
     <table>
       <thead><tr><th>时间</th><th>模型</th><th>标记</th><th>工具</th><th class="num">耗时</th></tr></thead>
-      <tbody>${recentRows}</tbody>
+      <tbody id="recentRows">${statsRecentRowsHtml(snapshot.recent)}</tbody>
     </table>
   </div>
 </div>
 
-<footer>
-  ${escHtml(snapshot.note)}<br>
-  ${snapshot.persisted ? "聚合数据已持久化（Deno KV），跨实例、跨重启累计。" : "⚠️ 聚合数据未持久化：仅统计当前实例，且实例回收后清零。"}
-  流式请求 ${totals.streaming} 次。字符数以请求文本长度估算（上游流式不回传 token 用量）。
-</footer>
+<footer id="footer">${statsFooterHtml(snapshot)}</footer>
+
+<script>
+// 每 5 秒拉 /stats.json, 用服务端预渲染片段局部替换 DOM (不整页刷新, 不闪烁/不抖动)。
+// /stats.json 响应里附带 html 片段字段, 由服务端同一批渲染函数生成, 保证与首屏一致。
+const REFRESH_MS = 5000;
+const NODES = {
+  tiles:      'tiles',
+  sub:        'sub-since',
+  donut:      'donut',
+  modelRows:  'modelRows',
+  trend:      'trend',
+  toolRows:   'toolRows',
+  recentRows: 'recentRows',
+  footer:     'footer',
+};
+
+async function refreshStats() {
+  try {
+    const res = await fetch('/stats.json', { headers: { 'Accept': 'application/json' } });
+    if (!res.ok) return;
+    const data = await res.json();
+    const frag = data.html;   // 服务端预渲染片段
+    if (!frag) return;
+    for (const [key, id] of Object.entries(NODES)) {
+      const el = document.getElementById(id);
+      if (el && frag[key] !== undefined) el.innerHTML = frag[key];
+    }
+  } catch (e) {
+    // 网络抖动静默重试, 不打断定时器
+  }
+}
+setInterval(refreshStats, REFRESH_MS);
+</script>
 </body>
 </html>`;
 }
@@ -3657,16 +3742,20 @@ async function handleRequest(req: Request): Promise<Response> {
     });
   }
 
-  // 用量统计原始数据 (JSON, 受 auth 保护; 同一份合并快照)
+  // 用量统计原始数据 (JSON, 与 /stats 页面同级公开; 附预渲染 HTML 片段,
+  // 供页面每 5s 前端局部刷新。数据为聚合统计 + 最近请求元数据, 不含消息内容。)
   if (req.method === "GET" && path === "/stats.json") {
-    return authMiddleware(async () =>
-      new Response(JSON.stringify(await getStatsSnapshotMerged()), {
-        headers: {
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*"
-        }
-      })
-    )(req);
+    const snapshot = await getStatsSnapshotMerged();
+    const payload = {
+      ...snapshot,
+      html: statsHtmlFragments(snapshot),
+    };
+    return new Response(JSON.stringify(payload), {
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
+      }
+    });
   }
 
   // 模型列表
