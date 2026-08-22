@@ -390,6 +390,148 @@ function shouldEnableAutoSearch(prompt: string): boolean {
   return /\b(search|查一下|查询|搜索|找一下|最新|新闻|link|citation|来源)\b/i.test(prompt);
 }
 
+// ==================== 用量统计 (stats, 参考 sider2claude usage-stats) ====================
+
+// 用量统计: 进程内聚合。为保持单文件零依赖, 不接 Deno KV;
+// 局限: Deno Deploy 多实例/重启后清零, 页面页脚会注明。
+// Token 以字符数估算 (上游 Sider 流式不回传真实 usage, 沿用现有字符估算口径)。
+// 采集点覆盖: OpenAI chat / 图像生成 / Gemini / Anthropic / Responses 全部端点。
+
+interface UsageRecord {
+  model: string;
+  stream: boolean;
+  ms: number;
+  toolUses: string[];
+  inputChars: number;
+  outputChars: number;
+}
+
+interface ModelStatRow {
+  model: string;
+  requests: number;
+  inputChars: number;
+  outputChars: number;
+  totalChars: number;
+}
+
+interface TrendBucketRow {
+  at: string;
+  requests: number;
+  inputChars: number;
+  outputChars: number;
+}
+
+interface StatsSnapshot {
+  since: string;
+  totals: {
+    requests: number;
+    streaming: number;
+    toolCalls: number;
+    inputChars: number;
+    outputChars: number;
+  };
+  models: ModelStatRow[];
+  tools: Array<{ name: string; count: number }>;
+  trend: TrendBucketRow[];
+  recent: Array<{
+    time: string;
+    model: string;
+    stream: boolean;
+    tools: string[];
+    ms: number;
+    chars: number;
+  }>;
+  note: string;
+}
+
+// 最近明细保留上限(每条约 200 字节); 对外展示条数; 滑动窗口与趋势分桶
+const STATS_RECENT_LIMIT = 200;
+const STATS_RECENT_DISPLAY = 10;
+const STATS_BUCKET_MS = 60 * 60_000; // 1 小时桶 = 近 24 小时趋势
+const STATS_BUCKET_COUNT = 24;
+
+const statsStartedAt = Date.now();
+let statsTotals = {
+  requests: 0, streaming: 0, toolCalls: 0, inputChars: 0, outputChars: 0,
+};
+const statsToolCounts = new Map<string, number>();
+const statsModelMap = new Map<string, ModelStatRow>();
+const statsRecent: Array<{ at: number; record: UsageRecord }> = [];
+
+// 每次请求完成时调用 (fire-and-forget 语义: 不抛错、不阻塞响应路径)
+function recordUsage(record: UsageRecord): void {
+  statsTotals.requests += 1;
+  if (record.stream) statsTotals.streaming += 1;
+  statsTotals.toolCalls += record.toolUses.length;
+  statsTotals.inputChars += record.inputChars;
+  statsTotals.outputChars += record.outputChars;
+  for (const name of record.toolUses) {
+    statsToolCounts.set(name, (statsToolCounts.get(name) ?? 0) + 1);
+  }
+
+  let row = statsModelMap.get(record.model);
+  if (!row) {
+    row = { model: record.model, requests: 0, inputChars: 0, outputChars: 0, totalChars: 0 };
+    statsModelMap.set(record.model, row);
+  }
+  row.requests += 1;
+  row.inputChars += record.inputChars;
+  row.outputChars += record.outputChars;
+  row.totalChars += record.inputChars + record.outputChars;
+
+  statsRecent.unshift({ at: Date.now(), record });
+  if (statsRecent.length > STATS_RECENT_LIMIT) {
+    statsRecent.length = STATS_RECENT_LIMIT;
+  }
+}
+
+// 近 24 小时按小时分桶; 空桶保留保证时间轴连续。
+// 数据源是 recent(200 条上限), 高流量下早期桶会偏低——趋势形状可读, 绝对值以 totals 为准。
+function buildStatsTrend(now: number): TrendBucketRow[] {
+  const currentBucket = Math.floor(now / STATS_BUCKET_MS) * STATS_BUCKET_MS;
+  const buckets = new Map<number, TrendBucketRow>();
+  for (let i = STATS_BUCKET_COUNT - 1; i >= 0; i -= 1) {
+    const at = currentBucket - i * STATS_BUCKET_MS;
+    buckets.set(at, { at: new Date(at).toISOString(), requests: 0, inputChars: 0, outputChars: 0 });
+  }
+  for (const { at, record } of statsRecent) {
+    const key = Math.floor(at / STATS_BUCKET_MS) * STATS_BUCKET_MS;
+    const bucket = buckets.get(key);
+    if (!bucket) continue; // 落在 24 小时窗口外
+    bucket.requests += 1;
+    bucket.inputChars += record.inputChars;
+    bucket.outputChars += record.outputChars;
+  }
+  return [...buckets.values()];
+}
+
+// 生成统计快照 (供 /stats 页面与 /stats.json 使用)
+function getStatsSnapshot(now = Date.now()): StatsSnapshot {
+  const tools = [...statsToolCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([name, count]) => ({ name, count }));
+
+  const models = [...statsModelMap.values()].sort((a, b) => b.requests - a.requests);
+
+  return {
+    since: new Date(statsStartedAt).toISOString(),
+    totals: { ...statsTotals },
+    models,
+    tools,
+    trend: buildStatsTrend(now),
+    recent: statsRecent.slice(0, STATS_RECENT_DISPLAY).map(({ at, record }) => ({
+      time: new Date(at).toISOString(),
+      model: record.model,
+      stream: record.stream,
+      tools: record.toolUses,
+      ms: record.ms,
+      chars: record.inputChars + record.outputChars,
+    })),
+    note: "进程内统计, 实例重启后清零; Deno Deploy 各隔离实例独立, 仅代表当前实例。Token 以字符数估算 (上游流式不回传真实 usage)。",
+  };
+}
+
 // ==================== 图像生成互斥锁 ====================
 
 // 图像生成忙碌标志(防止并发请求)
@@ -986,6 +1128,16 @@ async function handleNonStreamingResponse(
     openAIResponse.image_data = imageData;
   }
 
+  // 用量统计: 非流式 OpenAI chat 请求
+  recordUsage({
+    model: modelName,
+    stream: false,
+    ms: 0, // 非流式耗时未单独计时; 以时间戳近似
+    toolUses: [], // 非流式路径上游工具调用仅打日志, 不解析工具名
+    inputChars: userPrompt.length,
+    outputChars: fullText.length,
+  });
+
   return new Response(JSON.stringify(openAIResponse), {
     headers: {
       "Content-Type": "application/json",
@@ -1021,6 +1173,21 @@ function handleStreamingResponse(
       const streamT0 = Date.now();
       let imageUrls: string[] = [];  // 收集图像URL
       let imageDataList: any[] = [];  // 收集图像数据
+      // 用量统计累积: 输出字符数 + 触发的内置工具名 (Set 去重)
+      let streamOutputChars = 0;
+      const streamToolNames = new Set<string>();
+
+      // 流式请求完成时统一采集 (正常出口调用)
+      const finishStreamStats = () => {
+        recordUsage({
+          model: modelName,
+          stream: true,
+          ms: Date.now() - streamT0,
+          toolUses: [...streamToolNames],
+          inputChars: 0, // 流式路径无 prompt 注入点, 输入以 0 计
+          outputChars: streamOutputChars,
+        });
+      };
 
       try {
         for await (const line of lineReader.readLines(reader)) {
@@ -1088,6 +1255,7 @@ function handleStreamingResponse(
 
             // 在关闭前再次等待确保所有数据都已flush
             await new Promise(resolve => setTimeout(resolve, 50));
+            finishStreamStats();
             hb.close();
             return;
           }
@@ -1123,6 +1291,7 @@ function handleStreamingResponse(
                   firstChunkAt = Date.now();
                   console.log("⏱️ TTFT(ms):", firstChunkAt - streamT0);
                 }
+                streamOutputChars += (siderData.data.text || "").length;
                 openAIChunk = {
                   id: `chatcmpl-${Date.now()}`,
                   object: "chat.completion.chunk",
@@ -1169,6 +1338,9 @@ function handleStreamingResponse(
 
               case "tool_call":
                 console.log("🔧 工具调用状态:", siderData.data.tool_call.status);
+                // 用量统计: 收集触发的内置工具名 (tool_call.name, 经探针确认存在)
+                const tcName = siderData.data.tool_call?.name;
+                if (tcName) streamToolNames.add(tcName);
                 break;
 
               case "reasoning_content":
@@ -1229,6 +1401,7 @@ function handleStreamingResponse(
               };
               controller.enqueue(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
               controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              finishStreamStats();
               hb.close();
               return;
             }
@@ -1244,6 +1417,7 @@ function handleStreamingResponse(
         }
 
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        finishStreamStats();
         hb.close();
 
       } catch (error) {
@@ -1634,6 +1808,16 @@ async function handleImageGeneration(req: Request): Promise<Response> {
 
     console.log(`✅ 成功收集到 ${imageUrls.length} 个图像`);
 
+    // 用量统计: 图像生成请求
+    recordUsage({
+      model: MODEL_MAPPING[model] || "sider",
+      stream: true,
+      ms: 0,
+      toolUses: ["create_image"],
+      inputChars: prompt.length,
+      outputChars: 0,
+    });
+
     // 返回 URL 格式 (b64_json 已禁用)
     const responseData = {
       created: Math.floor(Date.now() / 1000),
@@ -1840,6 +2024,15 @@ async function handleGeminiGenerate(
           }
         } catch { /* skip */ }
       }
+      // 用量统计: Gemini 非流式
+      recordUsage({
+        model: geminiModel,
+        stream: false,
+        ms: 0,
+        toolUses: [],
+        inputChars: prompt.length,
+        outputChars: fullText.length,
+      });
       const geminiResp = buildGeminiResponse(fullText || "生成完成", reasoningAcc, geminiModel);
       return new Response(JSON.stringify(geminiResp), {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
@@ -1854,6 +2047,20 @@ async function handleGeminiGenerate(
         const lineReader = new SSELineReader();
         const encoder = new TextEncoder();
         const hb = createSSEHeartbeat(controller, encoder, COMMENT_PING_FRAME);
+        // 用量统计累积
+        const gT0 = Date.now();
+        let gOutputChars = 0;
+        const gTools = new Set<string>();
+        const finishGeminiStats = () => {
+          recordUsage({
+            model: geminiModel,
+            stream: true,
+            ms: Date.now() - gT0,
+            toolUses: [...gTools],
+            inputChars: 0,
+            outputChars: gOutputChars,
+          });
+        };
 
         try {
           for await (const line of lineReader.readLines(reader)) {
@@ -1862,6 +2069,7 @@ async function handleGeminiGenerate(
             const dl = tl.startsWith("data:") ? tl.substring(5).trim() : tl;
             if (dl === "[DONE]") {
               controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              finishGeminiStats();
               hb.close();
               return;
             }
@@ -1873,11 +2081,16 @@ async function handleGeminiGenerate(
                   error: { code: sd.code, message: sd.msg || "" }
                 })}\n\n`));
                 controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                finishGeminiStats();
                 hb.close();
                 return;
               }
               const d = sd.data;
               if (!d) continue;
+
+              // 累积输出字符 (text) 与工具名 (tool_call)
+              if (d.type === "text" && d.text) gOutputChars += d.text.length;
+              if (d.type === "tool_call" && d.tool_call?.name) gTools.add(d.tool_call.name);
 
               let geminiChunk: any = null;
               if (d.type === "text" && d.text) {
@@ -1908,6 +2121,7 @@ async function handleGeminiGenerate(
             } catch { /* skip */ }
           }
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          finishGeminiStats();
           hb.close();
         } catch (err: any) {
           console.error("❌ Gemini流式错误:", err);
@@ -2092,6 +2306,15 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
           }
         } catch { /* skip */ }
       }
+      // 用量统计: Anthropic 非流式
+      recordUsage({
+        model: anthroModel,
+        stream: false,
+        ms: 0,
+        toolUses: [],
+        inputChars: prompt.length,
+        outputChars: fullText.length,
+      });
       const resp = buildAnthropicResponse(msgId, fullText || "生成完成", anthroModel, reasoningAcc);
       return new Response(JSON.stringify(resp), {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
@@ -2119,6 +2342,19 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
         let blockIndex = -1;
         let currentBlock: "text" | "thinking" | null = null;
         let outputChars = 0;
+        // 用量统计累积: 工具名 (Set 去重) + 计时
+        const anthroT0 = Date.now();
+        const anthroTools = new Set<string>();
+        const finishAnthroStats = () => {
+          recordUsage({
+            model: anthroModel,
+            stream: true,
+            ms: Date.now() - anthroT0,
+            toolUses: [...anthroTools],
+            inputChars: 0,
+            outputChars,
+          });
+        };
 
         const ensureStart = () => {
           if (started) return;
@@ -2160,6 +2396,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
             usage: { output_tokens: Math.max(1, Math.ceil(outputChars / 4)) },
           });
           sendEvent("message_stop", { type: "message_stop" });
+          finishAnthroStats();
           hb.close();
         };
 
@@ -2205,6 +2442,9 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
                     delta: { type: "thinking_delta", thinking: rt },
                   });
                 }
+              } else if (d.type === "tool_call" && d.tool_call?.name) {
+                // 用量统计: 收集触发的内置工具名
+                anthroTools.add(d.tool_call.name);
               }
             } catch { /* skip 单行解析错误 */ }
           }
@@ -2221,6 +2461,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
             });
             sendEvent("message_stop", { type: "message_stop" });
           }
+          finishAnthroStats();
           hb.close();
         }
       },
@@ -2401,6 +2642,15 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
           }
         } catch { /* skip */ }
       }
+      // 用量统计: Responses 非流式
+      recordUsage({
+        model: modelName,
+        stream: false,
+        ms: 0,
+        toolUses: [],
+        inputChars: prompt.length,
+        outputChars: fullText.length,
+      });
       const respData = buildResponsesResponse(respId, fullText || "生成完成", modelName, reasoningAcc);
       return new Response(JSON.stringify(respData), {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
@@ -2415,6 +2665,20 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
         const lineReader = new SSELineReader();
         const encoder = new TextEncoder();
         const hb = createSSEHeartbeat(controller, encoder, COMMENT_PING_FRAME);
+        // 用量统计累积
+        const rT0 = Date.now();
+        let rOutputChars = 0;
+        const rTools = new Set<string>();
+        const finishResponsesStats = () => {
+          recordUsage({
+            model: modelName,
+            stream: true,
+            ms: Date.now() - rT0,
+            toolUses: [...rTools],
+            inputChars: 0,
+            outputChars: rOutputChars,
+          });
+        };
 
         const sendEvent = (event: string, data: any) => {
           if (hb.closed) return;
@@ -2447,6 +2711,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
               };
               sendEvent("response.completed", { type: "response.completed", response: completedResp });
               controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              finishResponsesStats();
               hb.close(); return;
             }
             if (!dl) continue;
@@ -2458,11 +2723,13 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
                   error: { type: "api_error", message: sd.msg || `code=${sd.code}` },
                 });
                 controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                finishResponsesStats();
                 hb.close(); return;
               }
               const d = sd.data; if (!d) continue;
               if (d.type === "text" && d.text) {
                 if (!textStarted) textStarted = true;
+                rOutputChars += d.text.length;
                 sendEvent("response.output_text.delta", {
                   type: "response.output_text.delta",
                   item_id: respId,
@@ -2471,12 +2738,16 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
                   delta: d.text,
                 });
               }
+              if (d.type === "tool_call" && d.tool_call?.name) {
+                rTools.add(d.tool_call.name);
+              }
               // reasoning_content ignored in responses stream (kept simple)
             } catch { /* skip */ }
           }
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          finishResponsesStats();
           hb.close();
-        } catch (err: any) { console.error("❌ Responses流错误:", err); hb.fail(err); }
+        } catch (err: any) { console.error("❌ Responses流错误:", err); finishResponsesStats(); hb.fail(err); }
       },
     });
 
@@ -2770,6 +3041,322 @@ function getEmbeddedAdminHTML(): string {
 </html>`;
 }
 
+// ==================== 用量统计页面渲染 ====================
+
+// /stats 用量看板: 服务端把 StatsSnapshot 渲染成自包含 HTML (内联 SVG + CSS,
+// 无外部依赖、无构建步骤), Deno Deploy 上零额外成本, 离线也能打开。
+// 参考 sider2claude 的 stats-page.ts 设计; 本项目仅单上游 (sider), 去掉后端维度。
+// 可视化: 模型分布环形图 + 表格, 字符使用趋势面积图, 工具调用频次条形, 最近请求表格。
+
+function escHtml(value: unknown): string {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/** 1234567 -> 1.23M, 与看板表格紧凑风格一致 */
+function compactNum(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
+}
+
+function hhmm(iso: string): string {
+  const d = new Date(iso);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+// 分类槽位 1-8, 超出的模型折叠成「其他」而不是循环取色
+const STATS_SERIES_COUNT = 8;
+
+/** 环形图: 按模型请求数构成。返回 SVG 弧段。 */
+function statsDonut(models: ModelStatRow[], total: number): string {
+  if (total === 0) {
+    return `<circle cx="90" cy="90" r="62" fill="none" stroke="var(--grid)" stroke-width="26"/>
+      <text x="90" y="90" class="donut-empty" text-anchor="middle" dominant-baseline="middle">暂无数据</text>`;
+  }
+
+  const R = 62;
+  const C = 2 * Math.PI * R;
+  let offset = 0;
+  const arcs = models.map((m, i) => {
+    const frac = m.requests / total;
+    const len = frac * C;
+    // 2px 表面间隙: 相邻扇区之间留缝, 避免两色直接相接
+    const gap = models.length > 1 ? 2 : 0;
+    const dash = `${Math.max(len - gap, 0.5)} ${C - Math.max(len - gap, 0.5)}`;
+    const arc = `<circle cx="90" cy="90" r="${R}" fill="none"
+      stroke="var(--s${i + 1})" stroke-width="26"
+      stroke-dasharray="${dash}" stroke-dashoffset="${-offset}"
+      transform="rotate(-90 90 90)">
+      <title>${escHtml(m.model)}：${m.requests} 次请求（${Math.round(frac * 100)}%）</title>
+    </circle>`;
+    offset += len;
+    return arc;
+  }).join("");
+
+  return `${arcs}
+    <text x="90" y="82" class="donut-num" text-anchor="middle">${total}</text>
+    <text x="90" y="102" class="donut-cap" text-anchor="middle">总请求</text>`;
+}
+
+/** 面积图: 字符使用趋势。单一 y 轴, input/output 两条序列。 */
+function statsTrendChart(trend: TrendBucketRow[]): string {
+  const W = 720;
+  const H = 200;
+  const PAD_L = 48;
+  const PAD_B = 26;
+  const PAD_T = 12;
+  const plotW = W - PAD_L - 12;
+  const plotH = H - PAD_B - PAD_T;
+
+  const peak = Math.max(1, ...trend.map((b) => Math.max(b.inputChars, b.outputChars)));
+  const stepX = trend.length > 1 ? plotW / (trend.length - 1) : plotW;
+  const x = (i: number) => PAD_L + i * stepX;
+  const y = (v: number) => PAD_T + plotH - (v / peak) * plotH;
+
+  const line = (pick: (b: TrendBucketRow) => number) =>
+    trend.map((b, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(pick(b)).toFixed(1)}`).join(" ");
+  const area = (pick: (b: TrendBucketRow) => number) =>
+    `${line(pick)} L${x(trend.length - 1).toFixed(1)},${(PAD_T + plotH).toFixed(1)} L${x(0).toFixed(1)},${(PAD_T + plotH).toFixed(1)} Z`;
+
+  // 5 条横向参考线
+  const grid = [0, 0.25, 0.5, 0.75, 1].map((f) => {
+    const gy = PAD_T + plotH - f * plotH;
+    return `<line x1="${PAD_L}" y1="${gy.toFixed(1)}" x2="${W - 12}" y2="${gy.toFixed(1)}" class="grid"/>
+      <text x="${PAD_L - 8}" y="${(gy + 4).toFixed(1)}" class="tick" text-anchor="end">${compactNum(Math.round(peak * f))}</text>`;
+  }).join("");
+
+  // x 轴每 6 桶标一次, 避免标签相撞
+  const xLabels = trend.map((b, i) =>
+    i % 6 === 0 || i === trend.length - 1
+      ? `<text x="${x(i).toFixed(1)}" y="${H - 8}" class="tick" text-anchor="middle">${hhmm(b.at)}</text>`
+      : ""
+  ).join("");
+
+  // 悬停热区: 整列可点, 命中目标远大于数据点本身
+  const hotspots = trend.map((b, i) =>
+    `<rect x="${(x(i) - stepX / 2).toFixed(1)}" y="${PAD_T}" width="${stepX.toFixed(1)}"
+      height="${plotH}" fill="transparent">
+      <title>${hhmm(b.at)}　请求 ${b.requests}　输入 ${compactNum(b.inputChars)}　输出 ${compactNum(b.outputChars)}</title>
+    </rect>`
+  ).join("");
+
+  return `<svg viewBox="0 0 ${W} ${H}" class="trend" role="img" aria-label="近 24 小时字符使用趋势">
+    ${grid}
+    <path d="${area((b) => b.inputChars)}" fill="var(--s1)" opacity="0.14"/>
+    <path d="${line((b) => b.inputChars)}" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round"/>
+    <path d="${area((b) => b.outputChars)}" fill="var(--s2)" opacity="0.14"/>
+    <path d="${line((b) => b.outputChars)}" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round"/>
+    ${xLabels}
+    ${hotspots}
+  </svg>`;
+}
+
+// 渲染 /stats 页面
+function renderStatsPage(snapshot: StatsSnapshot): string {
+  const { totals } = snapshot;
+  // 超过槽位数的模型折叠为「其他」
+  const shown = snapshot.models.slice(0, STATS_SERIES_COUNT);
+  const rest = snapshot.models.slice(STATS_SERIES_COUNT);
+  if (rest.length > 0) {
+    shown.push({
+      model: `其他 ${rest.length} 个模型`,
+      requests: rest.reduce((s, m) => s + m.requests, 0),
+      inputChars: rest.reduce((s, m) => s + m.inputChars, 0),
+      outputChars: rest.reduce((s, m) => s + m.outputChars, 0),
+      totalChars: rest.reduce((s, m) => s + m.totalChars, 0),
+    });
+  }
+
+  const modelRows = shown.length === 0
+    ? `<tr><td colspan="4" class="empty-row">暂无数据</td></tr>`
+    : shown.map((m, i) => `<tr>
+        <td><i class="dot" style="background:var(--s${i + 1})"></i>${escHtml(m.model)}</td>
+        <td class="num">${m.requests}</td>
+        <td class="num">${compactNum(m.totalChars)}</td>
+        <td class="num muted">${compactNum(m.inputChars)} / ${compactNum(m.outputChars)}</td>
+      </tr>`).join("");
+
+  const recentRows = snapshot.recent.length === 0
+    ? `<tr><td colspan="5" class="empty-row">暂无数据</td></tr>`
+    : snapshot.recent.map((r) => `<tr>
+        <td class="num muted">${hhmm(r.time)}</td>
+        <td>${escHtml(r.model)}</td>
+        <td>${r.stream ? '<span class="tag ghost">stream</span>' : ""}</td>
+        <td>${r.tools.length ? escHtml(r.tools.join(", ")) : '<span class="muted">—</span>'}</td>
+        <td class="num muted">${r.ms}ms</td>
+      </tr>`).join("");
+
+  const toolRows = snapshot.tools.length === 0
+    ? `<p class="muted small">暂无工具调用</p>`
+    : `<ul class="tools">${
+      snapshot.tools.map((t) => {
+        const max = snapshot.tools[0]?.count || 1;
+        return `<li><span class="tname">${escHtml(t.name)}</span>
+          <span class="tbar"><i style="width:${(t.count / max) * 100}%"></i></span>
+          <span class="tnum">${t.count}</span></li>`;
+      }).join("")
+    }</ul>`;
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sider2API 用量统计</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --plane: #f9f9f7;
+  --surface: #fcfcfb;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --border: rgba(11,11,11,0.10);
+  --s1: #2a78d6;
+  --s2: #eb6834;
+  --s3: #1baf7a;
+  --s4: #eda100;
+  --s5: #e87ba4;
+  --s6: #008300;
+  --s7: #4a3aa7;
+  --s8: #e34948;
+  --warn: #fab219;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --plane: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --border: rgba(255,255,255,0.10);
+    --s1: #3987e5;
+    --s2: #d95926;
+    --s3: #199e70;
+    --s4: #c98500;
+    --s5: #d55181;
+    --s6: #008300;
+    --s7: #9085e9;
+    --s8: #e66767;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 24px;
+  background: var(--plane); color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+h1 { font-size: 18px; margin: 0; font-weight: 600; }
+.sub { color: var(--muted); font-size: 12px; }
+.grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
+.row { display: grid; grid-template-columns: 1fr 1.35fr; gap: 16px; margin-bottom: 16px; }
+@media (max-width: 900px) { .row, .grid-3 { grid-template-columns: 1fr; } }
+.card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 16px;
+}
+.card h2 { font-size: 13px; margin: 0 0 14px; font-weight: 600; color: var(--ink-2); }
+.tile .v { font-size: 26px; font-weight: 650; letter-spacing: -0.02em; }
+.tile .k { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.donut-wrap { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+.donut-num { font-size: 24px; font-weight: 650; fill: var(--ink); }
+.donut-cap { font-size: 11px; fill: var(--muted); }
+.donut-empty { font-size: 12px; fill: var(--muted); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th {
+  text-align: left; font-weight: 500; color: var(--muted); font-size: 12px;
+  padding: 6px 8px; border-bottom: 1px solid var(--grid);
+}
+td { padding: 7px 8px; border-bottom: 1px solid var(--grid); }
+tr:last-child td { border-bottom: 0; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.empty-row { text-align: center; color: var(--muted); padding: 20px 0; }
+.dot { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 7px; vertical-align: baseline; }
+.trend { width: 100%; height: auto; }
+.grid { stroke: var(--grid); stroke-width: 1; }
+.tick { font-size: 10px; fill: var(--muted); }
+.legend { display: flex; gap: 16px; font-size: 12px; color: var(--ink-2); margin-bottom: 6px; }
+.legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; }
+.tag {
+  display: inline-block; padding: 1px 7px; border-radius: 4px;
+  font-size: 11px; margin-right: 4px; border: 1px solid var(--border);
+}
+.tag.ghost { color: var(--muted); }
+.tools { list-style: none; margin: 0; padding: 0; }
+.tools li { display: grid; grid-template-columns: 1fr 120px 34px; align-items: center; gap: 10px; padding: 4px 0; }
+.tname { font-size: 13px; }
+.tbar { height: 7px; background: var(--grid); border-radius: 4px; overflow: hidden; }
+.tbar i { display: block; height: 100%; background: var(--s3); border-radius: 4px; }
+.tnum { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink-2); font-size: 12px; }
+footer { color: var(--muted); font-size: 12px; margin-top: 18px; line-height: 1.7; }
+a { color: var(--s1); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Sider2API 用量统计</h1>
+  <span class="sub">自 ${escHtml(hhmm(snapshot.since))} 起 · 近 24 小时趋势 · <a href="/">服务信息</a> · <a href="/admin">管理界面</a></span>
+</header>
+
+<div class="grid-3">
+  <div class="card tile"><div class="v">${totals.requests}</div><div class="k">上游请求</div></div>
+  <div class="card tile"><div class="v">${compactNum(totals.inputChars + totals.outputChars)}</div><div class="k">字符总量</div></div>
+  <div class="card tile"><div class="v">${totals.toolCalls}</div><div class="k">工具调用</div></div>
+</div>
+
+<div class="row">
+  <div class="card">
+    <h2>模型分布</h2>
+    <div class="donut-wrap">
+      <svg viewBox="0 0 180 180" width="150" height="150" role="img" aria-label="按模型的请求数构成">${statsDonut(shown, totals.requests)}</svg>
+      <table>
+        <thead><tr><th>模型</th><th class="num">请求</th><th class="num">字符</th><th class="num">输入/输出</th></tr></thead>
+        <tbody>${modelRows}</tbody>
+      </table>
+    </div>
+  </div>
+  <div class="card">
+    <h2>字符使用趋势（近 24 小时）</h2>
+    <div class="legend">
+      <span><i style="background:var(--s1)"></i>输入字符</span>
+      <span><i style="background:var(--s2)"></i>输出字符</span>
+    </div>
+    ${statsTrendChart(snapshot.trend)}
+  </div>
+</div>
+
+<div class="row">
+  <div class="card">
+    <h2>工具调用频次</h2>
+    ${toolRows}
+  </div>
+  <div class="card">
+    <h2>最近请求</h2>
+    <table>
+      <thead><tr><th>时间</th><th>模型</th><th>标记</th><th>工具</th><th class="num">耗时</th></tr></thead>
+      <tbody>${recentRows}</tbody>
+    </table>
+  </div>
+</div>
+
+<footer>
+  ${escHtml(snapshot.note)}<br>
+  流式请求 ${totals.streaming} 次。字符数以请求文本长度估算（上游流式不回传 token 用量）。
+</footer>
+</body>
+</html>`;
+}
+
 // ==================== 路由处理 ====================
 
 async function handleRequest(req: Request): Promise<Response> {
@@ -2795,6 +3382,28 @@ async function handleRequest(req: Request): Promise<Response> {
         "Access-Control-Allow-Origin": "*"
       }
     });
+  }
+
+  // 用量统计页面 (公开, 参考 sider2claude /stats 设计)
+  if (req.method === "GET" && path === "/stats") {
+    return new Response(renderStatsPage(getStatsSnapshot()), {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Access-Control-Allow-Origin": "*"
+      }
+    });
+  }
+
+  // 用量统计原始数据 (JSON, 受 auth 保护)
+  if (req.method === "GET" && path === "/stats.json") {
+    return authMiddleware(async () =>
+      new Response(JSON.stringify(getStatsSnapshot()), {
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        }
+      })
+    )(req);
   }
 
   // 模型列表
