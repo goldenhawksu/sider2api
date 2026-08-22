@@ -22,7 +22,7 @@ STATS_HTML_MARKERS = [
     "最近请求",
 ]
 
-SNAPSHOT_KEYS = {"since", "totals", "models", "tools", "trend", "recent", "note"}
+SNAPSHOT_KEYS = {"since", "totals", "models", "tools", "trend", "recent", "note", "persisted"}
 TOTALS_KEYS = {"requests", "streaming", "toolCalls", "inputChars", "outputChars"}
 
 

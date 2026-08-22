@@ -392,8 +392,9 @@ function shouldEnableAutoSearch(prompt: string): boolean {
 
 // ==================== 用量统计 (stats, 参考 sider2claude usage-stats) ====================
 
-// 用量统计: 进程内聚合。为保持单文件零依赖, 不接 Deno KV;
-// 局限: Deno Deploy 多实例/重启后清零, 页面页脚会注明。
+// 用量统计: 进程内聚合 + 可选 Deno KV 持久层 (STATS_KV 门控)。
+// 未设置 STATS_KV 时行为与纯进程内完全一致 (默认); 设 STATS_KV=kv 在 Deno Deploy
+// 关联平台 KV 跨实例/跨重启累计, STATS_KV=memory 本地测试 (重启清零, 不落文件)。
 // Token 以字符数估算 (上游 Sider 流式不回传真实 usage, 沿用现有字符估算口径)。
 // 采集点覆盖: OpenAI chat / 图像生成 / Gemini / Anthropic / Responses 全部端点。
 
@@ -442,6 +443,8 @@ interface StatsSnapshot {
     chars: number;
   }>;
   note: string;
+  /** 聚合数据是否来自 KV 持久层 (跨实例); false 表示仅当前进程。 */
+  persisted: boolean;
 }
 
 // 最近明细保留上限(每条约 200 字节); 对外展示条数; 滑动窗口与趋势分桶
@@ -483,6 +486,8 @@ function recordUsage(record: UsageRecord): void {
   if (statsRecent.length > STATS_RECENT_LIMIT) {
     statsRecent.length = STATS_RECENT_LIMIT;
   }
+
+  persistUsage(record); // fire-and-forget; KV 未启用时内部直接返回
 }
 
 // 近 24 小时按小时分桶; 空桶保留保证时间轴连续。
@@ -529,6 +534,263 @@ function getStatsSnapshot(now = Date.now()): StatsSnapshot {
       chars: record.inputChars + record.outputChars,
     })),
     note: "进程内统计, 实例重启后清零; Deno Deploy 各隔离实例独立, 仅代表当前实例。Token 以字符数估算 (上游流式不回传真实 usage)。",
+    persisted: false,
+  };
+}
+
+// ==================== 用量统计 - Deno KV 持久层 (STATS_KV 门控) ====================
+
+// 参考 sider2claude usage-stats-kv.ts: 只存聚合 (数值), 不存明细——recent 明细留在进程内。
+// 每请求的全部增量编码成一次 atomic commit (多个 sum mutation), fire-and-forget 执行,
+// 不阻塞响应路径; 任何失败静默降级为纯进程内统计。
+//
+// 模式选择 (STATS_KV 环境变量):
+// - "kv": 默认 openKv()。在 Deno Deploy 上连接平台分配的数据库 (需先在后台 Provision 并关联本应用)。
+// - "memory": openKv(":memory:"), 行为与纯进程内一致 (重启清零, 不落文件), 本地可测试全链路。
+// - 未设置 / 其他: 完全跳过, 行为同纯进程内 (默认)。
+//
+// ⚠️ 命名空间解耦 (与 sider2claude 共用 KV 时的关键约束):
+// sider2claude 的 usage-stats-kv 把所有键放在 ["stats", ...] 前缀下, 并用
+// kv.list({ prefix: ["stats"] }) 全量扫描聚合。sider2pro 若也用 ["stats", ...],
+// 两者共用同一 KV 库时会互相把对方的键当自己的统计解析、数据互相污染。
+// 因此这里所有键都带顶层命名空间 [STATS_KV_ROOT, "stats", ...]:
+//   - 默认 STATS_KV_ROOT = "sider2pro" → 键形如 ["sider2pro", "stats", ...],
+//     与 sider2claude 的 ["stats", ...] 完全隔离, 可安全共用同一 KV 数据库;
+//   - 可用环境变量 STATS_KV_ROOT 覆盖 (例如多实例部署时各自独立命名空间)。
+//
+// ⚠️ Deno 稳定版本地需 --unstable-kv 标志, 因此不用 import type 引用 Deno.Kv 类型,
+// 统一用 (Deno as any) 动态调用, 保证 deno check / 普通 deno run 不因未启标志而报错。
+// Deno Deploy 平台默认开放 unstable API。
+
+const STATS_KV_BUCKET_MS = 60 * 60_000; // 1 小时桶
+// 顶层命名空间: 与 sider2claude 共用 KV 时保证键完全隔离 (见上注释)
+const STATS_KV_ROOT = Deno.env.get("STATS_KV_ROOT") || "sider2pro";
+// 统计前缀 = [root, "stats", ...]; 统一入口, 后续键变更只改这里
+const statsKvPrefix = () => [STATS_KV_ROOT, "stats"] as const;
+
+let statsKvPromise: Promise<any | null> | null = null;
+
+/** 懒加载 KV。两种模式都走完整写读路径 (memory 与真 KV 代码路径一致)。失败永久降级 null。 */
+function getStatsKv(): Promise<any | null> {
+  if (!statsKvPromise) {
+    statsKvPromise = (async () => {
+      try {
+        const mode = (Deno.env.get("STATS_KV") ?? "").toLowerCase();
+        if (!mode) return null; // 未显式启用
+        const kv = mode === "kv"
+          ? await (Deno as any).openKv()
+          : await (Deno as any).openKv(":memory:");
+        // 首次写入时记下统计起点 (check 不存在才写, 重启后才会产生新值)
+        const sinceKey = [...statsKvPrefix(), "since"];
+        await kv.atomic()
+          .check({ key: sinceKey, versionstamp: null })
+          .set(sinceKey, Date.now())
+          .commit()
+          .catch(() => {});
+        return kv;
+      } catch (error) {
+        console.warn("[stats] KV 不可用, 回退纯进程内统计:", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return null;
+      }
+    })();
+  }
+  return statsKvPromise;
+}
+
+const statsKvNum = (value: unknown): number =>
+  typeof value === "bigint" ? Number(value) : Number(value ?? 0);
+
+/** 把一次请求的增量原子提交到 KV (fire-and-forget, 失败静默)。 */
+function persistUsage(record: UsageRecord): void {
+  void (async () => {
+    const kv = await getStatsKv();
+    if (!kv) return;
+
+    const bucket = Math.floor(Date.now() / STATS_KV_BUCKET_MS) * STATS_KV_BUCKET_MS;
+    const ops: any[] = [];
+    const P = statsKvPrefix();
+
+    const sum = (key: unknown[], n: number) => {
+      if (n > 0) ops.push({ key, type: "sum", value: new (Deno as any).KvU64(BigInt(n)) });
+    };
+
+    sum([...P, "requests"], 1);
+    if (record.stream) sum([...P, "streaming"], 1);
+    sum([...P, "toolCalls"], record.toolUses.length);
+    sum([...P, "inputChars"], record.inputChars);
+    sum([...P, "outputChars"], record.outputChars);
+    for (const name of record.toolUses) sum([...P, "tool", name], 1);
+
+    const m = [...P, "model", record.model];
+    sum([...m, "requests"], 1);
+    sum([...m, "inputChars"], record.inputChars);
+    sum([...m, "outputChars"], record.outputChars);
+
+    const t = [...P, "trend", bucket];
+    sum([...t, "requests"], 1);
+    sum([...t, "inputChars"], record.inputChars);
+    sum([...t, "outputChars"], record.outputChars);
+
+    await kv.atomic()
+      .mutate(...ops)
+      .commit()
+      .catch(() => { /* 静默: KV 抖动不影响进程内统计 */ });
+  })();
+}
+
+/** KV 持久化的聚合视图; KV 未启用时返回 null (调用方回退进程内)。 */
+interface PersistentStats {
+  since: number;
+  totals: {
+    requests: number;
+    streaming: number;
+    toolCalls: number;
+    inputChars: number;
+    outputChars: number;
+  };
+  models: Array<{
+    model: string;
+    requests: number;
+    inputChars: number;
+    outputChars: number;
+  }>;
+  tools: Array<{ name: string; count: number }>;
+  trend: Array<{
+    bucket: number;
+    requests: number;
+    inputChars: number;
+    outputChars: number;
+  }>;
+}
+
+/** 读取持久化聚合; 带 2s 超时, KV 不可用或超时返回 null。 */
+async function readPersistentStats(): Promise<PersistentStats | null> {
+  const kv = await getStatsKv();
+  if (!kv) return null;
+
+  try {
+    const result = await Promise.race([
+      collectPersistentStats(kv),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 2_000)),
+    ]);
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+async function collectPersistentStats(kv: any): Promise<PersistentStats | null> {
+  const P = statsKvPrefix();
+  const sinceEntry = await kv.get([...P, "since"]);
+  const totals = { requests: 0, streaming: 0, toolCalls: 0, inputChars: 0, outputChars: 0 };
+  const models: PersistentStats["models"] = [];
+  const tools: PersistentStats["tools"] = [];
+  const trend: PersistentStats["trend"] = [];
+
+  // 只扫描本命名空间前缀, 不会读到 sider2claude 的 ["stats", ...] 键
+  for await (const entry of kv.list({ prefix: P })) {
+    const key = entry.key;
+    const value = statsKvNum(entry.value);
+
+    // 键形: [root, "stats", "model", model, field] / [root, "stats", "trend", bucket, field]
+    // 相对前缀的偏移: key[0]=root, key[1]="stats", 故模型在 key[2], 字段在 key[3]
+    if (key[1] === "stats" && key[2] === "model" && key.length === 5) {
+      const model = key[3] as string;
+      const field = key[4] as string;
+      let row = models.find((m) => m.model === model);
+      if (!row) {
+        row = { model, requests: 0, inputChars: 0, outputChars: 0 };
+        models.push(row);
+      }
+      if (field === "requests" || field === "inputChars" || field === "outputChars") {
+        (row as unknown as Record<string, number>)[field] += value;
+      }
+      continue;
+    }
+
+    if (key[1] === "stats" && key[2] === "trend" && key.length === 5) {
+      const bucket = Number(key[3]);
+      const field = key[4] as string;
+      let row = trend.find((t) => t.bucket === bucket);
+      if (!row) {
+        row = { bucket, requests: 0, inputChars: 0, outputChars: 0 };
+        trend.push(row);
+      }
+      if (field === "requests" || field === "inputChars" || field === "outputChars") {
+        (row as unknown as Record<string, number>)[field] += value;
+      }
+      continue;
+    }
+
+    if (key[1] === "stats" && key[2] === "tool" && key.length === 4) {
+      tools.push({ name: key[3] as string, count: value });
+      continue;
+    }
+
+    if (key[1] === "stats" && key.length === 3 && key[2] !== "since") {
+      const field = key[2] as string;
+      if (field in totals) {
+        (totals as unknown as Record<string, number>)[field] += value;
+      }
+    }
+  }
+
+  models.sort((a, b) => b.requests - a.requests);
+  tools.sort((a, b) => b.count - a.count);
+  trend.sort((a, b) => a.bucket - b.bucket);
+
+  return {
+    since: statsKvNum(sinceEntry.value) || Date.now(),
+    totals,
+    models,
+    tools,
+    trend,
+  };
+}
+
+/**
+ * 合并快照: 聚合取 KV 持久层 (跨实例、跨重启), 明细与最近窗口取进程内。
+ * KV 未启用 / 不可用 / 读取超时 (内部 2s) 时退回纯进程内快照。
+ * `/stats`、`/stats.json` 都应使用本函数。
+ */
+async function getStatsSnapshotMerged(now = Date.now()): Promise<StatsSnapshot> {
+  const local = getStatsSnapshot(now);
+  const persistent = await readPersistentStats();
+  if (!persistent) {
+    return local;
+  }
+
+  // 近 24 个小时桶, 空桶保留 (KV 里可能还没有这些桶的 key)
+  const currentBucket = Math.floor(now / STATS_KV_BUCKET_MS) * STATS_KV_BUCKET_MS;
+  const byBucket = new Map(persistent.trend.map((t) => [t.bucket, t]));
+  const trend: TrendBucketRow[] = [];
+  for (let i = STATS_BUCKET_COUNT - 1; i >= 0; i -= 1) {
+    const at = currentBucket - i * STATS_KV_BUCKET_MS;
+    const row = byBucket.get(at);
+    trend.push({
+      at: new Date(at).toISOString(),
+      requests: row?.requests ?? 0,
+      inputChars: row?.inputChars ?? 0,
+      outputChars: row?.outputChars ?? 0,
+    });
+  }
+
+  return {
+    ...local,
+    since: new Date(persistent.since).toISOString(),
+    totals: { ...persistent.totals },
+    models: persistent.models
+      .map((m) => ({
+        ...m,
+        totalChars: m.inputChars + m.outputChars,
+      }))
+      .sort((a, b) => b.requests - a.requests),
+    tools: persistent.tools.slice(0, 8),
+    trend,
+    note: "聚合数据持久化于 Deno KV, 跨实例、跨重启累计; 最近请求明细与近 24 小时窗口仅当前实例。Token 以字符数估算 (上游流式不回传真实 usage)。",
+    persisted: true,
   };
 }
 
@@ -3351,6 +3613,7 @@ a { color: var(--s1); }
 
 <footer>
   ${escHtml(snapshot.note)}<br>
+  ${snapshot.persisted ? "聚合数据已持久化（Deno KV），跨实例、跨重启累计。" : "⚠️ 聚合数据未持久化：仅统计当前实例，且实例回收后清零。"}
   流式请求 ${totals.streaming} 次。字符数以请求文本长度估算（上游流式不回传 token 用量）。
 </footer>
 </body>
@@ -3384,9 +3647,9 @@ async function handleRequest(req: Request): Promise<Response> {
     });
   }
 
-  // 用量统计页面 (公开, 参考 sider2claude /stats 设计)
+  // 用量统计页面 (公开, 参考 sider2claude /stats 设计; 聚合取 KV 持久层, 明细取进程内)
   if (req.method === "GET" && path === "/stats") {
-    return new Response(renderStatsPage(getStatsSnapshot()), {
+    return new Response(renderStatsPage(await getStatsSnapshotMerged()), {
       headers: {
         "Content-Type": "text/html; charset=utf-8",
         "Access-Control-Allow-Origin": "*"
@@ -3394,10 +3657,10 @@ async function handleRequest(req: Request): Promise<Response> {
     });
   }
 
-  // 用量统计原始数据 (JSON, 受 auth 保护)
+  // 用量统计原始数据 (JSON, 受 auth 保护; 同一份合并快照)
   if (req.method === "GET" && path === "/stats.json") {
     return authMiddleware(async () =>
-      new Response(JSON.stringify(getStatsSnapshot()), {
+      new Response(JSON.stringify(await getStatsSnapshotMerged()), {
         headers: {
           "Content-Type": "application/json",
           "Access-Control-Allow-Origin": "*"
