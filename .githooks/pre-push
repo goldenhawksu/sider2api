@@ -1,0 +1,55 @@
+#!/bin/sh
+# sider2api 推送门禁: 每次 git push 前自动运行集成回归测试, 100% 通过才放行。
+#
+# 原理: 推送 main 会触发 deno.com 生产部署 (SOP 铁律: 推送即上线)。
+# 本 hook 用【当前工作区代码】起本地临时实例跑完整回归, 失败即拦截推送。
+#
+# 逃生门: git push --no-verify   (git 原生, 绕过 hook; 仅在紧急/已人工确认时使用)
+#
+# 安装: git config core.hooksPath .githooks   (在仓库根执行一次)
+# 快速自检: SIDER2API_SMOKE=1 git push   (只跑零额度冒烟, 不完整回归)
+
+# 定位仓库根 (hook 可能从任意 cwd 触发)
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$ROOT" ]; then
+  echo "[pre-push] 无法定位仓库根, 跳过门禁 (请检查 git 状态)" >&2
+  exit 0
+fi
+cd "$ROOT" || exit 1
+
+echo ""
+echo "=========================================="
+echo "🚦 sider2api 推送门禁: 集成回归测试"
+echo "=========================================="
+echo ""
+
+# 找到 python310 (anaconda3)。优先级: 环境变量 > 常见路径。
+PY="${PYTHON310:-}"
+if [ -z "$PY" ]; then
+  for cand in \
+    "/d/anaconda3/envs/python310/python.exe" \
+    "$HOME/anaconda3/envs/python310/python.exe" \
+    "/c/Users/$USERNAME/anaconda3/envs/python310/python.exe"
+  do
+    if [ -f "$cand" ]; then
+      PY="$cand"
+      break
+    fi
+  done
+fi
+if [ -z "$PY" ]; then
+  PY="python"
+fi
+
+echo "🐍 Python: $PY"
+echo ""
+
+# 运行门禁回归。--smoke 可快速自检; 默认完整回归。
+# 临时设 PYTHONIOENCODING 避免 Windows 控制台 GBK 乱码导致输出误判。
+export PYTHONIOENCODING=utf-8
+if [ "$SIDER2API_SMOKE" = "1" ]; then
+  echo "(SIDER2API_SMOKE=1 已设置 -> 快速冒烟模式)"
+  exec "$PY" "$ROOT/scripts/run_regression.py" --smoke
+else
+  exec "$PY" "$ROOT/scripts/run_regression.py"
+fi
