@@ -410,6 +410,8 @@ interface UsageRecord {
 interface ModelStatRow {
   model: string;
   requests: number;
+  /** 该模型的请求失败次数 (上游错误/能力门控/异常出口)。 */
+  failures: number;
   inputChars: number;
   outputChars: number;
   totalChars: number;
@@ -474,7 +476,7 @@ function recordUsage(record: UsageRecord): void {
 
   let row = statsModelMap.get(record.model);
   if (!row) {
-    row = { model: record.model, requests: 0, inputChars: 0, outputChars: 0, totalChars: 0 };
+    row = { model: record.model, requests: 0, failures: 0, inputChars: 0, outputChars: 0, totalChars: 0 };
     statsModelMap.set(record.model, row);
   }
   row.requests += 1;
@@ -488,6 +490,19 @@ function recordUsage(record: UsageRecord): void {
   }
 
   persistUsage(record); // fire-and-forget; KV 未启用时内部直接返回
+}
+
+// 记录一次失败的请求 (上游错误/能力门控/异常出口)。
+// 单独函数: 失败路径没有完整的 UsageRecord (无 token/工具信息), 只关心模型维度计数。
+function recordFailure(model: string): void {
+  let row = statsModelMap.get(model);
+  if (!row) {
+    row = { model, requests: 0, failures: 0, inputChars: 0, outputChars: 0, totalChars: 0 };
+    statsModelMap.set(model, row);
+  }
+  row.failures += 1;
+
+  persistFailure(model); // fire-and-forget; KV 未启用时内部直接返回
 }
 
 // 近 24 小时按小时分桶; 空桶保留保证时间轴连续。
@@ -563,6 +578,13 @@ function getStatsSnapshot(now = Date.now()): StatsSnapshot {
 // Deno Deploy 平台默认开放 unstable API。
 
 const STATS_KV_BUCKET_MS = 60 * 60_000; // 1 小时桶
+// 趋势桶保留时长: 页面只展示近 24 小时 (24 桶), 25 小时前的旧桶回收,
+// 防止 trend 桶键无限增长拖慢 kv.list 全量扫描。回收是双保险:
+//   1) collectPersistentStats 读取时跳过并删除过期桶;
+//   2) persistUsage 跨小时桶时触发一次 cleanupStaleTrendKeys (覆盖无人访问场景)。
+const STATS_KV_TREND_RETENTION_MS = 25 * 60 * 60_000;
+// 上次触发 KV 清理的小时桶 (进程级: 每小时最多清理一次, 多实例重复清理无害)
+let lastKvCleanupBucket = 0;
 // 顶层命名空间: 与 sider2claude 共用 KV 时保证键完全隔离 (见上注释)
 const STATS_KV_ROOT = Deno.env.get("STATS_KV_ROOT") || "sider2pro";
 // 统计前缀 = [root, "stats", ...]; 统一入口, 后续键变更只改这里
@@ -637,7 +659,64 @@ function persistUsage(record: UsageRecord): void {
       .mutate(...ops)
       .commit()
       .catch(() => { /* 静默: KV 抖动不影响进程内统计 */ });
+
+    // 双保险之一: 每次请求写入都顺带回收过期趋势桶 (lastKvCleanupBucket 去重为每小时一次,
+    // 覆盖长时间无人访问 /stats 页面的场景)
+    cleanupStaleTrendKeys(kv);
   })();
+}
+
+/** 把一次失败计数持久化到 KV (fire-and-forget, 失败静默)。 */
+function persistFailure(model: string): void {
+  void (async () => {
+    const kv = await getStatsKv();
+    if (!kv) return;
+    const P = statsKvPrefix();
+    await kv.atomic()
+      .mutate({ key: [...P, "model", model, "failures"], type: "sum", value: new (Deno as any).KvU64(1n) })
+      .commit()
+      .catch(() => { /* 静默 */ });
+  })();
+}
+
+/**
+ * 回收过期趋势桶: 删除保留期 (STATS_KV_TREND_RETENTION_MS) 之前的
+ * [root, "stats", "trend", bucket, field] 键, 防止 KV 键无限增长。
+ *
+ * 触发时机 (双保险):
+ *   - collectPersistentStats 读取时顺带清理;
+ *   - persistUsage 检测到新小时桶时触发 (覆盖长时间无访问场景)。
+ *
+ * 进程级 lastKvCleanupBucket 保证每小时最多触发一次清理扫描;
+ * Deno Deploy 多实例各自独立触发, 重复删除无害 (KV 删除幂等)。
+ */
+async function cleanupStaleTrendKeys(kv: any): Promise<void> {
+  try {
+    const nowBucket = Math.floor(Date.now() / STATS_KV_BUCKET_MS);
+    if (lastKvCleanupBucket === nowBucket) return; // 本小时已清理过
+    lastKvCleanupBucket = nowBucket;
+
+    const P = statsKvPrefix();
+    const cutoff = Date.now() - STATS_KV_TREND_RETENTION_MS;
+    const stale: unknown[][] = [];
+    for await (const entry of kv.list({ prefix: [...P, "trend"] })) {
+      const k = entry.key;
+      if (k[1] === "stats" && k[2] === "trend" && k.length === 5) {
+        const bucket = Number(k[3]);
+        if (bucket < cutoff) stale.push(k);
+      }
+    }
+    if (stale.length === 0) return;
+    // 分批删除, 避免单次 atomic 超过 KV 事务上限 (通常 1000 键)
+    for (let i = 0; i < stale.length; i += 900) {
+      const batch = stale.slice(i, i + 900);
+      const ops = batch.map((key) => ({ key, type: "delete" as const }));
+      await kv.atomic().mutate(...ops).commit().catch(() => {});
+    }
+    console.log(`🧹 [stats] KV 清理 ${stale.length} 个过期趋势桶键`);
+  } catch {
+    // 静默: 清理失败不影响主流程
+  }
 }
 
 /** KV 持久化的聚合视图; KV 未启用时返回 null (调用方回退进程内)。 */
@@ -653,6 +732,7 @@ interface PersistentStats {
   models: Array<{
     model: string;
     requests: number;
+    failures: number;
     inputChars: number;
     outputChars: number;
   }>;
@@ -701,10 +781,10 @@ async function collectPersistentStats(kv: any): Promise<PersistentStats | null> 
       const field = key[4] as string;
       let row = models.find((m) => m.model === model);
       if (!row) {
-        row = { model, requests: 0, inputChars: 0, outputChars: 0 };
+        row = { model, requests: 0, failures: 0, inputChars: 0, outputChars: 0 };
         models.push(row);
       }
-      if (field === "requests" || field === "inputChars" || field === "outputChars") {
+      if (field === "requests" || field === "failures" || field === "inputChars" || field === "outputChars") {
         (row as unknown as Record<string, number>)[field] += value;
       }
       continue;
@@ -928,6 +1008,7 @@ const COMMENT_PING_FRAME = ": ping\n\n";
 
 // 处理文本对话请求
 async function handleChatCompletion(req: Request): Promise<Response> {
+  let modelName = "sider"; // 函数级: catch 出口的失败统计也要用
   try {
     const requestBody = await req.json();
     console.log("📥 收到聊天请求:", {
@@ -936,7 +1017,7 @@ async function handleChatCompletion(req: Request): Promise<Response> {
       messageCount: requestBody.messages?.length
     });
 
-    const modelName = requestBody.model || "sider";
+    modelName = requestBody.model || "sider";
     const siderModel = MODEL_MAPPING[modelName] || "sider";
     const isStreaming = requestBody.stream ?? false;
     const messages = requestBody.messages || [];
@@ -947,6 +1028,7 @@ async function handleChatCompletion(req: Request): Promise<Response> {
     // 收到图像块直接返回标准 not_supported, 绝不静默丢给上游让其幻觉。
     if (detectVisionInput(messages)) {
       console.warn("⛔ 收到视觉输入(图像), 但上游 sider 不支持视觉理解; 返回 not_supported。");
+      recordFailure(modelName); // 失败统计: 能力门控拒绝
       return notSupportedResponse(
         "上游 sider 不支持视觉输入 (图像理解)。请仅发送文本内容。" +
         "如需图像生成, 请用绘图关键词描述 (如'画一只猫') 或调用 /v1/images/generations。"
@@ -1183,6 +1265,7 @@ async function handleChatCompletion(req: Request): Promise<Response> {
         message = upstreamMsg || "上游模型使用额度已达上限, 请稍后重试。";
         type = "rate_limit_error";
       }
+      recordFailure(modelName); // 失败统计: 上游 HTTP 错误
       return new Response(JSON.stringify({
         error: { message, type, upstream_code: upstreamCode }
       }), {
@@ -1207,6 +1290,7 @@ async function handleChatCompletion(req: Request): Promise<Response> {
 
   } catch (error: any) {
     console.error("❌ 处理聊天请求错误:", error);
+    recordFailure(modelName); // 失败统计: 异常出口
     return new Response(JSON.stringify({
       error: {
         message: `处理请求失败: ${error.message}`,
@@ -1703,6 +1787,7 @@ function handleStreamingResponse(
 
 // 处理图像生成请求(专用端点)
 async function handleImageGeneration(req: Request): Promise<Response> {
+  let model = "dall-e-3"; // 函数级: catch 出口的失败统计也要用
   // ==================== 并发控制:检查是否已有图像生成进行中 ====================
   if (isImageGenerating) {
     const elapsedTime = Date.now() - currentGenerationStartTime;
@@ -1761,7 +1846,7 @@ async function handleImageGeneration(req: Request): Promise<Response> {
     }
 
     // 可选参数 - 完全符合 OpenAI 标准
-    const model = requestBody.model || "dall-e-3";  // 默认模型
+    model = requestBody.model || "dall-e-3";  // 默认模型
     const n = Math.min(Math.max(parseInt(requestBody.n) || 1, 1), 10);  // 1-10 之间
     const size = requestBody.size || "1024x1024";  // 支持: 256x256, 512x512, 1024x1024, 1024x1792, 1792x1024
     const quality = requestBody.quality || "standard";  // standard 或 hd
@@ -2098,6 +2183,7 @@ async function handleImageGeneration(req: Request): Promise<Response> {
 
   } catch (error: any) {
     console.error("❌ 图像生成错误:", error);
+    recordFailure(MODEL_MAPPING[model] || "sider"); // 失败统计: 异常/上游错误出口
     return new Response(JSON.stringify({
       error: {
         message: `图像生成失败: ${error.message}`,
@@ -2196,6 +2282,7 @@ async function handleGeminiGenerate(
         p && (p.inline_data || p.inlineData || p.file_data || p.fileData)));
     if (geminiHasVision) {
       console.warn("⛔ Gemini 收到视觉输入, 上游不支持; 返回 not_supported。");
+      recordFailure(geminiModel); // 失败统计: 能力门控拒绝
       return notSupportedResponse("上游 sider 不支持视觉输入 (图像理解)。请仅发送文本。");
     }
 
@@ -2256,6 +2343,7 @@ async function handleGeminiGenerate(
     if (!siderResponse.ok) {
       const errorText = await siderResponse.text();
       console.error("❌ Gemini上游错误:", errorText);
+      recordFailure(geminiModel); // 失败统计: 上游 HTTP 错误
       return new Response(JSON.stringify({
         error: { message: `上游错误: ${siderResponse.status}`, type: "upstream_error" }
       }), { status: 502, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
@@ -2402,6 +2490,7 @@ async function handleGeminiGenerate(
     });
   } catch (error: any) {
     console.error("❌ Gemini处理错误:", error);
+    recordFailure(geminiModel); // 失败统计: 异常出口
     return new Response(JSON.stringify({
       error: { message: `处理请求失败: ${error.message}`, type: "server_error" }
     }), { status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
@@ -2464,6 +2553,7 @@ function buildAnthropicResponse(
 
 // 处理 Anthropic 请求 (非流式 + 流式)
 async function handleAnthropicMessage(req: Request): Promise<Response> {
+  let anthroModel = "claude-sonnet-4.6"; // 函数级: catch 出口的失败统计也要用
   try {
     const body = await req.json();
     const isStream = body.stream === true;
@@ -2471,12 +2561,16 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
 
     const { messages } = anthropicToMessages(body);
 
+    // 提前赋值模型名: 视觉门控等早期出口的失败统计需要真实模型 (而非默认值)
+    anthroModel = body.model || "claude-sonnet-4.6";
+
     // 能力门控: Anthropic content 块含 {type:"image",source:{...}} => not_supported
     const anthroHasVision = (body.messages || []).some((m: any) =>
       Array.isArray(m?.content) && m.content.some((b: any) =>
         b && (b.type === "image" || b.source)));
     if (anthroHasVision) {
       console.warn("⛔ Anthropic 收到视觉输入, 上游不支持; 返回 not_supported。");
+      recordFailure(anthroModel); // 失败统计: 能力门控拒绝
       return new Response(JSON.stringify({
         type: "error",
         error: { type: "not_supported", message: "上游 sider 不支持视觉输入 (图像理解)。请仅发送文本。" },
@@ -2490,7 +2584,6 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
       }), { status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
     }
 
-    const anthroModel = body.model || "claude-sonnet-4.6";
     const siderModel = MODEL_MAPPING[anthroModel] || "sider";
     const isThink = shouldEnableThinkMode(anthroModel);
     const msgId = `msg_${Date.now()}`;
@@ -2538,6 +2631,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
     if (!siderResp.ok) {
       const errorText = await siderResp.text();
       console.error("❌ Anthropic上游错误:", errorText);
+      recordFailure(anthroModel); // 失败统计: 上游 HTTP 错误
       return new Response(JSON.stringify({
         type: "error",
         error: { type: "api_error", message: `上游错误: ${siderResp.status}` },
@@ -2738,6 +2832,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
     });
   } catch (error: any) {
     console.error("❌ Anthropic处理错误:", error);
+    recordFailure(anthroModel); // 失败统计: 异常出口
     return new Response(JSON.stringify({
       type: "error",
       error: { type: "api_error", message: `处理请求失败: ${error.message}` },
@@ -2809,6 +2904,7 @@ function buildResponsesResponse(
 }
 
 async function handleOpenAIResponse(req: Request): Promise<Response> {
+  let modelName = "sider"; // 函数级: catch 出口的失败统计也要用
   try {
     const body = await req.json();
     const isStream = body.stream === true;
@@ -2822,6 +2918,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
         b && (b.type === "input_image" || b.type === "image_url" || b.image_url)));
     if (respHasVision) {
       console.warn("⛔ Responses 收到视觉输入, 上游不支持; 返回 not_supported。");
+      recordFailure(modelName); // 失败统计: 能力门控拒绝
       return notSupportedResponse("上游 sider 不支持视觉输入 (图像理解)。请仅发送文本。");
     }
 
@@ -2831,7 +2928,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
       }), { status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
     }
 
-    const modelName = body.model || "sider";
+    modelName = body.model || "sider";
     const siderModel = MODEL_MAPPING[modelName] || "sider";
     const isThink = shouldEnableThinkMode(modelName);
     const respId = `resp_${Date.now()}`;
@@ -2875,6 +2972,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
     clearTimeout(upstreamTimeout);
 
     if (!siderResp.ok) {
+      recordFailure(modelName); // 失败统计: 上游 HTTP 错误
       return new Response(JSON.stringify({
         error: { message: `上游错误: ${siderResp.status}`, type: "api_error" },
       }), { status: 502, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
@@ -3022,6 +3120,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
     });
   } catch (error: any) {
     console.error("❌ Responses处理错误:", error);
+    recordFailure(modelName); // 失败统计: 异常出口
     return new Response(JSON.stringify({
       error: { message: `处理请求失败: ${error.message}`, type: "server_error" },
     }), { status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
@@ -3433,6 +3532,7 @@ function statsShownModels(snapshot: StatsSnapshot): ModelStatRow[] {
     shown.push({
       model: `其他 ${rest.length} 个模型`,
       requests: rest.reduce((s, m) => s + m.requests, 0),
+      failures: rest.reduce((s, m) => s + m.failures, 0),
       inputChars: rest.reduce((s, m) => s + m.inputChars, 0),
       outputChars: rest.reduce((s, m) => s + m.outputChars, 0),
       totalChars: rest.reduce((s, m) => s + m.totalChars, 0),
@@ -3453,14 +3553,17 @@ function statsSubHtml(snapshot: StatsSnapshot): string {
   return `自 ${escHtml(hhmm(snapshot.since))} 起 · 近 24 小时趋势 · <a href="/">服务信息</a> · <a href="/admin">管理界面</a>`;
 }
 
-/** 模型分布表 tbody 行。 */
+/** 模型分布表 tbody 行。失败列: 有失败时红色高亮, 无失败灰色。 */
 function statsModelRowsHtml(shown: ModelStatRow[]): string {
   if (shown.length === 0) {
-    return `<tr><td colspan="4" class="empty-row">暂无数据</td></tr>`;
+    return `<tr><td colspan="5" class="empty-row">暂无数据</td></tr>`;
   }
   return shown.map((m, i) => `<tr>
       <td><i class="dot" style="background:var(--s${i + 1})"></i>${escHtml(m.model)}</td>
       <td class="num">${m.requests}</td>
+      <td class="num">${m.failures > 0
+        ? `<span class="fail-num">${m.failures}</span>`
+        : `<span class="muted">0</span>`}</td>
       <td class="num">${compactNum(m.totalChars)}</td>
       <td class="num muted">${compactNum(m.inputChars)} / ${compactNum(m.outputChars)}</td>
     </tr>`).join("");
@@ -3601,6 +3704,7 @@ td { padding: 7px 8px; border-bottom: 1px solid var(--grid); }
 tr:last-child td { border-bottom: 0; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
 .muted { color: var(--muted); }
+.fail-num { color: var(--warn); font-weight: 650; }
 .small { font-size: 12px; }
 .empty-row { text-align: center; color: var(--muted); padding: 20px 0; }
 .dot { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 7px; vertical-align: baseline; }
@@ -3638,7 +3742,7 @@ a { color: var(--s1); }
     <div class="donut-wrap">
       <div id="donut">${statsDonutBlock(shown, totals.requests)}</div>
       <table>
-        <thead><tr><th>模型</th><th class="num">请求</th><th class="num">字符</th><th class="num">输入/输出</th></tr></thead>
+        <thead><tr><th>模型</th><th class="num">请求</th><th class="num">失败</th><th class="num">字符</th><th class="num">输入/输出</th></tr></thead>
         <tbody id="modelRows">${statsModelRowsHtml(shown)}</tbody>
       </table>
     </div>

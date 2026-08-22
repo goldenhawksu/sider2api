@@ -70,6 +70,54 @@ def test_stats_json_contract(client):
     frag = snap.get("html", {})
     missing = HTML_FRAGMENT_KEYS - set(frag.keys())
     assert not missing, f"html 片段缺区块: {missing}"
+    # 模型行须含 failures 字段 (失败统计)
+    for m in snap["models"]:
+        assert "failures" in m, f"模型 {m.get('model')} 缺 failures 字段"
+        assert m["failures"] >= 0
+
+
+def test_stats_page_shows_failures_column(client):
+    """/stats 模型分布表含"失败"列 (表头 + 数据行均带 failures)。"""
+    page = client.get("/stats", auth=False)
+    assert page.status_code == 200
+    # 表头含失败列
+    assert "失败</th>" in page.text
+    # 页面渲染逻辑引用了失败计数类
+    assert "fail-num" in page.text
+
+
+@pytest.mark.chat
+def test_stats_failure_recorded_on_vision_gate(client):
+    """能力门控 (视觉输入 not_supported) 应记录该模型的失败数。
+
+    零成本: 视觉门控在入站即拒绝, 不触达上游。金额消耗: 0。
+    """
+    model = config.SINGLE_MODEL
+    r_before = client.get("/stats.json", auth=False)
+    before = r_before.json()
+    before_fail = 0
+    for m in before["models"]:
+        if m["model"] == model:
+            before_fail = m.get("failures", 0)
+            break
+
+    # 发送带视觉输入的请求 -> 422 not_supported
+    r = client.chat(model, [{"role": "user", "content": [
+        {"type": "text", "text": "这是什么?"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/x.jpg"}},
+    ]}], stream=False)
+    assert r.status_code == 422, f"视觉门控应返回 422: {r.status_code} {r.text[:100]}"
+
+    r_after = client.get("/stats.json", auth=False)
+    snap = r_after.json()
+    after_fail = 0
+    for m in snap["models"]:
+        if m["model"] == model:
+            after_fail = m.get("failures", 0)
+            break
+    assert after_fail >= before_fail + 1, (
+        f"视觉门控失败未计入: {model} before={before_fail} after={after_fail}"
+    )
 
 
 def test_stats_page_utc8_timestamps(client):
