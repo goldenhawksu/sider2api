@@ -472,8 +472,9 @@ let statsTotals = {
   requests: 0, streaming: 0, toolCalls: 0, inputChars: 0, outputChars: 0,
 };
 const statsToolCounts = new Map<string, number>();
-const statsModelMap = new Map<string, ModelStatRow>();
 const statsRecent: Array<{ at: number; record: UsageRecord }> = [];
+// 失败事件时间戳 (供 24h 模型分布的失败计数; 与 recent 同上限, 新在前)
+const statsFailureRecent: Array<{ at: number; model: string }> = [];
 
 // 每次请求完成时调用 (fire-and-forget 语义: 不抛错、不阻塞响应路径)
 function recordUsage(record: UsageRecord): void {
@@ -486,16 +487,6 @@ function recordUsage(record: UsageRecord): void {
     statsToolCounts.set(name, (statsToolCounts.get(name) ?? 0) + 1);
   }
 
-  let row = statsModelMap.get(record.model);
-  if (!row) {
-    row = { model: record.model, requests: 0, failures: 0, inputChars: 0, outputChars: 0, totalChars: 0 };
-    statsModelMap.set(record.model, row);
-  }
-  row.requests += 1;
-  row.inputChars += record.inputChars;
-  row.outputChars += record.outputChars;
-  row.totalChars += record.inputChars + record.outputChars;
-
   statsRecent.unshift({ at: Date.now(), record });
   if (statsRecent.length > STATS_RECENT_LIMIT) {
     statsRecent.length = STATS_RECENT_LIMIT;
@@ -506,13 +497,12 @@ function recordUsage(record: UsageRecord): void {
 
 // 记录一次失败的请求 (上游错误/能力门控/异常出口)。
 // 单独函数: 失败路径没有完整的 UsageRecord (无 token/工具信息), 只关心模型维度计数。
+// 失败事件带时间戳入队, 供 24h 窗口的模型分布失败计数。
 function recordFailure(model: string): void {
-  let row = statsModelMap.get(model);
-  if (!row) {
-    row = { model, requests: 0, failures: 0, inputChars: 0, outputChars: 0, totalChars: 0 };
-    statsModelMap.set(model, row);
+  statsFailureRecent.unshift({ at: Date.now(), model });
+  if (statsFailureRecent.length > STATS_RECENT_LIMIT) {
+    statsFailureRecent.length = STATS_RECENT_LIMIT;
   }
-  row.failures += 1;
 
   persistFailure(model); // fire-and-forget; KV 未启用时内部直接返回
 }
@@ -537,6 +527,41 @@ function buildStatsTrend(now: number): TrendBucketRow[] {
   return [...buckets.values()];
 }
 
+// 近 24 小时窗口的模型分布聚合 (进程内)。
+// 数据源: statsRecent (带时间戳的请求记录) + statsFailureRecent (带时间戳的失败事件)。
+// 与 buildStatsTrend 同口径: 只统计 24 小时窗口内的记录, 窗口外忽略。
+function buildStatsModels(now: number): ModelStatRow[] {
+  const cutoff = now - STATS_BUCKET_MS * STATS_BUCKET_COUNT;
+  const map = new Map<string, ModelStatRow>();
+
+  // 请求记录 (成功路径: requests/inputChars/outputChars/totalChars)
+  for (const { at, record } of statsRecent) {
+    if (at < cutoff) continue; // 落在 24 小时窗口外
+    let row = map.get(record.model);
+    if (!row) {
+      row = { model: record.model, requests: 0, failures: 0, inputChars: 0, outputChars: 0, totalChars: 0 };
+      map.set(record.model, row);
+    }
+    row.requests += 1;
+    row.inputChars += record.inputChars;
+    row.outputChars += record.outputChars;
+    row.totalChars += record.inputChars + record.outputChars;
+  }
+
+  // 失败事件 (失败路径: failures 计数)
+  for (const { at, model } of statsFailureRecent) {
+    if (at < cutoff) continue; // 落在 24 小时窗口外
+    let row = map.get(model);
+    if (!row) {
+      row = { model, requests: 0, failures: 0, inputChars: 0, outputChars: 0, totalChars: 0 };
+      map.set(model, row);
+    }
+    row.failures += 1;
+  }
+
+  return [...map.values()].sort((a, b) => b.requests - a.requests);
+}
+
 // 生成统计快照 (供 /stats 页面与 /stats.json 使用)
 function getStatsSnapshot(now = Date.now()): StatsSnapshot {
   const tools = [...statsToolCounts.entries()]
@@ -544,7 +569,7 @@ function getStatsSnapshot(now = Date.now()): StatsSnapshot {
     .slice(0, 8)
     .map(([name, count]) => ({ name, count }));
 
-  const models = [...statsModelMap.values()].sort((a, b) => b.requests - a.requests);
+  const models = buildStatsModels(now);
 
   return {
     since: new Date(statsStartedAt).toISOString(),
@@ -590,6 +615,9 @@ function getStatsSnapshot(now = Date.now()): StatsSnapshot {
 // Deno Deploy 平台默认开放 unstable API。
 
 const STATS_KV_BUCKET_MS = 60 * 60_000; // 1 小时桶
+// 模型分布与趋势图同窗口: 近 24 小时 (24 桶)。KV 里模型维度键挂在趋势桶下,
+// 聚合模型分布时只统计此窗口内的桶 (与进程内 buildStatsModels 口径一致)。
+const STATS_KV_MODEL_WINDOW_MS = STATS_BUCKET_COUNT * STATS_KV_BUCKET_MS; // 24h
 // 趋势桶保留时长: 页面只展示近 24 小时 (24 桶), 25 小时前的旧桶回收,
 // 防止 trend 桶键无限增长拖慢 kv.list 全量扫描。回收是双保险:
 //   1) collectPersistentStats 读取时跳过并删除过期桶;
@@ -657,15 +685,16 @@ function persistUsage(record: UsageRecord): void {
     sum([...P, "outputChars"], record.outputChars);
     for (const name of record.toolUses) sum([...P, "tool", name], 1);
 
-    const m = [...P, "model", record.model];
-    sum([...m, "requests"], 1);
-    sum([...m, "inputChars"], record.inputChars);
-    sum([...m, "outputChars"], record.outputChars);
-
     const t = [...P, "trend", bucket];
     sum([...t, "requests"], 1);
     sum([...t, "inputChars"], record.inputChars);
     sum([...t, "outputChars"], record.outputChars);
+
+    // 每小时每模型维度: 供近 24h 模型分布 (跨实例一致, 与趋势同窗口; 键会随趋势桶一起回收)
+    const tm = [...P, "trend", bucket, "model", record.model];
+    sum([...tm, "requests"], 1);
+    sum([...tm, "inputChars"], record.inputChars);
+    sum([...tm, "outputChars"], record.outputChars);
 
     await kv.atomic()
       .mutate(...ops)
@@ -678,14 +707,22 @@ function persistUsage(record: UsageRecord): void {
   })();
 }
 
-/** 把一次失败计数持久化到 KV (fire-and-forget, 失败静默)。 */
+/** 把一次失败计数持久化到 KV (fire-and-forget, 失败静默)。
+ * 键: [root, "stats", "trend", bucket, "model", model, "failures"] — 小时桶内模型维度,
+ * 随趋势桶回收, 供近 24h 模型分布的失败计数。
+ */
 function persistFailure(model: string): void {
   void (async () => {
     const kv = await getStatsKv();
     if (!kv) return;
     const P = statsKvPrefix();
+    const bucket = Math.floor(Date.now() / STATS_KV_BUCKET_MS) * STATS_KV_BUCKET_MS;
     await kv.atomic()
-      .mutate({ key: [...P, "model", model, "failures"], type: "sum", value: new (Deno as any).KvU64(1n) })
+      .mutate({
+        key: [...P, "trend", bucket, "model", model, "failures"],
+        type: "sum",
+        value: new (Deno as any).KvU64(1n),
+      })
       .commit()
       .catch(() => { /* 静默 */ });
   })();
@@ -713,7 +750,8 @@ async function cleanupStaleTrendKeys(kv: any): Promise<void> {
     const stale: unknown[][] = [];
     for await (const entry of kv.list({ prefix: [...P, "trend"] })) {
       const k = entry.key;
-      if (k[1] === "stats" && k[2] === "trend" && k.length === 5) {
+      // 趋势总量键 [.., bucket, field] (len 5) 或模型维度键 [.., bucket, "model", model, field] (len 7)
+      if (k[1] === "stats" && k[2] === "trend" && (k.length === 5 || k.length === 7)) {
         const bucket = Number(k[3]);
         if (bucket < cutoff) stale.push(k);
       }
@@ -777,20 +815,28 @@ async function collectPersistentStats(kv: any): Promise<PersistentStats | null> 
   const P = statsKvPrefix();
   const sinceEntry = await kv.get([...P, "since"]);
   const totals = { requests: 0, streaming: 0, toolCalls: 0, inputChars: 0, outputChars: 0 };
+  // 24h 窗口的模型分布 (从 trend 桶的模型维度键聚合; 与趋势图同窗口口径)
   const models: PersistentStats["models"] = [];
   const tools: PersistentStats["tools"] = [];
   const trend: PersistentStats["trend"] = [];
+  // 当前 24h 窗口起点 (ms) — 只聚合窗口内的模型维度桶 (与进程内 buildStatsModels 同口径)
+  const modelCutoff = Date.now() - STATS_KV_MODEL_WINDOW_MS;
 
   // 只扫描本命名空间前缀, 不会读到 sider2claude 的 ["stats", ...] 键
   for await (const entry of kv.list({ prefix: P })) {
     const key = entry.key;
     const value = statsKvNum(entry.value);
 
-    // 键形: [root, "stats", "model", model, field] / [root, "stats", "trend", bucket, field]
-    // 相对前缀的偏移: key[0]=root, key[1]="stats", 故模型在 key[2], 字段在 key[3]
-    if (key[1] === "stats" && key[2] === "model" && key.length === 5) {
-      const model = key[3] as string;
-      const field = key[4] as string;
+    // 键形: [root, "stats", "trend", bucket, field] (趋势总量)
+    //       [root, "stats", "trend", bucket, "model", model, field] (模型维度, 供 24h 模型分布)
+    // 相对前缀的偏移: key[0]=root, key[1]="stats", key[2]="trend",
+    //   bucket 在 key[3], 模型维度标志 "model" 在 key[4], 模型名在 key[5], 字段在 key[6]
+    if (key[1] === "stats" && key[2] === "trend" && key[4] === "model" && key.length === 7) {
+      // 模型维度键: 只聚合近 24h 窗口的桶 (旧桶随趋势清理已删除, 此处双保险跳过窗口外)
+      const bucket = Number(key[3]);
+      if (bucket < modelCutoff) continue;
+      const model = key[5] as string;
+      const field = key[6] as string;
       let row = models.find((m) => m.model === model);
       if (!row) {
         row = { model, requests: 0, failures: 0, inputChars: 0, outputChars: 0 };

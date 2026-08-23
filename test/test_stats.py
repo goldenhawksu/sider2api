@@ -170,14 +170,31 @@ def test_stats_reflects_chat_request(client):
     models = {m["model"]: m for m in snap["models"]}
     assert model in models, f"模型 {model} 未出现在分布中: {list(models)[:5]}"
     row = models[model]
-    for k in ("requests", "inputChars", "outputChars", "totalChars"):
+    for k in ("requests", "inputChars", "outputChars", "totalChars", "failures"):
         assert k in row
     # 最近请求明细应包含本次 (新在前)
     assert snap["recent"], "recent 为空"
     newest = snap["recent"][0]
     for k in ("time", "model", "stream", "tools", "ms", "chars"):
         assert k in newest, f"recent 行缺字段: {k}"
-    # 结构完整性: 字符总量与模型合计一致 (进程内单实例下应吻合)
-    assert snap["totals"]["inputChars"] + snap["totals"]["outputChars"] == sum(
-        m["totalChars"] for m in snap["models"]
-    ), "totals 与 models 合计不一致"
+
+
+@pytest.mark.chat
+def test_stats_models_match_24h_window(client):
+    """模型分布是 24h 窗口 (与趋势图同口径), 而非累计全量。
+
+    断言: models 的总请求数 ≤ 当前窗口内趋势桶请求数之和 (因 recent 有 200 条
+    上限, 高流量下可能略低, 但绝不应超过 24h 桶之和)。金额消耗: 0 (只读)。
+    """
+    snap = client.get("/stats.json", auth=False).json()
+    models_total = sum(m["requests"] for m in snap["models"])
+    trend_total = sum(b["requests"] for b in snap["trend"])
+    # 模型分布来自窗口内 recent 聚合; trend 来自小时桶。两者同窗口,
+    # 差异仅来自 recent 200 条上限 (高流量下 trend 可能更高)。
+    assert models_total <= trend_total + 2, (
+        f"模型分布应 ≤ 24h 窗口趋势总量: models={models_total} trend={trend_total}"
+    )
+    # 若窗口内有流量, 模型分布不应为空
+    if trend_total > 0:
+        assert snap["models"], "24h 窗口内有请求但模型分布为空"
+    # 注意: totals 是累计全量, models 是 24h 窗口, 二者无需一致 (设计如此)
