@@ -432,6 +432,8 @@ interface ModelStatRow {
 interface TrendBucketRow {
   at: string;
   requests: number;
+  /** 该桶内调用失败次数 (上游错误/能力门控/异常)。 */
+  failures: number;
   inputChars: number;
   outputChars: number;
 }
@@ -514,7 +516,7 @@ function buildStatsTrend(now: number): TrendBucketRow[] {
   const buckets = new Map<number, TrendBucketRow>();
   for (let i = STATS_BUCKET_COUNT - 1; i >= 0; i -= 1) {
     const at = currentBucket - i * STATS_BUCKET_MS;
-    buckets.set(at, { at: new Date(at).toISOString(), requests: 0, inputChars: 0, outputChars: 0 });
+    buckets.set(at, { at: new Date(at).toISOString(), requests: 0, failures: 0, inputChars: 0, outputChars: 0 });
   }
   for (const { at, record } of statsRecent) {
     const key = Math.floor(at / STATS_BUCKET_MS) * STATS_BUCKET_MS;
@@ -717,12 +719,11 @@ function persistFailure(model: string): void {
     if (!kv) return;
     const P = statsKvPrefix();
     const bucket = Math.floor(Date.now() / STATS_KV_BUCKET_MS) * STATS_KV_BUCKET_MS;
+    // 注意: Deno KV 的 mutate() 接受可变参数, 不能传数组 (会抛 Invalid mutation type)
+    const m1 = { key: [...P, "trend", bucket, "model", model, "failures"], type: "sum", value: new (Deno as any).KvU64(1n) };
+    const m2 = { key: [...P, "trend", bucket, "failures"], type: "sum", value: new (Deno as any).KvU64(1n) };
     await kv.atomic()
-      .mutate({
-        key: [...P, "trend", bucket, "model", model, "failures"],
-        type: "sum",
-        value: new (Deno as any).KvU64(1n),
-      })
+      .mutate(m1, m2)
       .commit()
       .catch(() => { /* 静默 */ });
   })();
@@ -790,6 +791,7 @@ interface PersistentStats {
   trend: Array<{
     bucket: number;
     requests: number;
+    failures: number;
     inputChars: number;
     outputChars: number;
   }>;
@@ -853,10 +855,10 @@ async function collectPersistentStats(kv: any): Promise<PersistentStats | null> 
       const field = key[4] as string;
       let row = trend.find((t) => t.bucket === bucket);
       if (!row) {
-        row = { bucket, requests: 0, inputChars: 0, outputChars: 0 };
+        row = { bucket, requests: 0, failures: 0, inputChars: 0, outputChars: 0 };
         trend.push(row);
       }
-      if (field === "requests" || field === "inputChars" || field === "outputChars") {
+      if (field === "requests" || field === "failures" || field === "inputChars" || field === "outputChars") {
         (row as unknown as Record<string, number>)[field] += value;
       }
       continue;
@@ -910,6 +912,7 @@ async function getStatsSnapshotMerged(now = Date.now()): Promise<StatsSnapshot> 
     trend.push({
       at: new Date(at).toISOString(),
       requests: row?.requests ?? 0,
+      failures: row?.failures ?? 0,
       inputChars: row?.inputChars ?? 0,
       outputChars: row?.outputChars ?? 0,
     });
@@ -3703,7 +3706,7 @@ function statsDonut(models: ModelStatRow[], total: number): string {
     <text x="90" y="102" class="donut-cap" text-anchor="middle">总请求</text>`;
 }
 
-/** 面积图: 字符使用趋势。单一 y 轴, input/output 两条序列。 */
+/** 面积图: Token 使用趋势 + 调用失败曲线。单一 y 轴 (Token), 失败用独立缩放叠加。 */
 function statsTrendChart(trend: TrendBucketRow[]): string {
   const W = 720;
   const H = 200;
@@ -3714,16 +3717,19 @@ function statsTrendChart(trend: TrendBucketRow[]): string {
   const plotH = H - PAD_B - PAD_T;
 
   const peak = Math.max(1, ...trend.map((b) => Math.max(b.inputChars, b.outputChars)));
+  // 失败曲线独立缩放 (失败数远小于 Token 量级, 共用 y 轴会被压成一条线)
+  const failPeak = Math.max(1, ...trend.map((b) => b.failures));
   const stepX = trend.length > 1 ? plotW / (trend.length - 1) : plotW;
   const x = (i: number) => PAD_L + i * stepX;
   const y = (v: number) => PAD_T + plotH - (v / peak) * plotH;
+  const yFail = (v: number) => PAD_T + plotH - (v / failPeak) * plotH;
 
-  const line = (pick: (b: TrendBucketRow) => number) =>
-    trend.map((b, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(pick(b)).toFixed(1)}`).join(" ");
+  const line = (pick: (b: TrendBucketRow) => number, yFn: (v: number) => number) =>
+    trend.map((b, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${yFn(pick(b)).toFixed(1)}`).join(" ");
   const area = (pick: (b: TrendBucketRow) => number) =>
-    `${line(pick)} L${x(trend.length - 1).toFixed(1)},${(PAD_T + plotH).toFixed(1)} L${x(0).toFixed(1)},${(PAD_T + plotH).toFixed(1)} Z`;
+    `${line(pick, y)} L${x(trend.length - 1).toFixed(1)},${(PAD_T + plotH).toFixed(1)} L${x(0).toFixed(1)},${(PAD_T + plotH).toFixed(1)} Z`;
 
-  // 5 条横向参考线
+  // 5 条横向参考线 (Token 轴)
   const grid = [0, 0.25, 0.5, 0.75, 1].map((f) => {
     const gy = PAD_T + plotH - f * plotH;
     return `<line x1="${PAD_L}" y1="${gy.toFixed(1)}" x2="${W - 12}" y2="${gy.toFixed(1)}" class="grid"/>
@@ -3741,16 +3747,17 @@ function statsTrendChart(trend: TrendBucketRow[]): string {
   const hotspots = trend.map((b, i) =>
     `<rect x="${(x(i) - stepX / 2).toFixed(1)}" y="${PAD_T}" width="${stepX.toFixed(1)}"
       height="${plotH}" fill="transparent">
-      <title>${hhmm(b.at)}　请求 ${b.requests}　输入 ${compactNum(b.inputChars)}　输出 ${compactNum(b.outputChars)}</title>
+      <title>${hhmm(b.at)}　请求 ${b.requests}　失败 ${b.failures}　输入 ${compactNum(b.inputChars)}　输出 ${compactNum(b.outputChars)}</title>
     </rect>`
   ).join("");
 
-  return `<svg viewBox="0 0 ${W} ${H}" class="trend" role="img" aria-label="近 24 小时字符使用趋势">
+  return `<svg viewBox="0 0 ${W} ${H}" class="trend" role="img" aria-label="近 24 小时 Token 使用趋势与调用失败">
     ${grid}
     <path d="${area((b) => b.inputChars)}" fill="var(--s1)" opacity="0.14"/>
-    <path d="${line((b) => b.inputChars)}" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round"/>
+    <path d="${line((b) => b.inputChars, y)}" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round"/>
     <path d="${area((b) => b.outputChars)}" fill="var(--s2)" opacity="0.14"/>
-    <path d="${line((b) => b.outputChars)}" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round"/>
+    <path d="${line((b) => b.outputChars, y)}" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round"/>
+    <path d="${line((b) => b.failures, yFail)}" fill="none" stroke="var(--s3)" stroke-width="2" stroke-linejoin="round" stroke-dasharray="4 3"/>
     ${xLabels}
     ${hotspots}
   </svg>`;
@@ -3978,16 +3985,17 @@ a { color: var(--s1); }
     <div class="donut-wrap">
       <div id="donut">${statsDonutBlock(shown, totals.requests)}</div>
       <table>
-        <thead><tr><th>模型</th><th class="num">请求</th><th class="num">失败</th><th class="num">字符</th><th class="num">输入/输出</th></tr></thead>
+        <thead><tr><th>模型</th><th class="num">请求</th><th class="num">失败</th><th class="num">Token</th><th class="num">输入/输出</th></tr></thead>
         <tbody id="modelRows">${statsModelRowsHtml(shown)}</tbody>
       </table>
     </div>
   </div>
   <div class="card">
-    <h2>字符使用趋势（近 24 小时）</h2>
+    <h2>Token 使用趋势（近 24 小时）</h2>
     <div class="legend">
-      <span><i style="background:var(--s1)"></i>输入字符</span>
-      <span><i style="background:var(--s2)"></i>输出字符</span>
+      <span><i style="background:var(--s1)"></i>输入 Token</span>
+      <span><i style="background:var(--s2)"></i>输出 Token</span>
+      <span><i style="background:var(--s3)"></i>调用失败</span>
     </div>
     <div id="trend">${statsTrendChart(snapshot.trend)}</div>
   </div>
