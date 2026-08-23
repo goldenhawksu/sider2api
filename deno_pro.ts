@@ -24,6 +24,18 @@ const SIDER_MAX_WORDS = 6000;
 // 默认 15s，小于常见 30~60s 代理空闲超时。
 const SSE_PING_INTERVAL_MS = parseInt(Deno.env.get("SSE_PING_INTERVAL_MS") || "15000", 10);
 
+// ==================== 上游调用限速门控 ====================
+// 对 sider 上游的每次调用做模型级限速，防止单模型突发流量打爆上游额度/触发 IP 级限流。
+// - 滑动窗口: 每模型每 60s 最多 RATE_LIMIT_MAX_CALLS 次调用。
+// - 熔断: 调用失败后该模型熔断 RATE_LIMIT_BREAKER_MS；opus 模型熔断 1 小时 (旗舰级更保守)。
+// - 超限/熔断直接返回标准化 429 rate_limit_error，不消耗上游额度。
+const RATE_LIMIT_WINDOW_MS = parseInt(Deno.env.get("RATE_LIMIT_WINDOW_MS") || "60000", 10); // 窗口 60s
+const RATE_LIMIT_MAX_CALLS = parseInt(Deno.env.get("RATE_LIMIT_MAX_CALLS") || "6", 10);      // 每窗口最多 6 次
+const RATE_LIMIT_BREAKER_MS = parseInt(Deno.env.get("RATE_LIMIT_BREAKER_MS") || "60000", 10); // 普通模型熔断 1 分钟
+const RATE_LIMIT_BREAKER_OPUS_MS = parseInt(Deno.env.get("RATE_LIMIT_BREAKER_OPUS_MS") || "3600000", 10); // opus 熔断 1 小时
+// 是否启用限速 (默认开; 测试/调试可关)
+const RATE_LIMIT_ENABLED = (Deno.env.get("RATE_LIMIT_ENABLED") || "true").toLowerCase() === "true";
+
 // 默认请求模板(基于真实成功的抓包数据)
 const DEFAULT_REQUEST_TEMPLATE = {
   "stream": true,
@@ -874,6 +886,160 @@ async function getStatsSnapshotMerged(now = Date.now()): Promise<StatsSnapshot> 
   };
 }
 
+// ==================== 上游调用限速门控 ====================
+
+// 每模型限速状态: 滑动窗口计数 + 熔断截止时间。
+// 窗口按 WINDOW_MS 对齐到整段 (与统计趋势桶同思路), 每窗口最多 MAX_CALLS 次。
+interface RateLimitState {
+  windowStart: number;  // 当前窗口起始 (毫秒时间戳)
+  count: number;        // 当前窗口已调用次数
+  breakerUntil: number; // 熔断截止时间; 0 = 未熔断
+}
+
+// 模型 → 限速状态 (内存 Map, 实例重启后重置; 与会话存储同生命周期)
+const rateLimitMap = new Map<string, RateLimitState>();
+
+/** opus 模型判定: 名字含 "opus" (claude-opus-*) 的旗舰级, 熔断时长更长。 */
+function isOpusModel(model: string): boolean {
+  return model.includes("opus");
+}
+
+/** 获取或初始化某模型的限速状态。 */
+function getRateLimitState(model: string): RateLimitState {
+  let st = rateLimitMap.get(model);
+  if (!st) {
+    st = { windowStart: 0, count: 0, breakerUntil: 0 };
+    rateLimitMap.set(model, st);
+  }
+  return st;
+}
+
+/**
+ * 检查某模型当前是否允许调用上游。
+ * @returns { allowed: boolean; retryAfterSec: number } allowed=false 时 retryAfterSec 为建议重试秒数
+ */
+function checkRateLimit(model: string): { allowed: boolean; retryAfterSec: number } {
+  if (!RATE_LIMIT_ENABLED) return { allowed: true, retryAfterSec: 0 };
+
+  const now = Date.now();
+  const st = getRateLimitState(model);
+
+  // 1. 熔断检查: 熔断中且未到期 -> 拒绝
+  if (st.breakerUntil > now) {
+    const retryAfterSec = Math.ceil((st.breakerUntil - now) / 1000);
+    return { allowed: false, retryAfterSec };
+  }
+
+  // 2. 窗口滑动: 若已超出当前窗口, 重置计数
+  if (now - st.windowStart >= RATE_LIMIT_WINDOW_MS) {
+    st.windowStart = now;
+    st.count = 0;
+  }
+
+  // 3. 配额检查: 达到上限 -> 拒绝, 建议等窗口剩余时间
+  if (st.count >= RATE_LIMIT_MAX_CALLS) {
+    const windowRemain = RATE_LIMIT_WINDOW_MS - (now - st.windowStart);
+    const retryAfterSec = Math.max(1, Math.ceil(windowRemain / 1000));
+    return { allowed: false, retryAfterSec };
+  }
+
+  return { allowed: true, retryAfterSec: 0 };
+}
+
+/** 调用上游前: 通过限速则计入配额 (在 checkRateLimit 通过后、fetch 前调用)。 */
+function acquireRateLimitSlot(model: string): void {
+  const st = getRateLimitState(model);
+  // 窗口滑动 (与 check 相同的对齐逻辑; 若跨窗口则重置)
+  if (Date.now() - st.windowStart >= RATE_LIMIT_WINDOW_MS) {
+    st.windowStart = Date.now();
+    st.count = 0;
+  }
+  st.count += 1;
+}
+
+/** 调用上游成功: 熔断状态复位 (成功后解除任何历史熔断)。 */
+function recordUpstreamSuccess(model: string): void {
+  const st = getRateLimitState(model);
+  st.breakerUntil = 0;
+}
+
+/**
+ * 调用上游失败: 触发熔断。opus 模型熔断 1 小时, 其他 1 分钟。
+ * 熔断期内 checkRateLimit 会拒绝该模型的所有调用。
+ */
+function recordUpstreamFailure(model: string): void {
+  const st = getRateLimitState(model);
+  const breakerMs = isOpusModel(model) ? RATE_LIMIT_BREAKER_OPUS_MS : RATE_LIMIT_BREAKER_MS;
+  st.breakerUntil = Date.now() + breakerMs;
+  console.warn(`⛔ [限速] ${model} 上游调用失败, 熔断 ${Math.round(breakerMs / 1000)} 秒`);
+}
+
+/** 限速拒绝的标准化响应 (OpenAI 兼容 rate_limit_error, 带 Retry-After)。 */
+function rateLimitedResponse(model: string, retryAfterSec: number): Response {
+  const retryAfter = Math.max(1, retryAfterSec);
+  // 熔断时长文案按模型类型判定 (opus 1 小时/其他 1 分钟), 不依赖剩余秒数,
+  // 避免剩余时间略低于整时长时文案误判。
+  const breakerLabel = isOpusModel(model) ? "1 小时" : "1 分钟";
+  return new Response(JSON.stringify({
+    error: {
+      message: `模型 ${model} 的调用过于频繁, 请 ${retryAfter} 秒后重试。` +
+        `限速策略: 每 ${RATE_LIMIT_WINDOW_MS / 1000} 秒最多 ${RATE_LIMIT_MAX_CALLS} 次调用; ` +
+        `失败后熔断 ${breakerLabel}。`,
+      type: "rate_limit_error",
+      code: "model_rate_limited",
+      model,
+    }
+  }), {
+    status: 429,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Retry-After": String(retryAfter),
+      // 标记头: 各端点 !ok 分支据此识别并透传本响应, 不重新包装为上游错误
+      "X-Model-Rate-Limited": "1"
+    }
+  });
+}
+
+/**
+ * 带限速门控的上游请求封装。所有 sider 上游 fetch 统一走这里:
+ *   1) checkRateLimit: 熔断/超限 -> 直接返回 429 (不触达上游);
+ *   2) acquireRateLimitSlot: 通过则占用 1 次配额;
+ *   3) fetch 上游; 成功 -> recordUpstreamSuccess (复位熔断),
+ *      失败 (非 2xx 或网络异常) -> recordUpstreamFailure (触发熔断, opus 1 小时/其他 1 分钟)。
+ *
+ * 注意: 限速按【上游实际模型】统计 (siderModel, 即 MODEL_MAPPING 映射后的值),
+ *       这样 gpt-4.1 与 claude-opus-4.8 等不同模型各自独立计数。
+ */
+async function fetchSiderRateLimited(
+  model: string,
+  url: string,
+  init: RequestInit,
+): Promise<Response> {
+  // 1. 限速检查 (熔断 + 滑动窗口)
+  const { allowed, retryAfterSec } = checkRateLimit(model);
+  if (!allowed) {
+    return rateLimitedResponse(model, retryAfterSec);
+  }
+
+  // 2. 占用配额
+  acquireRateLimitSlot(model);
+
+  // 3. 调用上游, 按结果记录成功/失败
+  try {
+    const res = await fetch(url, init);
+    if (res.ok) {
+      recordUpstreamSuccess(model);
+    } else {
+      recordUpstreamFailure(model);
+    }
+    return res;
+  } catch (err) {
+    recordUpstreamFailure(model);
+    throw err; // 交给调用方 catch 处理 (已有统一错误翻译)
+  }
+}
+
 // ==================== 图像生成互斥锁 ====================
 
 // 图像生成忙碌标志(防止并发请求)
@@ -1211,11 +1377,11 @@ async function handleChatCompletion(req: Request): Promise<Response> {
       hasCid: !!siderRequest.cid
     });
 
-    // 发送请求 (带超时控制，避免长时间挂起放大尾延迟)
+    // 发送请求 (带超时控制，避免长时间挂起放大尾延迟; 走限速门控)
     const upstreamController = new AbortController();
     const upstreamTimeout = setTimeout(() => upstreamController.abort(), UPSTREAM_TIMEOUT_MS);
 
-    const siderResponse = await fetch(SIDER_API_ENDPOINT, {
+    const siderResponse = await fetchSiderRateLimited(siderModel, SIDER_API_ENDPOINT, {
       method: "POST",
       signal: upstreamController.signal,
       headers: {
@@ -1234,6 +1400,10 @@ async function handleChatCompletion(req: Request): Promise<Response> {
     clearTimeout(upstreamTimeout);
 
     if (!siderResponse.ok) {
+      // 限速门控响应直接透传 (带 X-Model-Rate-Limited 标记), 不重新包装为上游错误
+      if (siderResponse.headers.get("X-Model-Rate-Limited") === "1") {
+        return siderResponse;
+      }
       const errorText = await siderResponse.text();
       console.error("❌ Sider API 错误响应:", errorText);
       // 翻译上游错误码为 OpenAI 兼容格式
@@ -1733,6 +1903,8 @@ function handleStreamingResponse(
               const errCode = siderData.code;
               const errMsg = siderData.msg || "";
               console.error(`❌ 上游流内错误: code=${errCode} msg=${errMsg}`);
+              // 流内错误同样触发熔断 (HTTP 200 但 SSE 内部错误, 如 1135 限流)
+              recordUpstreamFailure(MODEL_MAPPING[modelName] || "sider");
               const errChunk = {
                 id: `chatcmpl-${Date.now()}`,
                 object: "chat.completion.chunk",
@@ -1940,7 +2112,7 @@ async function handleImageGeneration(req: Request): Promise<Response> {
     const imgUpstreamController = new AbortController();
     const imgUpstreamTimeout = setTimeout(() => imgUpstreamController.abort(), UPSTREAM_TIMEOUT_MS);
 
-    const siderResponse = await fetch(SIDER_API_ENDPOINT, {
+    const siderResponse = await fetchSiderRateLimited(siderRequest.model, SIDER_API_ENDPOINT, {
       method: "POST",
       signal: imgUpstreamController.signal,
       headers: {
@@ -1958,6 +2130,10 @@ async function handleImageGeneration(req: Request): Promise<Response> {
     clearTimeout(imgUpstreamTimeout);
 
     if (!siderResponse.ok) {
+      // 限速门控响应直接透传 (带 X-Model-Rate-Limited 标记), 不重新包装为上游错误
+      if (siderResponse.headers.get("X-Model-Rate-Limited") === "1") {
+        return siderResponse;
+      }
       const errorText = await siderResponse.text();
       console.error("❌ Sider API 错误:", errorText);
       throw new Error(`Sider API 错误: ${siderResponse.status} - ${errorText}`);
@@ -2319,11 +2495,11 @@ async function handleGeminiGenerate(
       auto: enableSearch ? ["search", "data_analysis"] : ["data_analysis"]
     };
 
-    // 发送上游请求
+    // 发送上游请求 (带限速门控)
     const upstreamController = new AbortController();
     const upstreamTimeout = setTimeout(() => upstreamController.abort(), UPSTREAM_TIMEOUT_MS);
 
-    const siderResponse = await fetch(SIDER_API_ENDPOINT, {
+    const siderResponse = await fetchSiderRateLimited(siderModel, SIDER_API_ENDPOINT, {
       method: "POST",
       signal: upstreamController.signal,
       headers: {
@@ -2341,6 +2517,10 @@ async function handleGeminiGenerate(
     clearTimeout(upstreamTimeout);
 
     if (!siderResponse.ok) {
+      // 限速门控响应直接透传 (带 X-Model-Rate-Limited 标记), 不重新包装为上游错误
+      if (siderResponse.headers.get("X-Model-Rate-Limited") === "1") {
+        return siderResponse;
+      }
       const errorText = await siderResponse.text();
       console.error("❌ Gemini上游错误:", errorText);
       recordFailure(geminiModel); // 失败统计: 上游 HTTP 错误
@@ -2427,6 +2607,8 @@ async function handleGeminiGenerate(
             try {
               const sd = JSON.parse(dl);
               if (sd.code && sd.code !== 0) {
+                // 流内错误触发熔断 (HTTP 200 但 SSE 内部错误)
+                recordUpstreamFailure(siderModel);
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify({
                   error: { code: sd.code, message: sd.msg || "" }
                 })}\n\n`));
@@ -2615,7 +2797,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
 
     const upstreamController = new AbortController();
     const upstreamTimeout = setTimeout(() => upstreamController.abort(), UPSTREAM_TIMEOUT_MS);
-    const siderResp = await fetch(SIDER_API_ENDPOINT, {
+    const siderResp = await fetchSiderRateLimited(siderModel, SIDER_API_ENDPOINT, {
       method: "POST", signal: upstreamController.signal,
       headers: {
         "Content-Type": "application/json", Authorization: `Bearer ${SIDER_AUTH_TOKEN}`,
@@ -2629,6 +2811,10 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
     clearTimeout(upstreamTimeout);
 
     if (!siderResp.ok) {
+      // 限速门控响应直接透传 (带 X-Model-Rate-Limited 标记), 不重新包装为上游错误
+      if (siderResp.headers.get("X-Model-Rate-Limited") === "1") {
+        return siderResp;
+      }
       const errorText = await siderResp.text();
       console.error("❌ Anthropic上游错误:", errorText);
       recordFailure(anthroModel); // 失败统计: 上游 HTTP 错误
@@ -2958,7 +3144,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
 
     const upstreamController = new AbortController();
     const upstreamTimeout = setTimeout(() => upstreamController.abort(), UPSTREAM_TIMEOUT_MS);
-    const siderResp = await fetch(SIDER_API_ENDPOINT, {
+    const siderResp = await fetchSiderRateLimited(siderModel, SIDER_API_ENDPOINT, {
       method: "POST", signal: upstreamController.signal,
       headers: {
         "Content-Type": "application/json", Authorization: `Bearer ${SIDER_AUTH_TOKEN}`,
@@ -2972,6 +3158,10 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
     clearTimeout(upstreamTimeout);
 
     if (!siderResp.ok) {
+      // 限速门控响应直接透传 (带 X-Model-Rate-Limited 标记), 不重新包装为上游错误
+      if (siderResp.headers.get("X-Model-Rate-Limited") === "1") {
+        return siderResp;
+      }
       recordFailure(modelName); // 失败统计: 上游 HTTP 错误
       return new Response(JSON.stringify({
         error: { message: `上游错误: ${siderResp.status}`, type: "api_error" },
