@@ -3688,9 +3688,9 @@ function statsDonut(models: ModelStatRow[], total: number): string {
   const arcs = models.map((m, i) => {
     const frac = m.requests / total;
     const len = frac * C;
-    // 2px 表面间隙: 相邻扇区之间留缝, 避免两色直接相接
-    const gap = models.length > 1 ? 2 : 0;
-    const dash = `${Math.max(len - gap, 0.5)} ${C - Math.max(len - gap, 0.5)}`;
+    // 扇区间不留缝隙: 所有扇区长度之和 = 周长, 保证圆环始终完整闭合。
+    // 相邻扇区靠颜色区分 (分类色板对比足够), 需要时可用描边分隔。
+    const dash = `${len} ${C - len}`;
     const arc = `<circle cx="90" cy="90" r="${R}" fill="none"
       stroke="var(--s${i + 1})" stroke-width="26"
       stroke-dasharray="${dash}" stroke-dashoffset="${-offset}"
