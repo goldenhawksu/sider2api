@@ -3677,7 +3677,10 @@ const STATS_SERIES_COUNT = 8;
 
 /** 环形图: 按模型请求数构成。返回 SVG 弧段。 */
 function statsDonut(models: ModelStatRow[], total: number): string {
-  if (total === 0) {
+  // 分母一律用扇区数据之和 (与 models 同窗口口径), 忽略外部传入的 total,
+  // 避免「分子是 24h 窗口、分母是累计全量」的口径错配导致圆环无法闭合。
+  const shownTotal = models.reduce((s, m) => s + m.requests, 0);
+  if (shownTotal === 0) {
     return `<circle cx="90" cy="90" r="62" fill="none" stroke="var(--grid)" stroke-width="26"/>
       <text x="90" y="90" class="donut-empty" text-anchor="middle" dominant-baseline="middle">暂无数据</text>`;
   }
@@ -3686,10 +3689,9 @@ function statsDonut(models: ModelStatRow[], total: number): string {
   const C = 2 * Math.PI * R;
   let offset = 0;
   const arcs = models.map((m, i) => {
-    const frac = m.requests / total;
+    const frac = m.requests / shownTotal;
     const len = frac * C;
     // 扇区间不留缝隙: 所有扇区长度之和 = 周长, 保证圆环始终完整闭合。
-    // 相邻扇区靠颜色区分 (分类色板对比足够), 需要时可用描边分隔。
     const dash = `${len} ${C - len}`;
     const arc = `<circle cx="90" cy="90" r="${R}" fill="none"
       stroke="var(--s${i + 1})" stroke-width="26"
@@ -3702,8 +3704,8 @@ function statsDonut(models: ModelStatRow[], total: number): string {
   }).join("");
 
   return `${arcs}
-    <text x="90" y="82" class="donut-num" text-anchor="middle">${total}</text>
-    <text x="90" y="102" class="donut-cap" text-anchor="middle">总请求</text>`;
+    <text x="90" y="82" class="donut-num" text-anchor="middle">${shownTotal}</text>
+    <text x="90" y="102" class="donut-cap" text-anchor="middle">窗口请求</text>`;
 }
 
 /** 面积图: Token 使用趋势 + 调用失败曲线。单一 y 轴 (Token), 失败用独立缩放叠加。 */
