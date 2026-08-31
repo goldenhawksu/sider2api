@@ -1383,6 +1383,26 @@ async function fetchSiderRateLimited(
 
 // ==================== 认证中间件 ====================
 
+// 从请求中提取调用方 token。三家官方 SDK 的鉴权约定各不相同, 都要认:
+//   OpenAI SDK    -> Authorization: Bearer <token>
+//   Anthropic SDK -> x-api-key: <token>
+//   Gemini SDK    -> x-goog-api-key: <token>, 或 URL query ?key=<token>
+// 只认 Authorization 会让 anthropic / google-genai 官方 SDK 开箱即 401。
+function extractAuthToken(req: Request): string | null {
+  const authHeader = req.headers.get("Authorization");
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    return authHeader.slice("Bearer ".length).trim() || null;
+  }
+
+  const apiKey = req.headers.get("x-api-key") || req.headers.get("x-goog-api-key");
+  if (apiKey) return apiKey.trim() || null;
+
+  const queryKey = new URL(req.url).searchParams.get("key");
+  if (queryKey) return queryKey.trim() || null;
+
+  return null;
+}
+
 function authMiddleware(handler: (req: Request) => Promise<Response>): (req: Request) => Promise<Response> {
   return async (req: Request) => {
     // 如果未配置 AUTH_TOKEN,允许所有请求
@@ -1390,13 +1410,13 @@ function authMiddleware(handler: (req: Request) => Promise<Response>): (req: Req
       return handler(req);
     }
 
-    // 获取请求头中的授权信息
-    const authHeader = req.headers.get("Authorization");
+    const token = extractAuthToken(req);
 
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    if (!token) {
       return new Response(JSON.stringify({
         error: {
-          message: "Unauthorized: Missing or invalid Authorization header",
+          message: "Unauthorized: Missing or invalid credentials. Provide one of: " +
+            "Authorization: Bearer <token>, x-api-key, x-goog-api-key, or ?key=",
           type: "invalid_request_error"
         }
       }), {
@@ -1407,8 +1427,6 @@ function authMiddleware(handler: (req: Request) => Promise<Response>): (req: Req
         }
       });
     }
-
-    const token = authHeader.split(" ")[1];
 
     if (token !== AUTH_TOKEN) {
       return new Response(JSON.stringify({
@@ -4587,7 +4605,7 @@ async function handleRequest(req: Request): Promise<Response> {
       headers: {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "POST, GET, PUT, DELETE, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Session-ID"
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Session-ID, x-api-key, x-goog-api-key, anthropic-version"
       }
     });
   }
