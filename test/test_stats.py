@@ -3,7 +3,7 @@
 
 分层:
 - smoke 级 (零额度): /stats 200 + HTML 结构契约; /stats.json 公开 + 快照结构 + html 片段契约。
-- chat 级 (耗真实额度): 发起一次对话后, /stats.json 应反映该请求 (模型/字符/耗时字段存在)。
+- chat 级 (耗真实额度): 发起一次对话后, /stats.json 的近 24h 窗口应反映该请求。
 """
 import re
 
@@ -65,6 +65,14 @@ def test_stats_json_contract(client):
     assert isinstance(snap["models"], list)
     assert isinstance(snap["tools"], list)
     assert isinstance(snap["trend"], list) and len(snap["trend"]) == 24  # 近 24 小时分桶
+    trend_totals = {
+        "requests": sum(b["requests"] for b in snap["trend"]),
+        "streaming": sum(b.get("streaming", 0) for b in snap["trend"]),
+        "toolCalls": sum(b.get("toolCalls", 0) for b in snap["trend"]),
+        "inputChars": sum(b["inputChars"] for b in snap["trend"]),
+        "outputChars": sum(b["outputChars"] for b in snap["trend"]),
+    }
+    assert snap["totals"] == trend_totals, "totals 应与近 24 小时趋势桶求和一致"
     assert isinstance(snap["recent"], list)
     # 预渲染 HTML 片段: 覆盖所有可局部刷新的区块
     frag = snap.get("html", {})
@@ -149,7 +157,7 @@ def test_stats_page_utc8_timestamps(client):
 def test_stats_reflects_chat_request(client):
     """发起一次真实对话后, 快照应出现该模型且 requests 递增。
 
-    注意: 快照为进程内累计, 若被测实例此前已有流量, 无法断言精确计数,
+    注意: 快照为近 24h 窗口, 若被测实例此前已有流量, 无法断言精确计数,
     只断言"记录存在 + 结构有效"。金额消耗: 1 次代表性模型请求。
     """
     model = config.SINGLE_MODEL
@@ -181,14 +189,24 @@ def test_stats_reflects_chat_request(client):
 
 @pytest.mark.chat
 def test_stats_models_match_24h_window(client):
-    """模型分布是 24h 窗口 (与趋势图同口径), 而非累计全量。
+    """统计快照统一使用 24h 窗口, 而非累计全量。
 
-    断言: models 的总请求数 ≤ 当前窗口内趋势桶请求数之和 (因 recent 有 200 条
-    上限, 高流量下可能略低, 但绝不应超过 24h 桶之和)。金额消耗: 0 (只读)。
+    断言: totals 等于当前窗口趋势桶求和; models 的总请求数 ≤ 当前窗口请求数。
+    金额消耗: 0 (只读)。
     """
     snap = client.get("/stats.json", auth=False).json()
     models_total = sum(m["requests"] for m in snap["models"])
     trend_total = sum(b["requests"] for b in snap["trend"])
+    trend_totals = {
+        "requests": trend_total,
+        "streaming": sum(b.get("streaming", 0) for b in snap["trend"]),
+        "toolCalls": sum(b.get("toolCalls", 0) for b in snap["trend"]),
+        "inputChars": sum(b["inputChars"] for b in snap["trend"]),
+        "outputChars": sum(b["outputChars"] for b in snap["trend"]),
+    }
+    assert snap["totals"] == trend_totals, (
+        f"totals 应等于近 24h 趋势总量: totals={snap['totals']} trend={trend_totals}"
+    )
     # 模型分布来自窗口内 recent 聚合; trend 来自小时桶。两者同窗口,
     # 差异仅来自 recent 200 条上限 (高流量下 trend 可能更高)。
     assert models_total <= trend_total + 2, (
@@ -197,4 +215,4 @@ def test_stats_models_match_24h_window(client):
     # 若窗口内有流量, 模型分布不应为空
     if trend_total > 0:
         assert snap["models"], "24h 窗口内有请求但模型分布为空"
-    # 注意: totals 是累计全量, models 是 24h 窗口, 二者无需一致 (设计如此)
+    assert "历史累计" not in snap.get("note", "")

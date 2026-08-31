@@ -657,6 +657,8 @@ interface ModelStatRow {
 interface TrendBucketRow {
   at: string;
   requests: number;
+  streaming: number;
+  toolCalls: number;
   /** 该桶内调用失败次数 (上游错误/能力门控/异常)。 */
   failures: number;
   inputChars: number;
@@ -694,26 +696,12 @@ const STATS_RECENT_DISPLAY = 10;
 const STATS_BUCKET_MS = 60 * 60_000; // 1 小时桶 = 近 24 小时趋势
 const STATS_BUCKET_COUNT = 24;
 
-const statsStartedAt = Date.now();
-let statsTotals = {
-  requests: 0, streaming: 0, toolCalls: 0, inputChars: 0, outputChars: 0,
-};
-const statsToolCounts = new Map<string, number>();
 const statsRecent: Array<{ at: number; record: UsageRecord }> = [];
 // 失败事件时间戳 (供 24h 模型分布的失败计数; 与 recent 同上限, 新在前)
 const statsFailureRecent: Array<{ at: number; model: string }> = [];
 
 // 每次请求完成时调用 (fire-and-forget 语义: 不抛错、不阻塞响应路径)
 function recordUsage(record: UsageRecord): void {
-  statsTotals.requests += 1;
-  if (record.stream) statsTotals.streaming += 1;
-  statsTotals.toolCalls += record.toolUses.length;
-  statsTotals.inputChars += record.inputChars;
-  statsTotals.outputChars += record.outputChars;
-  for (const name of record.toolUses) {
-    statsToolCounts.set(name, (statsToolCounts.get(name) ?? 0) + 1);
-  }
-
   statsRecent.unshift({ at: Date.now(), record });
   if (statsRecent.length > STATS_RECENT_LIMIT) {
     statsRecent.length = STATS_RECENT_LIMIT;
@@ -734,20 +722,47 @@ function recordFailure(model: string): void {
   persistFailure(model); // fire-and-forget; KV 未启用时内部直接返回
 }
 
+type StatsTotals = StatsSnapshot["totals"];
+
+function emptyStatsTotals(): StatsTotals {
+  return { requests: 0, streaming: 0, toolCalls: 0, inputChars: 0, outputChars: 0 };
+}
+
+function totalsFromTrend(trend: TrendBucketRow[]): StatsTotals {
+  return trend.reduce((totals, bucket) => {
+    totals.requests += bucket.requests;
+    totals.streaming += bucket.streaming;
+    totals.toolCalls += bucket.toolCalls;
+    totals.inputChars += bucket.inputChars;
+    totals.outputChars += bucket.outputChars;
+    return totals;
+  }, emptyStatsTotals());
+}
+
 // 近 24 小时按小时分桶; 空桶保留保证时间轴连续。
-// 数据源是 recent(200 条上限), 高流量下早期桶会偏低——趋势形状可读, 绝对值以 totals 为准。
+// 数据源是 recent(200 条上限), 高流量下早期桶会偏低; KV 模式用小时桶聚合保持跨实例一致。
 function buildStatsTrend(now: number): TrendBucketRow[] {
   const currentBucket = Math.floor(now / STATS_BUCKET_MS) * STATS_BUCKET_MS;
   const buckets = new Map<number, TrendBucketRow>();
   for (let i = STATS_BUCKET_COUNT - 1; i >= 0; i -= 1) {
     const at = currentBucket - i * STATS_BUCKET_MS;
-    buckets.set(at, { at: new Date(at).toISOString(), requests: 0, failures: 0, inputChars: 0, outputChars: 0 });
+    buckets.set(at, {
+      at: new Date(at).toISOString(),
+      requests: 0,
+      streaming: 0,
+      toolCalls: 0,
+      failures: 0,
+      inputChars: 0,
+      outputChars: 0,
+    });
   }
   for (const { at, record } of statsRecent) {
     const key = Math.floor(at / STATS_BUCKET_MS) * STATS_BUCKET_MS;
     const bucket = buckets.get(key);
     if (!bucket) continue; // 落在 24 小时窗口外
     bucket.requests += 1;
+    if (record.stream) bucket.streaming += 1;
+    bucket.toolCalls += record.toolUses.length;
     bucket.inputChars += record.inputChars;
     bucket.outputChars += record.outputChars;
   }
@@ -789,21 +804,34 @@ function buildStatsModels(now: number): ModelStatRow[] {
   return [...map.values()].sort((a, b) => b.requests - a.requests);
 }
 
-// 生成统计快照 (供 /stats 页面与 /stats.json 使用)
-function getStatsSnapshot(now = Date.now()): StatsSnapshot {
-  const tools = [...statsToolCounts.entries()]
+// 近 24 小时窗口的工具调用频次 (进程内)。历史累计工具名不直接展示,
+// 避免旧的 create_image 记录被误读为当前仍在持续调用图像工具。
+function buildStatsTools(now: number): Array<{ name: string; count: number }> {
+  const cutoff = now - STATS_BUCKET_MS * STATS_BUCKET_COUNT;
+  const map = new Map<string, number>();
+  for (const { at, record } of statsRecent) {
+    if (at < cutoff) continue;
+    for (const name of record.toolUses) {
+      map.set(name, (map.get(name) ?? 0) + 1);
+    }
+  }
+  return [...map.entries()]
     .sort((a, b) => b[1] - a[1])
     .slice(0, 8)
     .map(([name, count]) => ({ name, count }));
+}
 
+// 生成统计快照 (供 /stats 页面与 /stats.json 使用)
+function getStatsSnapshot(now = Date.now()): StatsSnapshot {
   const models = buildStatsModels(now);
+  const trend = buildStatsTrend(now);
 
   return {
-    since: new Date(statsStartedAt).toISOString(),
-    totals: { ...statsTotals },
+    since: trend[0]?.at ?? new Date(now - STATS_BUCKET_MS * (STATS_BUCKET_COUNT - 1)).toISOString(),
+    totals: totalsFromTrend(trend),
     models,
-    tools,
-    trend: buildStatsTrend(now),
+    tools: buildStatsTools(now),
+    trend,
     recent: statsRecent.slice(0, STATS_RECENT_DISPLAY).map(({ at, record }) => ({
       time: new Date(at).toISOString(),
       model: record.model,
@@ -812,7 +840,7 @@ function getStatsSnapshot(now = Date.now()): StatsSnapshot {
       ms: record.ms,
       chars: record.inputChars + record.outputChars,
     })),
-    note: "进程内统计, 实例重启后清零; Deno Deploy 各隔离实例独立, 仅代表当前实例。Token 以字符数估算 (上游流式不回传真实 usage)。",
+    note: "所有统计指标均为近 24 小时窗口值。进程内模式仅代表当前实例; 实例重启后清零。Token 以字符数估算 (上游流式不回传真实 usage)。",
     persisted: false,
   };
 }
@@ -842,7 +870,7 @@ function getStatsSnapshot(now = Date.now()): StatsSnapshot {
 // Deno Deploy 平台默认开放 unstable API。
 
 const STATS_KV_BUCKET_MS = 60 * 60_000; // 1 小时桶
-// 模型分布与趋势图同窗口: 近 24 小时 (24 桶)。KV 里模型维度键挂在趋势桶下,
+// 模型分布、工具频次、顶部总量与趋势图同窗口: 近 24 小时 (24 桶)。KV 里维度键挂在趋势桶下,
 // 聚合模型分布时只统计此窗口内的桶 (与进程内 buildStatsModels 口径一致)。
 const STATS_KV_MODEL_WINDOW_MS = STATS_BUCKET_COUNT * STATS_KV_BUCKET_MS; // 24h
 // 趋势桶保留时长: 页面只展示近 24 小时 (24 桶), 25 小时前的旧桶回收,
@@ -905,17 +933,13 @@ function persistUsage(record: UsageRecord): void {
       if (n > 0) ops.push({ key, type: "sum", value: new (Deno as any).KvU64(BigInt(n)) });
     };
 
-    sum([...P, "requests"], 1);
-    if (record.stream) sum([...P, "streaming"], 1);
-    sum([...P, "toolCalls"], record.toolUses.length);
-    sum([...P, "inputChars"], record.inputChars);
-    sum([...P, "outputChars"], record.outputChars);
-    for (const name of record.toolUses) sum([...P, "tool", name], 1);
-
     const t = [...P, "trend", bucket];
     sum([...t, "requests"], 1);
+    if (record.stream) sum([...t, "streaming"], 1);
+    sum([...t, "toolCalls"], record.toolUses.length);
     sum([...t, "inputChars"], record.inputChars);
     sum([...t, "outputChars"], record.outputChars);
+    for (const name of record.toolUses) sum([...t, "tool", name], 1);
 
     // 每小时每模型维度: 供近 24h 模型分布 (跨实例一致, 与趋势同窗口; 键会随趋势桶一起回收)
     const tm = [...P, "trend", bucket, "model", record.model];
@@ -976,8 +1000,9 @@ async function cleanupStaleTrendKeys(kv: any): Promise<void> {
     const stale: unknown[][] = [];
     for await (const entry of kv.list({ prefix: [...P, "trend"] })) {
       const k = entry.key;
-      // 趋势总量键 [.., bucket, field] (len 5) 或模型维度键 [.., bucket, "model", model, field] (len 7)
-      if (k[1] === "stats" && k[2] === "trend" && (k.length === 5 || k.length === 7)) {
+      // 趋势总量键 [.., bucket, field] (len 5)、工具窗口键 [.., bucket, "tool", name] (len 6)
+      // 或模型维度键 [.., bucket, "model", model, field] (len 7)
+      if (k[1] === "stats" && k[2] === "trend" && (k.length === 5 || k.length === 6 || k.length === 7)) {
         const bucket = Number(k[3]);
         if (bucket < cutoff) stale.push(k);
       }
@@ -997,7 +1022,6 @@ async function cleanupStaleTrendKeys(kv: any): Promise<void> {
 
 /** KV 持久化的聚合视图; KV 未启用时返回 null (调用方回退进程内)。 */
 interface PersistentStats {
-  since: number;
   totals: {
     requests: number;
     streaming: number;
@@ -1016,6 +1040,8 @@ interface PersistentStats {
   trend: Array<{
     bucket: number;
     requests: number;
+    streaming: number;
+    toolCalls: number;
     failures: number;
     inputChars: number;
     outputChars: number;
@@ -1040,11 +1066,10 @@ async function readPersistentStats(): Promise<PersistentStats | null> {
 
 async function collectPersistentStats(kv: any): Promise<PersistentStats | null> {
   const P = statsKvPrefix();
-  const sinceEntry = await kv.get([...P, "since"]);
-  const totals = { requests: 0, streaming: 0, toolCalls: 0, inputChars: 0, outputChars: 0 };
+  const totals = emptyStatsTotals();
   // 24h 窗口的模型分布 (从 trend 桶的模型维度键聚合; 与趋势图同窗口口径)
   const models: PersistentStats["models"] = [];
-  const tools: PersistentStats["tools"] = [];
+  const toolMap = new Map<string, number>();
   const trend: PersistentStats["trend"] = [];
   // 当前 24h 窗口起点 (ms) — 只聚合窗口内的模型维度桶 (与进程内 buildStatsModels 同口径)
   const modelCutoff = Date.now() - STATS_KV_MODEL_WINDOW_MS;
@@ -1077,37 +1102,53 @@ async function collectPersistentStats(kv: any): Promise<PersistentStats | null> 
 
     if (key[1] === "stats" && key[2] === "trend" && key.length === 5) {
       const bucket = Number(key[3]);
+      if (bucket < modelCutoff) continue;
       const field = key[4] as string;
       let row = trend.find((t) => t.bucket === bucket);
       if (!row) {
-        row = { bucket, requests: 0, failures: 0, inputChars: 0, outputChars: 0 };
+        row = { bucket, requests: 0, streaming: 0, toolCalls: 0, failures: 0, inputChars: 0, outputChars: 0 };
         trend.push(row);
       }
-      if (field === "requests" || field === "failures" || field === "inputChars" || field === "outputChars") {
+      if (field === "requests" || field === "streaming" || field === "toolCalls" ||
+          field === "failures" || field === "inputChars" || field === "outputChars") {
         (row as unknown as Record<string, number>)[field] += value;
+        if (field in totals) {
+          (totals as unknown as Record<string, number>)[field] += value;
+        }
       }
+      continue;
+    }
+
+    if (key[1] === "stats" && key[2] === "trend" && key[4] === "tool" && key.length === 6) {
+      // 工具频次与模型分布/趋势同口径: 只聚合近 24h 窗口。
+      const bucket = Number(key[3]);
+      if (bucket < modelCutoff) continue;
+      const name = key[5] as string;
+      toolMap.set(name, (toolMap.get(name) ?? 0) + value);
       continue;
     }
 
     if (key[1] === "stats" && key[2] === "tool" && key.length === 4) {
-      tools.push({ name: key[3] as string, count: value });
+      // 旧版累计工具名保留在 KV 中, 但页面不再直接展示它,
+      // 避免历史 create_image 记录被误读为近 24 小时仍在调用。
       continue;
     }
 
     if (key[1] === "stats" && key.length === 3 && key[2] !== "since") {
-      const field = key[2] as string;
-      if (field in totals) {
-        (totals as unknown as Record<string, number>)[field] += value;
-      }
+      // 旧版累计总量键保留在 KV 中, 但 /stats 统一展示近 24 小时窗口值。
+      continue;
     }
   }
 
   models.sort((a, b) => b.requests - a.requests);
+  const tools = [...toolMap.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([name, count]) => ({ name, count }));
   tools.sort((a, b) => b.count - a.count);
   trend.sort((a, b) => a.bucket - b.bucket);
 
   return {
-    since: statsKvNum(sinceEntry.value) || Date.now(),
     totals,
     models,
     tools,
@@ -1137,6 +1178,8 @@ async function getStatsSnapshotMerged(now = Date.now()): Promise<StatsSnapshot> 
     trend.push({
       at: new Date(at).toISOString(),
       requests: row?.requests ?? 0,
+      streaming: row?.streaming ?? 0,
+      toolCalls: row?.toolCalls ?? 0,
       failures: row?.failures ?? 0,
       inputChars: row?.inputChars ?? 0,
       outputChars: row?.outputChars ?? 0,
@@ -1145,8 +1188,8 @@ async function getStatsSnapshotMerged(now = Date.now()): Promise<StatsSnapshot> 
 
   return {
     ...local,
-    since: new Date(persistent.since).toISOString(),
-    totals: { ...persistent.totals },
+    since: trend[0]?.at ?? new Date(now - STATS_KV_BUCKET_MS * (STATS_BUCKET_COUNT - 1)).toISOString(),
+    totals: totalsFromTrend(trend),
     models: persistent.models
       .map((m) => ({
         ...m,
@@ -1155,7 +1198,7 @@ async function getStatsSnapshotMerged(now = Date.now()): Promise<StatsSnapshot> 
       .sort((a, b) => b.requests - a.requests),
     tools: persistent.tools.slice(0, 8),
     trend,
-    note: "聚合数据持久化于 Deno KV, 跨实例、跨重启累计; 最近请求明细与近 24 小时窗口仅当前实例。Token 以字符数估算 (上游流式不回传真实 usage)。",
+    note: "所有统计指标均为近 24 小时窗口值。聚合数据持久化于 Deno KV, 跨实例一致; 最近请求明细仅当前实例。Token 以字符数估算 (上游流式不回传真实 usage)。",
     persisted: true,
   };
 }
@@ -4262,14 +4305,17 @@ function statsShownModels(snapshot: StatsSnapshot): ModelStatRow[] {
 
 /** 顶部三个统计卡。 */
 function statsTilesHtml(totals: StatsSnapshot["totals"]): string {
-  return `<div class="card tile"><div class="v">${totals.requests}</div><div class="k">上游请求</div></div>
-  <div class="card tile"><div class="v">${compactNum(totals.inputChars + totals.outputChars)}</div><div class="k">字符总量</div></div>
-  <div class="card tile"><div class="v">${totals.toolCalls}</div><div class="k">工具调用</div></div>`;
+  return `<div class="card tile"><div class="v">${totals.requests}</div><div class="k">近 24h 上游请求</div></div>
+  <div class="card tile"><div class="v">${compactNum(totals.inputChars + totals.outputChars)}</div><div class="k">近 24h 字符总量</div></div>
+  <div class="card tile"><div class="v">${totals.toolCalls}</div><div class="k">近 24h 工具调用</div></div>`;
 }
 
 /** header 副标题 (时间起点 + 链接)。 */
 function statsSubHtml(snapshot: StatsSnapshot): string {
-  return `自 ${escHtml(hhmm(snapshot.since))} 起 · 近 24 小时趋势 · <a href="/">服务信息</a> · <a href="/admin">管理界面</a>`;
+  const first = snapshot.trend[0]?.at ? hhmm(snapshot.trend[0].at) : "";
+  const last = snapshot.trend[snapshot.trend.length - 1]?.at ? hhmm(snapshot.trend[snapshot.trend.length - 1].at) : "";
+  const windowLabel = first && last ? `${first} - ${last}` : "近 24 小时";
+  return `统计窗口 ${escHtml(windowLabel)} · 数据源 ${snapshot.persisted ? "Deno KV" : "当前实例"} · <a href="/">服务信息</a> · <a href="/admin">管理界面</a>`;
 }
 
 /** 模型分布表 tbody 行。失败列: 有失败时红色高亮, 无失败灰色。 */
@@ -4317,8 +4363,8 @@ function statsToolRowsHtml(tools: StatsSnapshot["tools"]): string {
 /** 页脚说明 (含持久化状态)。 */
 function statsFooterHtml(snapshot: StatsSnapshot): string {
   return `${escHtml(snapshot.note)}<br>
-  ${snapshot.persisted ? "聚合数据已持久化（Deno KV），跨实例、跨重启累计。" : "⚠️ 聚合数据未持久化：仅统计当前实例，且实例回收后清零。"}
-  流式请求 ${snapshot.totals.streaming} 次。字符数以请求文本长度估算（上游流式不回传 token 用量）。`;
+  ${snapshot.persisted ? "聚合窗口数据已持久化（Deno KV），跨实例读取一致。" : "⚠️ 聚合窗口数据未持久化：仅统计当前实例，且实例回收后清零。"}
+  近 24h 流式请求 ${snapshot.totals.streaming} 次。字符数以请求文本长度估算（上游流式不回传 token 用量）。`;
 }
 
 /** 环形图整块 (含 svg 外壳)。 */

@@ -217,10 +217,12 @@ def mock_stack():
         "SSE_PING_INTERVAL_MS": "0",
         "ENABLE_AUTO_SEARCH": "false",
         "UPSTREAM_TIMEOUT_MS": "5000",
+        "STATS_KV": "memory",
+        "STATS_KV_ROOT": "mock-regression",
         "DENO_NO_UPDATE_CHECK": "1",
     })
     proc = subprocess.Popen(
-        ["deno", "run", "--allow-net", "--allow-env", "--allow-read", "--allow-write", "deno_pro.ts"],
+        ["deno", "run", "--unstable-kv", "--allow-net", "--allow-env", "--allow-read", "--allow-write", "deno_pro.ts"],
         cwd=ROOT,
         env=env,
         stdout=subprocess.PIPE,
@@ -335,6 +337,35 @@ def _collect_openai_stream(resp) -> dict[str, Any]:
         if choice.get("finish_reason"):
             finish_reason = choice["finish_reason"]
     return {"content": "".join(content), "finish_reason": finish_reason, "done_count": done_count}
+
+
+def _get_stats(base_url: str) -> dict[str, Any]:
+    resp = requests.get(base_url + "/stats.json", timeout=(3, 10))
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def _trend_totals(stats: dict[str, Any]) -> dict[str, int]:
+    trend = stats["trend"]
+    return {
+        "requests": sum(bucket["requests"] for bucket in trend),
+        "streaming": sum(bucket.get("streaming", 0) for bucket in trend),
+        "toolCalls": sum(bucket.get("toolCalls", 0) for bucket in trend),
+        "inputChars": sum(bucket["inputChars"] for bucket in trend),
+        "outputChars": sum(bucket["outputChars"] for bucket in trend),
+    }
+
+
+def _wait_for_stats(base_url: str, predicate, timeout: float = 5.0) -> dict[str, Any]:
+    deadline = time.time() + timeout
+    last: dict[str, Any] | None = None
+    while time.time() < deadline:
+        last = _get_stats(base_url)
+        if predicate(last):
+            return last
+        time.sleep(0.1)
+    assert last is not None
+    return last
 
 
 @pytest.mark.smoke
@@ -519,6 +550,36 @@ def test_image_generation_has_no_process_global_concurrency_lock(mock_stack):
         assert resp.json()["data"][0]["url"].startswith("https://example.test/image-")
         assert "concurrent_request_rejected" not in resp.text
     assert len(mock_stack["state"].snapshot()) == 2
+
+
+@pytest.mark.smoke
+def test_stats_totals_tools_and_trend_use_same_24h_window(mock_stack):
+    before = _get_stats(mock_stack["base_url"])
+    before_requests = before["totals"]["requests"]
+    before_tools = {item["name"]: item["count"] for item in before["tools"]}
+
+    r = _post(mock_stack["base_url"], "/v1/images/generations", {
+        "prompt": "MOCK_IMAGE_SUCCESS",
+        "n": 1,
+        "size": "1024x1024",
+    })
+    assert r.status_code == 200, r.text
+
+    stats = _wait_for_stats(
+        mock_stack["base_url"],
+        lambda snap: snap["totals"]["requests"] >= before_requests + 1 and
+        {item["name"]: item["count"] for item in snap["tools"]}.get("create_image", 0) >=
+        before_tools.get("create_image", 0) + 1,
+    )
+    trend_totals = _trend_totals(stats)
+
+    assert stats["totals"] == trend_totals
+    assert stats["totals"]["streaming"] == trend_totals["streaming"]
+    assert stats["totals"]["toolCalls"] == trend_totals["toolCalls"]
+    assert any(bucket.get("toolCalls", 0) > 0 for bucket in stats["trend"])
+    assert any(item["name"] == "create_image" and item["count"] >= 1 for item in stats["tools"])
+    assert "近 24 小时窗口" in stats["note"]
+    assert "历史累计" not in stats["note"]
 
 
 @pytest.mark.smoke
