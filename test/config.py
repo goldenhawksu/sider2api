@@ -21,9 +21,12 @@ READ_TIMEOUT = float(os.environ.get("SIDER2API_READ_TIMEOUT", "120"))
 
 # 代表性模型预设 (按系列各取代表). 运行时与 live /v1/models 取交集, 不存在则自动跳过.
 # 与 test/local_test.py 选型保持一致, 另加 sider 智能路由作兜底基线.
+# Anthropic 系列取 sonnet 而非 opus: opus 是旗舰, 上游额度极稀缺 (实测打爆后锁 4.5 小时),
+# 放进常规回归会让"跑一次完整回归"的额度成本高到阻塞验证流程。
+# sonnet 覆盖同一条格式翻译路径, 额度宽松得多; 需要覆盖 opus 时用 --full。
 REPRESENTATIVE_MODELS = [
     "gpt-5.5",
-    "claude-opus-4.8",
+    "claude-sonnet-5",
     "gemini-2.5-pro",
     "deepseek-v4-pro",
     "grok-4",

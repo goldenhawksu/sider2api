@@ -28,7 +28,7 @@ RL_MODEL_B = "gpt-5.1"           # 隔离测试 - 被限速
 RL_OTHER = "gpt-5.4-mini"        # 隔离测试 - 不应被限速
 RL_MODEL_C = "gpt-5.6-sol"       # 错误格式
 CONTEXT_MODEL = "gpt-5.6-terra"   # 603 不熔断
-OPUS_CONTEXT_MODEL = "claude-opus-4.5"   # opus 的 603 也不熔断
+OPUS_CONTEXT_MODEL = "claude-opus-4.6"   # opus 的 603 也不熔断 (取额度较宽松的 opus 变体)
 
 # 触发上游 code:603 的超长 prompt (~48000 字符, 超 8810~22000 阈值)
 _LONG_PROMPT = "请逐字复述。" + ("测试数据" * 12000)
