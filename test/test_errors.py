@@ -1,7 +1,7 @@
 """错误处理与鉴权契约测试。
 
 缺参 400 / 缺失或错误 token 401 在上游调用之前被拦截, 属零额度 (smoke);
-未知模型回退与并发图像 429 会消耗上游额度 (cost)。
+未知模型回退与并发图像生成会消耗上游额度 (cost)。
 """
 import pytest
 
@@ -42,8 +42,8 @@ def test_unknown_model_fallback(client):
 
 @pytest.mark.cost
 @pytest.mark.image
-def test_concurrent_image_429(client, request):
-    """并发图像生成应被互斥锁拒绝 (429)。默认跳过, 用 --run-concurrent 开启。"""
+def test_concurrent_image_has_no_process_global_lock(client, request):
+    """并发图像生成不应被进程内互斥锁拒绝。默认跳过, 用 --run-concurrent 开启。"""
     if not request.config.getoption("run_concurrent"):
         pytest.skip("默认跳过; 用 --run-concurrent 启用")
     import threading
@@ -52,13 +52,15 @@ def test_concurrent_image_429(client, request):
 
     def fire():
         try:
-            results.append(client.image("a red apple", n=1, size="512x512").status_code)
+            resp = client.image("a red apple", n=1, size="512x512")
+            results.append((resp.status_code, resp.text[:300]))
         except Exception as e:  # noqa: BLE001
-            results.append(repr(e))
+            results.append(("exception", repr(e)))
 
     threads = [threading.Thread(target=fire) for _ in range(2)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
-    assert 429 in results, f"未观察到并发拒绝 429: {results}"
+    assert not any("concurrent_request_rejected" in str(item) for item in results), \
+        f"不应出现进程内并发锁拒绝: {results}"

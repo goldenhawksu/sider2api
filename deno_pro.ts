@@ -3,7 +3,9 @@
 
 // ==================== 配置常量 ====================
 
-const SIDER_API_ENDPOINT = "https://sider.ai/api/chat/v1/completions";
+const SIDER_API_ENDPOINT = Deno.env.get("SIDER_API_ENDPOINT") ||
+  Deno.env.get("SIDER_API_URL") ||
+  "https://sider.ai/api/chat/v1/completions";
 
 // 从环境变量获取 Token,如果没有则使用默认值(仅用于测试)
 const SIDER_AUTH_TOKEN = Deno.env.get("SIDER_AUTH_TOKEN")
@@ -316,13 +318,24 @@ function simpleHash(str: string): string {
   return hash.toString(36);
 }
 
+function callerFingerprint(req: Request): string {
+  const explicit = req.headers.get("X-User-ID") || req.headers.get("X-Client-ID");
+  if (explicit) return simpleHash(explicit);
+
+  const auth = req.headers.get("Authorization") || "";
+  if (auth.startsWith("Bearer ")) return simpleHash(auth.slice("Bearer ".length));
+
+  const ip = req.headers.get("CF-Connecting-IP") || req.headers.get("X-Forwarded-For") || "";
+  return ip ? simpleHash(ip.split(",")[0].trim()) : "anon";
+}
+
 // 从 messages[] 推导稳定的会话指纹 ID。
 // 同一对话的所有轮次共享相同的「系统消息 + 第一条用户消息」，
 // 因此可作为跨轮次的稳定标识，无需客户端主动发送 X-Session-ID。
-function deriveSessionId(messages: any[], flattenFn: (c: any) => string): string {
+function deriveSessionId(messages: any[], flattenFn: (c: any) => string, caller = "anon"): string {
   const systemText = flattenFn(messages.find(m => m.role === "system")?.content ?? "");
   const firstUserText = flattenFn(messages.find(m => m.role === "user")?.content ?? "");
-  return `conv-${simpleHash(systemText + "|" + firstUserText)}`;
+  return `conv-${caller}-${simpleHash(systemText + "|" + firstUserText)}`;
 }
 
 // 估算文本词数：中日韩字符各计 1 词，其余按空白分词。
@@ -332,6 +345,218 @@ function estimateWordCount(text: string): number {
   const otherWords = text.replace(/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g, " ")
     .trim().split(/\s+/).filter(Boolean).length;
   return cjkChars + otherWords;
+}
+
+// 估算 token 数：CJK 每字约 1 token，其余按 4 字符约 1 token。
+function estimateTokens(text: string): number {
+  if (!text) return 0;
+  const cjk = (text.match(/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g) || []).length;
+  const rest = text.replace(/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g, "").length;
+  return cjk + Math.ceil(rest / 4);
+}
+
+type OutputStopReason = "end_turn" | "max_tokens" | "stop_sequence";
+
+interface OutputLimitOptions {
+  maxTokens?: number;
+  stopSequences?: string[];
+}
+
+interface OutputLimitResult {
+  text: string;
+  stopReason: OutputStopReason;
+  stopSequence?: string;
+}
+
+function normalizePositiveInt(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+  return Math.floor(value);
+}
+
+function normalizeStopSequences(value: unknown): string[] | undefined {
+  const list = typeof value === "string" ? [value] : Array.isArray(value) ? value : [];
+  const normalized = list.filter((s): s is string => typeof s === "string" && s.length > 0);
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function openAIOutputLimits(body: any): OutputLimitOptions {
+  return {
+    maxTokens: normalizePositiveInt(body?.max_tokens ?? body?.max_completion_tokens),
+    stopSequences: normalizeStopSequences(body?.stop),
+  };
+}
+
+function anthropicOutputLimits(body: any): OutputLimitOptions {
+  return {
+    maxTokens: normalizePositiveInt(body?.max_tokens),
+    stopSequences: normalizeStopSequences(body?.stop_sequences),
+  };
+}
+
+function geminiOutputLimits(body: any): OutputLimitOptions {
+  return {
+    maxTokens: normalizePositiveInt(body?.generationConfig?.maxOutputTokens),
+    stopSequences: normalizeStopSequences(body?.generationConfig?.stopSequences),
+  };
+}
+
+function responsesOutputLimits(body: any): OutputLimitOptions {
+  return {
+    maxTokens: normalizePositiveInt(body?.max_output_tokens),
+    stopSequences: normalizeStopSequences(body?.stop),
+  };
+}
+
+function truncateToTokenLimit(text: string, maxTokens?: number): { text: string; truncated: boolean } {
+  if (!maxTokens || estimateTokens(text) <= maxTokens) {
+    return { text, truncated: false };
+  }
+
+  let lo = 0;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (estimateTokens(text.slice(0, mid)) <= maxTokens) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return { text: text.slice(0, lo), truncated: true };
+}
+
+function applyOutputLimits(text: string, opts: OutputLimitOptions): OutputLimitResult {
+  let cut = -1;
+  let matched: string | undefined;
+  for (const seq of opts.stopSequences ?? []) {
+    const i = text.indexOf(seq);
+    if (i !== -1 && (cut === -1 || i < cut)) {
+      cut = i;
+      matched = seq;
+    }
+  }
+
+  const beforeStop = cut === -1 ? text : text.slice(0, cut);
+  const limited = truncateToTokenLimit(beforeStop, opts.maxTokens);
+  if (limited.truncated) {
+    return { text: limited.text, stopReason: "max_tokens" };
+  }
+  if (matched !== undefined) {
+    return { text: beforeStop, stopReason: "stop_sequence", stopSequence: matched };
+  }
+  return { text, stopReason: "end_turn" };
+}
+
+function createStreamingOutputLimiter(opts: OutputLimitOptions) {
+  const stopSequences = opts.stopSequences ?? [];
+  const holdback = Math.max(0, ...stopSequences.map(s => s.length - 1));
+  let emitted = "";
+  let buffer = "";
+  let done = false;
+
+  const emitWithMax = (candidate: string): { text: string; done: boolean; stopReason?: OutputStopReason } => {
+    const limited = truncateToTokenLimit(emitted + candidate, opts.maxTokens);
+    if (limited.truncated) {
+      const text = limited.text.slice(emitted.length);
+      emitted = limited.text;
+      done = true;
+      buffer = "";
+      return { text, done: true, stopReason: "max_tokens" };
+    }
+    emitted += candidate;
+    return { text: candidate, done: false };
+  };
+
+  const push = (chunk: string): { text: string; done: boolean; stopReason?: OutputStopReason; stopSequence?: string } => {
+    if (done || !chunk) return { text: "", done };
+    buffer += chunk;
+
+    let cut = -1;
+    let matched: string | undefined;
+    for (const seq of stopSequences) {
+      const i = buffer.indexOf(seq);
+      if (i !== -1 && (cut === -1 || i < cut)) {
+        cut = i;
+        matched = seq;
+      }
+    }
+
+    if (cut !== -1) {
+      const limited = emitWithMax(buffer.slice(0, cut));
+      if (limited.done) return limited;
+      done = true;
+      buffer = "";
+      return { text: limited.text, done: true, stopReason: "stop_sequence", stopSequence: matched };
+    }
+
+    const safeLength = Math.max(0, buffer.length - holdback);
+    if (safeLength === 0) return { text: "", done: false };
+    const safe = buffer.slice(0, safeLength);
+    buffer = buffer.slice(safeLength);
+    return emitWithMax(safe);
+  };
+
+  const flush = (): { text: string; stopReason: OutputStopReason } => {
+    if (done) return { text: "", stopReason: "end_turn" };
+    const limited = emitWithMax(buffer);
+    buffer = "";
+    if (limited.done) return { text: limited.text, stopReason: "max_tokens" };
+    done = true;
+    return { text: limited.text, stopReason: "end_turn" };
+  };
+
+  return { push, flush, get done() { return done; } };
+}
+
+function openAIFinishReason(reason: OutputStopReason): "stop" | "length" {
+  return reason === "max_tokens" ? "length" : "stop";
+}
+
+function geminiFinishReason(reason: OutputStopReason): "STOP" | "MAX_TOKENS" {
+  return reason === "max_tokens" ? "MAX_TOKENS" : "STOP";
+}
+
+function upstreamErrorDetails(code: number, msg = ""): { statusCode: number; type: string; message: string } {
+  if (code === 603) {
+    return {
+      statusCode: 400,
+      type: "context_length_exceeded",
+      message: msg || "请求内容超出上游词数上限, 请缩短 prompt 或缩减对话历史。",
+    };
+  }
+  if (code === 1101 || code === 1135) {
+    return {
+      statusCode: 429,
+      type: "rate_limit_error",
+      message: msg || (code === 1101 ? "上游并发/限流, 请稍后重试。" : "上游模型使用额度已达上限, 请稍后重试。"),
+    };
+  }
+  if (code === 1001) {
+    return {
+      statusCode: 401,
+      type: "auth_error",
+      message: msg || "上游 Token 无效或已过期。",
+    };
+  }
+  return {
+    statusCode: code === 707 ? 503 : 502,
+    type: "upstream_error",
+    message: msg || `上游错误 code=${code}`,
+  };
+}
+
+function openAIErrorResponse(code: number, msg = ""): Response {
+  const detail = upstreamErrorDetails(code, msg);
+  return new Response(JSON.stringify({
+    error: {
+      message: detail.message,
+      type: detail.type,
+      upstream_code: code,
+    },
+  }), {
+    status: detail.statusCode,
+    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+  });
 }
 
 // 检测是否为图像生成请求
@@ -1023,6 +1248,28 @@ function recordUpstreamFailure(model: string): void {
   console.warn(`⛔ [限速] ${model} 上游调用失败, 熔断 ${Math.round(breakerMs / 1000)} 秒`);
 }
 
+/**
+ * 按 Sider SSE 业务错误码回写限速状态。
+ * 只有 1135 代表额度真正耗尽；1101 是瞬时并发，603 是载荷过大，都不应触发长熔断。
+ */
+function noteUpstreamOutcome(model: string, code: number): void {
+  const st = getRateLimitState(model);
+  switch (code) {
+    case 1135:
+      recordUpstreamFailure(model);
+      break;
+    case 1101:
+      st.count = Math.min(st.count + 2, RATE_LIMIT_MAX_CALLS);
+      break;
+    case 707:
+      st.breakerUntil = Date.now() + 5 * 60_000;
+      console.warn(`⏸️ [限速] ${model} 上游返回 707, 短暂停投 5 分钟`);
+      break;
+    default:
+      break;
+  }
+}
+
 /** 限速拒绝的标准化响应 (OpenAI 兼容 rate_limit_error, 带 Retry-After)。 */
 function rateLimitedResponse(model: string, retryAfterSec: number): Response {
   const retryAfter = Math.max(1, retryAfterSec);
@@ -1054,8 +1301,8 @@ function rateLimitedResponse(model: string, retryAfterSec: number): Response {
  * 带限速门控的上游请求封装。所有 sider 上游 fetch 统一走这里:
  *   1) checkRateLimit: 熔断/超限 -> 直接返回 429 (不触达上游);
  *   2) acquireRateLimitSlot: 通过则占用 1 次配额;
- *   3) fetch 上游; 成功 -> recordUpstreamSuccess (复位熔断),
- *      失败 (非 2xx 或网络异常) -> recordUpstreamFailure (触发熔断, opus 1 小时/其他 1 分钟)。
+ *   3) fetch 上游; 成功 -> recordUpstreamSuccess (复位熔断);
+ *      401/403 才熔断。普通 5xx/网络异常不熔断，避免把一次抖动放大为长时间不可用。
  *
  * 注意: 限速按【上游实际模型】统计 (siderModel, 即 MODEL_MAPPING 映射后的值),
  *       这样 gpt-4.1 与 claude-opus-4.8 等不同模型各自独立计数。
@@ -1079,22 +1326,17 @@ async function fetchSiderRateLimited(
     const res = await fetch(url, init);
     if (res.ok) {
       recordUpstreamSuccess(model);
-    } else {
+    } else if (res.status === 401 || res.status === 403) {
       recordUpstreamFailure(model);
     }
     return res;
   } catch (err) {
-    recordUpstreamFailure(model);
     throw err; // 交给调用方 catch 处理 (已有统一错误翻译)
   }
 }
 
-// ==================== 图像生成互斥锁 ====================
-
-// 图像生成忙碌标志(防止并发请求)
-let isImageGenerating = false;
-let currentGenerationStartTime = 0;
-const IMAGE_GENERATION_TIMEOUT = 180000; // 3分钟超时
+// 图像生成不使用进程内全局互斥锁；Deno Deploy 多实例下该锁无法提供跨实例保护。
+// 并发保护统一交给模型级限速门控处理。
 
 // ==================== 认证中间件 ====================
 
@@ -1235,6 +1477,7 @@ async function handleChatCompletion(req: Request): Promise<Response> {
     modelName = requestBody.model || "sider";
     const siderModel = MODEL_MAPPING[modelName] || "sider";
     const isStreaming = requestBody.stream ?? false;
+    const outputLimits = openAIOutputLimits(requestBody);
     const messages = requestBody.messages || [];
     const lastMessage = messages[messages.length - 1];
 
@@ -1367,7 +1610,8 @@ async function handleChatCompletion(req: Request): Promise<Response> {
 
     // 优先使用客户端显式传入的 X-Session-ID，
     // 否则从 messages[] 指纹推导稳定 ID，确保同一对话多轮复用同一 Sider 服务端会话。
-    const sessionId = req.headers.get("X-Session-ID") || deriveSessionId(messages, flattenMessageContent);
+    const sessionId = req.headers.get("X-Session-ID") ||
+      deriveSessionId(messages, flattenMessageContent, callerFingerprint(req));
     let session = conversationSessions.get(sessionId);
 
     // 构建 Sider 请求
@@ -1462,27 +1706,17 @@ async function handleChatCompletion(req: Request): Promise<Response> {
       } catch {
         errorPayload = null;
       }
-      const upstreamCode = errorPayload?.code;
+      const upstreamCodeRaw = errorPayload?.code;
+      const upstreamCode = typeof upstreamCodeRaw === "number" ? upstreamCodeRaw : Number(upstreamCodeRaw);
       const upstreamMsg = errorPayload?.msg || "";
       let statusCode = siderResponse.status;
       let message = `Sider API 错误: ${siderResponse.status} - ${errorText}`;
       let type = "upstream_error";
-      if (upstreamCode === 603) {
-        statusCode = 400;
-        message = upstreamMsg || "请求内容超出词数上限, 请缩短 prompt 或缩减对话历史。";
-        type = "context_length_exceeded";
-      } else if (upstreamCode === 1001) {
-        statusCode = 401;
-        message = "上游 Token 无效或已过期。";
-        type = "auth_error";
-      } else if (upstreamCode === 1101) {
-        statusCode = 429;
-        message = upstreamMsg || "上游并发/限流, 请稍后重试。";
-        type = "rate_limit_error";
-      } else if (upstreamCode === 1135) {
-        statusCode = 429;
-        message = upstreamMsg || "上游模型使用额度已达上限, 请稍后重试。";
-        type = "rate_limit_error";
+      if (Number.isFinite(upstreamCode)) {
+        const detail = upstreamErrorDetails(upstreamCode, upstreamMsg);
+        statusCode = detail.statusCode;
+        message = detail.message;
+        type = detail.type;
       }
       recordFailure(modelName); // 失败统计: 上游 HTTP 错误
       return new Response(JSON.stringify({
@@ -1501,11 +1735,11 @@ async function handleChatCompletion(req: Request): Promise<Response> {
     // 非流式响应
     if (!isStreaming) {
       return await handleNonStreamingResponse(siderResponse, modelName, fullContext, isImageGen, sessionId,
-        customToolsRequested && !toolChoiceNone);
+        customToolsRequested && !toolChoiceNone, outputLimits);
     }
 
     // 流式响应
-    return handleStreamingResponse(siderResponse, modelName, isImageGen, sessionId);
+    return handleStreamingResponse(siderResponse, modelName, isImageGen, sessionId, outputLimits, fullContext);
 
   } catch (error: any) {
     console.error("❌ 处理聊天请求错误:", error);
@@ -1532,7 +1766,8 @@ async function handleNonStreamingResponse(
   userPrompt: string,
   isImageGen: boolean,
   sessionId: string,
-  customToolsDegraded = false
+  customToolsDegraded = false,
+  outputLimits: OutputLimitOptions = {},
 ): Promise<Response> {
   let fullText = "";
   let reasoningContentAcc = "";
@@ -1541,6 +1776,8 @@ async function handleNonStreamingResponse(
   let conversationId = "";
   let messageId = "";
   let parentMessageId = "";
+  let upstreamErrCode = 0;
+  let upstreamErrMsg = "";
 
   const reader = siderResponse.body?.getReader();
   if (!reader) {
@@ -1561,6 +1798,13 @@ async function handleNonStreamingResponse(
 
     try {
       const siderData = JSON.parse(dataLine);
+
+      const code = Number(siderData.code || 0);
+      if (code !== 0) {
+        upstreamErrCode = code;
+        upstreamErrMsg = siderData.msg || upstreamErrMsg;
+        continue;
+      }
 
       if (!siderData.data) continue;
 
@@ -1610,11 +1854,31 @@ async function handleNonStreamingResponse(
   }
 
   // 构建 OpenAI 格式响应
-  let content = fullText || "生成完成";
+  if (upstreamErrCode !== 0 && !fullText && !imageUrl) {
+    recordFailure(modelName);
+    noteUpstreamOutcome(MODEL_MAPPING[modelName] || "sider", upstreamErrCode);
+    return openAIErrorResponse(upstreamErrCode, upstreamErrMsg);
+  }
+
+  if (!fullText && !imageUrl) {
+    recordFailure(modelName);
+    return new Response(JSON.stringify({
+      error: {
+        message: "上游响应没有生成任何文本内容。",
+        type: "upstream_error",
+      },
+    }), {
+      status: 502,
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+    });
+  }
+
+  const limited = applyOutputLimits(fullText, outputLimits);
+  let content = limited.text;
 
   // 图像生成优化: 在文本中添加Markdown格式的图片URL (双保险)
   if (isImageGen && imageUrl) {
-    content = `${fullText || "我已为您生成了图像"}\n\n![图片](${imageUrl})`;
+    content = `${limited.text || "我已为您生成了图像"}\n\n![图片](${imageUrl})`;
   }
 
   const openAIResponse: any = {
@@ -1627,15 +1891,19 @@ async function handleNonStreamingResponse(
         role: "assistant",
         content: content
       },
-      finish_reason: "stop",
+      finish_reason: openAIFinishReason(limited.stopReason),
       index: 0
     }],
     usage: {
-      prompt_tokens: userPrompt.length,
-      completion_tokens: fullText.length,
-      total_tokens: userPrompt.length + fullText.length
+      prompt_tokens: estimateTokens(userPrompt),
+      completion_tokens: estimateTokens(content),
+      total_tokens: estimateTokens(userPrompt) + estimateTokens(content)
     }
   };
+
+  if (limited.stopSequence) {
+    openAIResponse.choices[0].stop_sequence = limited.stopSequence;
+  }
 
   // 携带推理内容 (think 模式非流式), 兼容 Anthropic/Ollama 风格
   if (reasoningContentAcc) {
@@ -1700,7 +1968,7 @@ async function handleNonStreamingResponse(
     ms: 0, // 非流式耗时未单独计时; 以时间戳近似
     toolUses: [], // 非流式路径上游工具调用仅打日志, 不解析工具名
     inputChars: userPrompt.length,
-    outputChars: fullText.length,
+    outputChars: content.length,
   });
 
   return new Response(JSON.stringify(openAIResponse), {
@@ -1718,7 +1986,9 @@ function handleStreamingResponse(
   siderResponse: Response,
   modelName: string,
   isImageGen: boolean,
-  sessionId: string
+  sessionId: string,
+  outputLimits: OutputLimitOptions = {},
+  inputText = "",
 ): Response {
   let conversationId = "";
 
@@ -1741,6 +2011,7 @@ function handleStreamingResponse(
       // 用量统计累积: 输出字符数 + 触发的内置工具名 (Set 去重)
       let streamOutputChars = 0;
       const streamToolNames = new Set<string>();
+      const textLimiter = createStreamingOutputLimiter(outputLimits);
 
       // 流式请求完成时统一采集 (正常出口调用)
       const finishStreamStats = () => {
@@ -1749,9 +2020,32 @@ function handleStreamingResponse(
           stream: true,
           ms: Date.now() - streamT0,
           toolUses: [...streamToolNames],
-          inputChars: 0, // 流式路径无 prompt 注入点, 输入以 0 计
+          inputChars: inputText.length,
           outputChars: streamOutputChars,
         });
+      };
+
+      const enqueueTextChunk = (text: string, finishReason: "stop" | "length" | null = null) => {
+        if (!text && finishReason === null) return;
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+          id: `chatcmpl-${Date.now()}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: modelName,
+          choices: [{
+            delta: text ? { content: text } : {},
+            finish_reason: finishReason,
+            index: 0
+          }]
+        })}\n\n`));
+      };
+
+      const finishOpenAIStream = async (reason: OutputStopReason = "end_turn") => {
+        enqueueTextChunk("", openAIFinishReason(reason));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        await new Promise(resolve => setTimeout(resolve, 50));
+        finishStreamStats();
+        hb.close();
       };
 
       try {
@@ -1764,6 +2058,12 @@ function handleStreamingResponse(
             : trimmedLine;
 
           if (dataLine === '[DONE]') {
+            const flushed = textLimiter.flush();
+            if (flushed.text) {
+              streamOutputChars += flushed.text.length;
+              enqueueTextChunk(flushed.text);
+            }
+
             // 如果是图像生成且收集到了图像,在DONE前发送元数据chunk
             if (isImageGen && imageUrls.length > 0) {
               const metadataChunk = {
@@ -1816,12 +2116,7 @@ function handleStreamingResponse(
               await new Promise(resolve => setTimeout(resolve, 100));
             }
 
-            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-
-            // 在关闭前再次等待确保所有数据都已flush
-            await new Promise(resolve => setTimeout(resolve, 50));
-            finishStreamStats();
-            hb.close();
+            await finishOpenAIStream(flushed.stopReason);
             return;
           }
 
@@ -1829,6 +2124,36 @@ function handleStreamingResponse(
 
           try {
             const siderData = JSON.parse(dataLine);
+
+            // 上游流内错误码检测 (SSE 顶层 code 非 0/null, 如 1135 限流)
+            if (siderData.code && siderData.code !== 0) {
+              const errCode = Number(siderData.code);
+              const errMsg = siderData.msg || "";
+              console.error(`❌ 上游流内错误: code=${errCode} msg=${errMsg}`);
+              if (streamOutputChars === 0 && imageUrls.length === 0) {
+                noteUpstreamOutcome(MODEL_MAPPING[modelName] || "sider", errCode);
+                const detail = upstreamErrorDetails(errCode, errMsg);
+                const errChunk = {
+                  id: `chatcmpl-${Date.now()}`,
+                  object: "chat.completion.chunk",
+                  created: Math.floor(Date.now() / 1000),
+                  model: modelName,
+                  choices: [{
+                    delta: {},
+                    finish_reason: "error",
+                    index: 0
+                  }],
+                  error: { code: errCode, message: detail.message, type: detail.type }
+                };
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
+                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                finishStreamStats();
+                hb.close();
+                return;
+              }
+              continue;
+            }
+
             if (!siderData.data) continue;
 
             let openAIChunk: any = null;
@@ -1856,20 +2181,16 @@ function handleStreamingResponse(
                   firstChunkAt = Date.now();
                   console.log("⏱️ TTFT(ms):", firstChunkAt - streamT0);
                 }
-                streamOutputChars += (siderData.data.text || "").length;
-                openAIChunk = {
-                  id: `chatcmpl-${Date.now()}`,
-                  object: "chat.completion.chunk",
-                  created: Math.floor(Date.now() / 1000),
-                  model: modelName,
-                  choices: [{
-                    delta: {
-                      content: siderData.data.text
-                    },
-                    finish_reason: null,
-                    index: 0
-                  }]
-                };
+                const textResult = textLimiter.push(siderData.data.text || "");
+                if (textResult.text) {
+                  streamOutputChars += textResult.text.length;
+                  enqueueTextChunk(textResult.text);
+                }
+                if (textResult.done) {
+                  await finishOpenAIStream(textResult.stopReason || "end_turn");
+                  try { await reader.cancel(); } catch { /* ignore */ }
+                  return;
+                }
                 break;
 
               case "file":
@@ -1947,32 +2268,6 @@ function handleStreamingResponse(
                 break;
             }
 
-            // 上游流内错误码检测 (SSE 顶层 code 非 0/null, 如 1135 限流)
-            if (siderData.code && siderData.code !== 0) {
-              const errCode = siderData.code;
-              const errMsg = siderData.msg || "";
-              console.error(`❌ 上游流内错误: code=${errCode} msg=${errMsg}`);
-              // 流内错误同样触发熔断 (HTTP 200 但 SSE 内部错误, 如 1135 限流)
-              recordUpstreamFailure(MODEL_MAPPING[modelName] || "sider");
-              const errChunk = {
-                id: `chatcmpl-${Date.now()}`,
-                object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
-                model: modelName,
-                choices: [{
-                  delta: {},
-                  finish_reason: "error",
-                  index: 0
-                }],
-                error: { code: errCode, message: errMsg }
-              };
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
-              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-              finishStreamStats();
-              hb.close();
-              return;
-            }
-
             if (openAIChunk) {
               const chunk = `data: ${JSON.stringify(openAIChunk)}\n\n`;
               controller.enqueue(encoder.encode(chunk));
@@ -1983,9 +2278,12 @@ function handleStreamingResponse(
           }
         }
 
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-        finishStreamStats();
-        hb.close();
+        const flushed = textLimiter.flush();
+        if (flushed.text) {
+          streamOutputChars += flushed.text.length;
+          enqueueTextChunk(flushed.text);
+        }
+        await finishOpenAIStream(flushed.stopReason);
 
       } catch (error) {
         console.error("❌ 流式处理错误:", error);
@@ -2009,39 +2307,6 @@ function handleStreamingResponse(
 // 处理图像生成请求(专用端点)
 async function handleImageGeneration(req: Request): Promise<Response> {
   let model = "dall-e-3"; // 函数级: catch 出口的失败统计也要用
-  // ==================== 并发控制:检查是否已有图像生成进行中 ====================
-  if (isImageGenerating) {
-    const elapsedTime = Date.now() - currentGenerationStartTime;
-
-    // 检查是否超时(可能是僵尸锁)
-    if (elapsedTime > IMAGE_GENERATION_TIMEOUT) {
-      console.warn(`⚠️ 检测到超时的图像生成锁,自动释放 (已运行 ${Math.floor(elapsedTime/1000)} 秒)`);
-      isImageGenerating = false;
-    } else {
-      // 拒绝并发请求
-      console.log(`🚫 拒绝并发请求: 已有图像生成进行中 (已运行 ${Math.floor(elapsedTime/1000)} 秒)`);
-      return new Response(JSON.stringify({
-        error: {
-          message: `服务器正在处理其他图像生成请求,请稍后重试。当前请求已运行 ${Math.floor(elapsedTime/1000)} 秒。`,
-          type: "rate_limit_error",
-          code: "concurrent_request_rejected"
-        }
-      }), {
-        status: 429,
-        headers: {
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*",
-          "Retry-After": "10"
-        }
-      });
-    }
-  }
-
-  // 设置忙碌标志
-  isImageGenerating = true;
-  currentGenerationStartTime = Date.now();
-  console.log(`🔒 设置图像生成锁 (时间戳: ${currentGenerationStartTime})`);
-
   try {
     const requestBody = await req.json();
     console.log("🎨 收到图像生成请求:", requestBody);
@@ -2253,18 +2518,16 @@ async function handleImageGeneration(req: Request): Promise<Response> {
 
           // 检查 Sider API 错误响应
           if (siderData.code && siderData.code !== 0) {
+            const errCode = Number(siderData.code);
+            const detail = upstreamErrorDetails(errCode, siderData.msg || "");
+            noteUpstreamOutcome(siderRequest.model, errCode);
+            recordFailure(siderRequest.model);
             console.error(`❌ Sider API 错误 [行${lineCount}]:`, {
-              code: siderData.code,
+              code: errCode,
               msg: siderData.msg
             });
-
-            // 特殊处理:并发限制错误
-            if (siderData.code === 1101) {
-              throw new Error(`Sider API 限流: ${siderData.msg}。请等待当前请求完成后重试。`);
-            }
-
-            // 其他错误也应该抛出
-            throw new Error(`Sider API 错误 (${siderData.code}): ${siderData.msg}`);
+            try { await reader.cancel(); } catch { /* ignore */ }
+            return openAIErrorResponse(errCode, detail.message);
           }
 
           if (!siderData.data) {
@@ -2421,11 +2684,6 @@ async function handleImageGeneration(req: Request): Promise<Response> {
         "Access-Control-Allow-Origin": "*"
       }
     });
-  } finally {
-    // 释放锁 (无论成功还是失败)
-    isImageGenerating = false;
-    const totalTime = Date.now() - currentGenerationStartTime;
-    console.log(`🔓 释放图像生成锁 (总耗时: ${Math.floor(totalTime/1000)} 秒)`);
   }
 }
 
@@ -2462,7 +2720,8 @@ function geminiToMessages(body: any): { messages: any[] } {
 // Gemini 非流式响应构建
 function buildGeminiResponse(
   content: string, reasoning: string, modelName: string,
-  finishReason = "STOP"
+  finishReason = "STOP",
+  inputText = "",
 ): any {
   const parts: any[] = [];
   if (content) {
@@ -2478,9 +2737,9 @@ function buildGeminiResponse(
       index: 0,
     }],
     usageMetadata: {
-      promptTokenCount: 0,
-      candidatesTokenCount: content.length,
-      totalTokenCount: content.length,
+      promptTokenCount: estimateTokens(inputText),
+      candidatesTokenCount: estimateTokens(content),
+      totalTokenCount: estimateTokens(inputText) + estimateTokens(content),
     },
   };
   // Gemini 扩展: thought (思考内容)
@@ -2497,6 +2756,7 @@ async function handleGeminiGenerate(
   try {
     const body = await req.json();
     console.log(`📥 Gemini ${isStream ? "stream" : "generate"}: model=${geminiModel}`);
+    const outputLimits = geminiOutputLimits(body);
 
     // 入站适配: Gemini → messages[]
     const { messages } = geminiToMessages(body);
@@ -2581,6 +2841,8 @@ async function handleGeminiGenerate(
     // ===== 非流式: 消费上游流, 聚合后返回 Gemini 格式 =====
     if (!isStream) {
       let fullText = "", reasoningAcc = "";
+      let upstreamErrCode = 0;
+      let upstreamErrMsg = "";
       const reader = siderResponse.body?.getReader();
       if (!reader) throw new Error("无法获取响应流");
       const lineReader = new SSELineReader();
@@ -2591,7 +2853,11 @@ async function handleGeminiGenerate(
         if (!dl) continue;
         try {
           const sd = JSON.parse(dl);
-          if (sd.code && sd.code !== 0) continue;
+          if (sd.code && sd.code !== 0) {
+            upstreamErrCode = Number(sd.code);
+            upstreamErrMsg = sd.msg || upstreamErrMsg;
+            continue;
+          }
           const d = sd.data;
           if (!d) continue;
           if (d.type === "text" && d.text) fullText += d.text;
@@ -2603,6 +2869,18 @@ async function handleGeminiGenerate(
           }
         } catch { /* skip */ }
       }
+      if (upstreamErrCode !== 0 && !fullText) {
+        recordFailure(geminiModel);
+        noteUpstreamOutcome(siderModel, upstreamErrCode);
+        return openAIErrorResponse(upstreamErrCode, upstreamErrMsg);
+      }
+      if (!fullText) {
+        recordFailure(geminiModel);
+        return new Response(JSON.stringify({
+          error: { message: "上游响应没有生成任何文本内容。", type: "upstream_error" }
+        }), { status: 502, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+      }
+      const limited = applyOutputLimits(fullText, outputLimits);
       // 用量统计: Gemini 非流式
       recordUsage({
         model: geminiModel,
@@ -2610,9 +2888,15 @@ async function handleGeminiGenerate(
         ms: 0,
         toolUses: [],
         inputChars: prompt.length,
-        outputChars: fullText.length,
+        outputChars: limited.text.length,
       });
-      const geminiResp = buildGeminiResponse(fullText || "生成完成", reasoningAcc, geminiModel);
+      const geminiResp = buildGeminiResponse(
+        limited.text,
+        reasoningAcc,
+        geminiModel,
+        geminiFinishReason(limited.stopReason),
+        fullContext,
+      );
       return new Response(JSON.stringify(geminiResp), {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });
@@ -2630,15 +2914,34 @@ async function handleGeminiGenerate(
         const gT0 = Date.now();
         let gOutputChars = 0;
         const gTools = new Set<string>();
+        const textLimiter = createStreamingOutputLimiter(outputLimits);
         const finishGeminiStats = () => {
           recordUsage({
             model: geminiModel,
             stream: true,
             ms: Date.now() - gT0,
             toolUses: [...gTools],
-            inputChars: 0,
+            inputChars: prompt.length,
             outputChars: gOutputChars,
           });
+        };
+
+        const enqueueGeminiText = (text: string, finishReason?: "STOP" | "MAX_TOKENS") => {
+          if (!text && !finishReason) return;
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            candidates: [{
+              content: { role: "model", parts: text ? [{ text }] : [] },
+              ...(finishReason ? { finishReason } : {}),
+              index: 0,
+            }],
+          })}\n\n`));
+        };
+
+        const finishGeminiStream = (reason: OutputStopReason = "end_turn") => {
+          enqueueGeminiText("", geminiFinishReason(reason));
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          finishGeminiStats();
+          hb.close();
         };
 
         try {
@@ -2647,40 +2950,50 @@ async function handleGeminiGenerate(
             if (!tl) continue;
             const dl = tl.startsWith("data:") ? tl.substring(5).trim() : tl;
             if (dl === "[DONE]") {
-              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-              finishGeminiStats();
-              hb.close();
+              const flushed = textLimiter.flush();
+              if (flushed.text) {
+                gOutputChars += flushed.text.length;
+                enqueueGeminiText(flushed.text);
+              }
+              finishGeminiStream(flushed.stopReason);
               return;
             }
             if (!dl) continue;
             try {
               const sd = JSON.parse(dl);
               if (sd.code && sd.code !== 0) {
-                // 流内错误触发熔断 (HTTP 200 但 SSE 内部错误)
-                recordUpstreamFailure(siderModel);
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                  error: { code: sd.code, message: sd.msg || "" }
-                })}\n\n`));
-                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                finishGeminiStats();
-                hb.close();
-                return;
+                const errCode = Number(sd.code);
+                const detail = upstreamErrorDetails(errCode, sd.msg || "");
+                if (gOutputChars === 0) {
+                  noteUpstreamOutcome(siderModel, errCode);
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                    error: { code: errCode, message: detail.message, type: detail.type }
+                  })}\n\n`));
+                  controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                  finishGeminiStats();
+                  hb.close();
+                  return;
+                }
+                continue;
               }
               const d = sd.data;
               if (!d) continue;
 
               // 累积输出字符 (text) 与工具名 (tool_call)
-              if (d.type === "text" && d.text) gOutputChars += d.text.length;
               if (d.type === "tool_call" && d.tool_call?.name) gTools.add(d.tool_call.name);
 
               let geminiChunk: any = null;
               if (d.type === "text" && d.text) {
-                geminiChunk = {
-                  candidates: [{
-                    content: { role: "model", parts: [{ text: d.text }] },
-                    index: 0,
-                  }],
-                };
+                const textResult = textLimiter.push(d.text);
+                if (textResult.text) {
+                  gOutputChars += textResult.text.length;
+                  enqueueGeminiText(textResult.text);
+                }
+                if (textResult.done) {
+                  finishGeminiStream(textResult.stopReason || "end_turn");
+                  try { await reader.cancel(); } catch { /* ignore */ }
+                  return;
+                }
               } else if (d.type === "reasoning_content") {
                 const rc = d.reasoning_content;
                 const rt = (typeof rc === "object" && rc !== null && "text" in rc)
@@ -2701,9 +3014,12 @@ async function handleGeminiGenerate(
               }
             } catch { /* skip */ }
           }
-          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-          finishGeminiStats();
-          hb.close();
+          const flushed = textLimiter.flush();
+          if (flushed.text) {
+            gOutputChars += flushed.text.length;
+            enqueueGeminiText(flushed.text);
+          }
+          finishGeminiStream(flushed.stopReason);
         } catch (err: any) {
           console.error("❌ Gemini流式错误:", err);
           hb.fail(err);
@@ -2765,7 +3081,7 @@ function anthropicToMessages(body: any): { messages: any[] } {
 // Anthropic 非流式响应构建
 function buildAnthropicResponse(
   id: string, content: string, modelName: string, reasoning: string,
-  stopReason = "end_turn", usage: any = null,
+  stopReason: OutputStopReason = "end_turn", usage: any = null, stopSequence?: string,
 ): any {
   const resp: any = {
     id,
@@ -2775,10 +3091,15 @@ function buildAnthropicResponse(
     content: [{ type: "text", text: content }],
     stop_reason: stopReason,
   };
+  if (stopSequence) {
+    resp.stop_sequence = stopSequence;
+  }
   if (reasoning) {
     resp.content.unshift({ type: "thinking", thinking: reasoning });
   }
-  resp.usage = usage || { input_tokens: 0, output_tokens: content.length };
+  if (usage) {
+    resp.usage = usage;
+  }
   return resp;
 }
 
@@ -2789,6 +3110,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
     const body = await req.json();
     const isStream = body.stream === true;
     console.log(`📥 Anthropic ${isStream ? "stream" : "message"}: model=${body.model}`);
+    const outputLimits = anthropicOutputLimits(body);
 
     const { messages } = anthropicToMessages(body);
 
@@ -2876,6 +3198,8 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
     // ---- 非流式 ----
     if (!isStream) {
       let fullText = "", reasoningAcc = "";
+      let upstreamErrCode = 0;
+      let upstreamErrMsg = "";
       const reader = siderResp.body?.getReader();
       if (!reader) throw new Error("无法获取响应流");
       const lineReader = new SSELineReader();
@@ -2886,7 +3210,11 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
         if (!dl) continue;
         try {
           const sd = JSON.parse(dl);
-          if (sd.code && sd.code !== 0) continue;
+          if (sd.code && sd.code !== 0) {
+            upstreamErrCode = Number(sd.code);
+            upstreamErrMsg = sd.msg || upstreamErrMsg;
+            continue;
+          }
           const d = sd.data; if (!d) continue;
           if (d.type === "text" && d.text) fullText += d.text;
           if (d.type === "reasoning_content") {
@@ -2897,6 +3225,23 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
           }
         } catch { /* skip */ }
       }
+      if (upstreamErrCode !== 0 && !fullText) {
+        recordFailure(anthroModel);
+        noteUpstreamOutcome(siderModel, upstreamErrCode);
+        const detail = upstreamErrorDetails(upstreamErrCode, upstreamErrMsg);
+        return new Response(JSON.stringify({
+          type: "error",
+          error: { type: detail.type, message: detail.message, upstream_code: upstreamErrCode },
+        }), { status: detail.statusCode, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+      }
+      if (!fullText) {
+        recordFailure(anthroModel);
+        return new Response(JSON.stringify({
+          type: "error",
+          error: { type: "api_error", message: "上游响应没有生成任何文本内容。" },
+        }), { status: 502, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+      }
+      const limited = applyOutputLimits(fullText, outputLimits);
       // 用量统计: Anthropic 非流式
       recordUsage({
         model: anthroModel,
@@ -2904,9 +3249,20 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
         ms: 0,
         toolUses: [],
         inputChars: prompt.length,
-        outputChars: fullText.length,
+        outputChars: limited.text.length,
       });
-      const resp = buildAnthropicResponse(msgId, fullText || "生成完成", anthroModel, reasoningAcc);
+      const resp = buildAnthropicResponse(
+        msgId,
+        limited.text,
+        anthroModel,
+        reasoningAcc,
+        limited.stopReason,
+        {
+          input_tokens: estimateTokens(fullContext),
+          output_tokens: estimateTokens(reasoningAcc + limited.text),
+        },
+        limited.stopSequence,
+      );
       return new Response(JSON.stringify(resp), {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
@@ -2933,6 +3289,8 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
         let blockIndex = -1;
         let currentBlock: "text" | "thinking" | null = null;
         let outputChars = 0;
+        let outputTextAcc = "";
+        const textLimiter = createStreamingOutputLimiter(outputLimits);
         // 用量统计累积: 工具名 (Set 去重) + 计时
         const anthroT0 = Date.now();
         const anthroTools = new Set<string>();
@@ -2942,7 +3300,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
             stream: true,
             ms: Date.now() - anthroT0,
             toolUses: [...anthroTools],
-            inputChars: 0,
+            inputChars: fullContext.length,
             outputChars,
           });
         };
@@ -2955,7 +3313,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
             message: {
               id: msgId, type: "message", role: "assistant", model: anthroModel,
               content: [], stop_reason: null, stop_sequence: null,
-              usage: { input_tokens: 0, output_tokens: 0 },
+              usage: { input_tokens: estimateTokens(fullContext), output_tokens: 0 },
             },
           });
         };
@@ -2977,14 +3335,13 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
               : { type: "text", text: "" },
           });
         };
-        const finishOk = () => {
+        const finishOk = (reason: OutputStopReason = "end_turn", stopSequence: string | null = null) => {
           ensureStart();
           closeBlock();
           sendEvent("message_delta", {
             type: "message_delta",
-            delta: { stop_reason: "end_turn", stop_sequence: null },
-            // token 估算 (约 4 字符/token), 避免用字符数直填 usage。
-            usage: { output_tokens: Math.max(1, Math.ceil(outputChars / 4)) },
+            delta: { stop_reason: reason, stop_sequence: stopSequence },
+            usage: { output_tokens: estimateTokens(outputTextAcc) },
           });
           sendEvent("message_stop", { type: "message_stop" });
           finishAnthroStats();
@@ -2998,29 +3355,58 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
             const tl = line.trim();
             if (!tl) continue;
             const dl = tl.startsWith("data:") ? tl.substring(5).trim() : tl;
-            if (dl === "[DONE]") { finishOk(); return; }
+            if (dl === "[DONE]") {
+              const flushed = textLimiter.flush();
+              if (flushed.text) {
+                if (currentBlock !== "text") openBlock("text");
+                outputChars += flushed.text.length;
+                outputTextAcc += flushed.text;
+                sendEvent("content_block_delta", {
+                  type: "content_block_delta",
+                  index: blockIndex,
+                  delta: { type: "text_delta", text: flushed.text },
+                });
+              }
+              finishOk(flushed.stopReason);
+              return;
+            }
             if (!dl) continue;
             try {
               const sd = JSON.parse(dl);
               if (sd.code && sd.code !== 0) {
-                closeBlock();
-                sendEvent("error", {
-                  type: "error",
-                  error: { type: "api_error", message: sd.msg || `code=${sd.code}` },
-                });
-                sendEvent("message_stop", { type: "message_stop" });
-                hb.close();
-                return;
+                const errCode = Number(sd.code);
+                const detail = upstreamErrorDetails(errCode, sd.msg || "");
+                if (outputTextAcc.length === 0) {
+                  noteUpstreamOutcome(siderModel, errCode);
+                  closeBlock();
+                  sendEvent("error", {
+                    type: "error",
+                    error: { type: detail.type, message: detail.message, upstream_code: errCode },
+                  });
+                  sendEvent("message_stop", { type: "message_stop" });
+                  hb.close();
+                  return;
+                }
+                continue;
               }
               const d = sd.data; if (!d) continue;
               if (d.type === "text" && d.text) {
                 if (currentBlock !== "text") openBlock("text");
-                outputChars += d.text.length;
-                sendEvent("content_block_delta", {
-                  type: "content_block_delta",
-                  index: blockIndex,
-                  delta: { type: "text_delta", text: d.text },
-                });
+                const textResult = textLimiter.push(d.text);
+                if (textResult.text) {
+                  outputChars += textResult.text.length;
+                  outputTextAcc += textResult.text;
+                  sendEvent("content_block_delta", {
+                    type: "content_block_delta",
+                    index: blockIndex,
+                    delta: { type: "text_delta", text: textResult.text },
+                  });
+                }
+                if (textResult.done) {
+                  finishOk(textResult.stopReason || "end_turn", textResult.stopSequence || null);
+                  try { await reader.cancel(); } catch { /* ignore */ }
+                  return;
+                }
               } else if (d.type === "reasoning_content") {
                 const rc = d.reasoning_content;
                 const rt = (typeof rc === "object" && rc !== null && "text" in rc)
@@ -3041,7 +3427,18 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
           }
 
           // 上游未显式发 [DONE] 就结束的兜底
-          finishOk();
+          const flushed = textLimiter.flush();
+          if (flushed.text) {
+            if (currentBlock !== "text") openBlock("text");
+            outputChars += flushed.text.length;
+            outputTextAcc += flushed.text;
+            sendEvent("content_block_delta", {
+              type: "content_block_delta",
+              index: blockIndex,
+              delta: { type: "text_delta", text: flushed.text },
+            });
+          }
+          finishOk(flushed.stopReason);
         } catch (err: any) {
           console.error("❌ Anthropic流错误:", err);
           if (!hb.closed) {
@@ -3112,6 +3509,7 @@ function responsesToMessages(body: any): { messages: any[]; prompt: string } {
 // Responses API 非流式响应构建
 function buildResponsesResponse(
   id: string, content: string, modelName: string, reasoning: string,
+  inputText = "", stopReason: OutputStopReason = "end_turn",
 ): any {
   const output: any[] = [];
   // 如果有推理内容, 先放 reasoning
@@ -3126,16 +3524,21 @@ function buildResponsesResponse(
     content: [{ type: "output_text", text: content }],
   });
 
-  return {
+  const resp: any = {
     id, object: "response",
     model: modelName,
     output,
+    status: stopReason === "max_tokens" ? "incomplete" : "completed",
     usage: {
-      input_tokens: 0,
-      output_tokens: content.length,
-      total_tokens: content.length,
+      input_tokens: estimateTokens(inputText),
+      output_tokens: estimateTokens(content),
+      total_tokens: estimateTokens(inputText) + estimateTokens(content),
     },
   };
+  if (stopReason === "max_tokens") {
+    resp.incomplete_details = { reason: "max_output_tokens" };
+  }
+  return resp;
 }
 
 async function handleOpenAIResponse(req: Request): Promise<Response> {
@@ -3144,6 +3547,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
     const body = await req.json();
     const isStream = body.stream === true;
     console.log(`📥 Responses ${isStream ? "stream" : "nonstream"}: model=${body.model}`);
+    const outputLimits = responsesOutputLimits(body);
 
     const { messages, prompt } = responsesToMessages(body);
 
@@ -3220,6 +3624,8 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
     // ---- 非流式 ----
     if (!isStream) {
       let fullText = "", reasoningAcc = "";
+      let upstreamErrCode = 0;
+      let upstreamErrMsg = "";
       const reader = siderResp.body?.getReader();
       if (!reader) throw new Error("无法获取响应流");
       const lineReader = new SSELineReader();
@@ -3230,7 +3636,11 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
         if (!dl) continue;
         try {
           const sd = JSON.parse(dl);
-          if (sd.code && sd.code !== 0) continue;
+          if (sd.code && sd.code !== 0) {
+            upstreamErrCode = Number(sd.code);
+            upstreamErrMsg = sd.msg || upstreamErrMsg;
+            continue;
+          }
           const d = sd.data; if (!d) continue;
           if (d.type === "text" && d.text) fullText += d.text;
           if (d.type === "reasoning_content") {
@@ -3241,6 +3651,18 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
           }
         } catch { /* skip */ }
       }
+      if (upstreamErrCode !== 0 && !fullText) {
+        recordFailure(modelName);
+        noteUpstreamOutcome(siderModel, upstreamErrCode);
+        return openAIErrorResponse(upstreamErrCode, upstreamErrMsg);
+      }
+      if (!fullText) {
+        recordFailure(modelName);
+        return new Response(JSON.stringify({
+          error: { message: "上游响应没有生成任何文本内容。", type: "upstream_error" },
+        }), { status: 502, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+      }
+      const limited = applyOutputLimits(fullText, outputLimits);
       // 用量统计: Responses 非流式
       recordUsage({
         model: modelName,
@@ -3248,9 +3670,9 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
         ms: 0,
         toolUses: [],
         inputChars: prompt.length,
-        outputChars: fullText.length,
+        outputChars: limited.text.length,
       });
-      const respData = buildResponsesResponse(respId, fullText || "生成完成", modelName, reasoningAcc);
+      const respData = buildResponsesResponse(respId, limited.text, modelName, reasoningAcc, fullContext, limited.stopReason);
       return new Response(JSON.stringify(respData), {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
@@ -3267,14 +3689,16 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
         // 用量统计累积
         const rT0 = Date.now();
         let rOutputChars = 0;
+        let outputTextAcc = "";
         const rTools = new Set<string>();
+        const textLimiter = createStreamingOutputLimiter(outputLimits);
         const finishResponsesStats = () => {
           recordUsage({
             model: modelName,
             stream: true,
             ms: Date.now() - rT0,
             toolUses: [...rTools],
-            inputChars: 0,
+            inputChars: prompt.length,
             outputChars: rOutputChars,
           });
         };
@@ -3293,49 +3717,89 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
         let textStarted = false;
         sendEvent("response.output_text.delta", { type: "response.output_text.delta", delta: "" });
 
+        const finishResponsesStream = (reason: OutputStopReason = "end_turn") => {
+          const completedResp: any = {
+            ...initialResp,
+            status: reason === "max_tokens" ? "incomplete" : "completed",
+            output: [{
+              type: "message", role: "assistant",
+              content: [{ type: "output_text", text: outputTextAcc }],
+            }],
+            usage: {
+              input_tokens: estimateTokens(fullContext),
+              output_tokens: estimateTokens(outputTextAcc),
+              total_tokens: estimateTokens(fullContext) + estimateTokens(outputTextAcc),
+            },
+          };
+          if (reason === "max_tokens") {
+            completedResp.incomplete_details = { reason: "max_output_tokens" };
+          }
+          sendEvent("response.completed", { type: "response.completed", response: completedResp });
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          finishResponsesStats();
+          hb.close();
+        };
+
         try {
           for await (const line of lineReader.readLines(reader)) {
             const tl = line.trim();
             if (!tl) continue;
             const dl = tl.startsWith("data:") ? tl.substring(5).trim() : tl;
             if (dl === "[DONE]") {
-              const completedResp = {
-                ...initialResp,
-                status: "completed",
-                output: [{
-                  type: "message", role: "assistant",
-                  content: [{ type: "output_text", text: textStarted ? "" : "" }],
-                }],
-                usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
-              };
-              sendEvent("response.completed", { type: "response.completed", response: completedResp });
-              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-              finishResponsesStats();
-              hb.close(); return;
-            }
-            if (!dl) continue;
-            try {
-              const sd = JSON.parse(dl);
-              if (sd.code && sd.code !== 0) {
-                sendEvent("error", {
-                  type: "error",
-                  error: { type: "api_error", message: sd.msg || `code=${sd.code}` },
-                });
-                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                finishResponsesStats();
-                hb.close(); return;
-              }
-              const d = sd.data; if (!d) continue;
-              if (d.type === "text" && d.text) {
-                if (!textStarted) textStarted = true;
-                rOutputChars += d.text.length;
+              const flushed = textLimiter.flush();
+              if (flushed.text) {
+                textStarted = true;
+                rOutputChars += flushed.text.length;
+                outputTextAcc += flushed.text;
                 sendEvent("response.output_text.delta", {
                   type: "response.output_text.delta",
                   item_id: respId,
                   output_index: 0,
                   content_index: 0,
-                  delta: d.text,
+                  delta: flushed.text,
                 });
+              }
+              finishResponsesStream(flushed.stopReason);
+              return;
+            }
+            if (!dl) continue;
+            try {
+              const sd = JSON.parse(dl);
+              if (sd.code && sd.code !== 0) {
+                const errCode = Number(sd.code);
+                const detail = upstreamErrorDetails(errCode, sd.msg || "");
+                if (outputTextAcc.length === 0) {
+                  noteUpstreamOutcome(siderModel, errCode);
+                  sendEvent("error", {
+                    type: "error",
+                    error: { type: detail.type, message: detail.message, upstream_code: errCode },
+                  });
+                  controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                  finishResponsesStats();
+                  hb.close(); return;
+                }
+                continue;
+              }
+              const d = sd.data; if (!d) continue;
+              if (d.type === "text" && d.text) {
+                const textResult = textLimiter.push(d.text);
+                if (!textStarted && textResult.text) textStarted = true;
+                if (textResult.text) {
+                  rOutputChars += textResult.text.length;
+                  outputTextAcc += textResult.text;
+                  sendEvent("response.output_text.delta", {
+                    type: "response.output_text.delta",
+                    item_id: respId,
+                    output_index: 0,
+                    content_index: 0,
+                    delta: textResult.text,
+                  });
+                }
+                if (textResult.done) {
+                  finishResponsesStream(textResult.stopReason || "end_turn");
+                  try { await reader.cancel(); } catch { /* ignore */ }
+                  return;
+                }
               }
               if (d.type === "tool_call" && d.tool_call?.name) {
                 rTools.add(d.tool_call.name);
@@ -3343,9 +3807,19 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
               // reasoning_content ignored in responses stream (kept simple)
             } catch { /* skip */ }
           }
-          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-          finishResponsesStats();
-          hb.close();
+          const flushed = textLimiter.flush();
+          if (flushed.text) {
+            rOutputChars += flushed.text.length;
+            outputTextAcc += flushed.text;
+            sendEvent("response.output_text.delta", {
+              type: "response.output_text.delta",
+              item_id: respId,
+              output_index: 0,
+              content_index: 0,
+              delta: flushed.text,
+            });
+          }
+          finishResponsesStream(flushed.stopReason);
         } catch (err: any) { console.error("❌ Responses流错误:", err); finishResponsesStats(); hb.fail(err); }
       },
     });
@@ -4389,4 +4863,3 @@ console.log(`   - 支持 ${Object.keys(MODEL_MAPPING).length} 个模型`);
 console.log("\n🔐 安全配置:");
 console.log(`   - SIDER_AUTH_TOKEN: ${SIDER_AUTH_TOKEN ? "✅ 已配置" : "❌ 未配置"}`);
 console.log(`   - AUTH_TOKEN: ${AUTH_TOKEN ? "✅ 已启用认证" : "⚠️ 未启用认证(开发模式)"}`);
-

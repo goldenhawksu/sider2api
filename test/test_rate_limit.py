@@ -1,18 +1,18 @@
-"""限速门控功能测试: 每模型 1 分钟最多 6 次调用, 失败后熔断 (普通 1 分钟 / opus 1 小时)。
+"""限速门控功能测试: 每模型 1 分钟最多 6 次调用, 配额耗尽后熔断。
 
 设计要点:
 - 每个测试用【独立模型】, 避免与主测试套件 (gpt-5.5/claude-opus-4.8/gemini-2.5-pro 等)
   及测试文件内部互相干扰 (限速状态在实例内存, 共享)。
 - 熔断/限速影响最多持续 1 小时 (opus), 因此受影响的模型不用于其他测试。
+- Sider code:603 是输入过长, 不应触发模型熔断。
 
 覆盖:
 - 限速窗口: 连续 6 次成功后第 7 次应被 429 拒绝 (model_rate_limited)。
 - 模型隔离: 一个模型限速不影响其他模型。
 - 错误格式: 429 响应 OpenAI 兼容 (type/code/model + Retry-After)。
-- 熔断: 上游失败后该模型 60s 内被拒绝。
-- opus 熔断: claude-opus-* 失败后熔断 1 小时 (Retry-After ~3600)。
+- 输入过长: code:603 返回 400, 但后续短请求不被本地熔断。
 
-金额消耗: 每用例约 6 次真实额度 (第 7 次被门控拦截), 熔断用例 1 次失败请求。
+金额消耗: 每用例约 6 次真实额度 (第 7 次被门控拦截), 603 用例会额外发起一次短请求。
 """
 import time
 
@@ -27,8 +27,8 @@ RL_MODEL_A = "gpt-5-mini"        # 6 次限速窗口
 RL_MODEL_B = "gpt-5.1"           # 隔离测试 - 被限速
 RL_OTHER = "gpt-5.4-mini"        # 隔离测试 - 不应被限速
 RL_MODEL_C = "gpt-5.6-sol"       # 错误格式
-BREAKER_MODEL = "gpt-5.6-terra"   # 60s 熔断
-OPUS_MODEL = "claude-opus-4.5"   # 1h 熔断 (opus 模型, 不在主套件中)
+CONTEXT_MODEL = "gpt-5.6-terra"   # 603 不熔断
+OPUS_CONTEXT_MODEL = "claude-opus-4.5"   # opus 的 603 也不熔断
 
 # 触发上游 code:603 的超长 prompt (~48000 字符, 超 8810~22000 阈值)
 _LONG_PROMPT = "请逐字复述。" + ("测试数据" * 12000)
@@ -76,34 +76,23 @@ def test_rate_limit_error_format(client):
     assert "60 秒最多 6 次" in body["error"]["message"], f"message 应含策略: {body}"
 
 
-def test_circuit_breaker_after_failure(client):
-    """上游失败后该模型熔断: 60s 内被 429 拒绝。"""
-    model = BREAKER_MODEL
+def test_603_does_not_trigger_circuit_breaker(client):
+    """输入过长(code:603)只拒绝当前请求, 不应让该模型进入 60s 熔断。"""
+    model = CONTEXT_MODEL
     # 触发上游失败 (超长 prompt -> code 603)
     r = client.chat(model, [{"role": "user", "content": _LONG_PROMPT}], stream=False)
     assert r.status_code == 400, f"超长 prompt 应触发 603 类错误: {r.status_code} {r.text[:100]}"
     time.sleep(0.5)
-    # 熔断生效: 立即调用应被 429
+    # 不应熔断: 立即调用短请求应继续触达上游
     r2 = client.chat(model, [{"role": "user", "content": "说一个字"}], stream=False)
-    assert r2.status_code == 429, f"熔断后应 429: {r2.status_code} {r2.text[:120]}"
-    err = r2.json().get("error", {})
-    assert err.get("type") == "rate_limit_error"
-    assert err.get("code") == "model_rate_limited"
-    assert "1 分钟" in err.get("message", ""), f"普通模型应熔断 1 分钟: {err}"
-    retry = int(r2.headers.get("retry-after", "0"))
-    assert 1 <= retry <= 60, f"熔断剩余应 <=60s: {retry}"
+    assert r2.status_code == 200, f"603 后不应本地熔断: {r2.status_code} {r2.text[:120]}"
 
 
-def test_opus_circuit_breaker_1hour(client):
-    """opus 模型失败后熔断 1 小时 (Retry-After ~3600)。"""
-    model = OPUS_MODEL
+def test_opus_603_does_not_trigger_1hour_circuit_breaker(client):
+    """opus 模型的 code:603 也只是输入错误, 不应触发 1 小时熔断。"""
+    model = OPUS_CONTEXT_MODEL
     r = client.chat(model, [{"role": "user", "content": _LONG_PROMPT}], stream=False)
     assert r.status_code == 400, f"超长 prompt 应触发 603 类错误: {r.status_code} {r.text[:100]}"
     time.sleep(0.5)
     r2 = client.chat(model, [{"role": "user", "content": "说一个字"}], stream=False)
-    assert r2.status_code == 429, f"opus 熔断后应 429: {r2.status_code} {r2.text[:120]}"
-    err = r2.json().get("error", {})
-    assert err.get("type") == "rate_limit_error"
-    assert "1 小时" in err.get("message", ""), f"opus 应熔断 1 小时: {err}"
-    retry = int(r2.headers.get("retry-after", "0"))
-    assert retry >= 3000, f"opus 熔断剩余应约 3600s (允许已过几秒): {retry}"
+    assert r2.status_code == 200, f"opus 的 603 后不应本地熔断: {r2.status_code} {r2.text[:120]}"
