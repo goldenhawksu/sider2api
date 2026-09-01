@@ -11,6 +11,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -98,8 +99,26 @@ def _scenario_frames(prompt: str, seq: int) -> tuple[list[bytes], float]:
     delay = 0.0
     if "MOCK_HTTP_500" in prompt:
         return [], delay
+    if "MOCK_1135_MIN" in prompt:
+        # 上游 1135 会明说恢复时间, 门控应按这个时间熔断而非按模型类型拍脑袋
+        return [_frame({
+            "code": 1135,
+            "msg": "You've reached the current usage limit. This limit ensures fair use "
+                   "for all users. Please try again after 1 minutes.",
+            "data": None,
+        }), _done()], delay
+    if "MOCK_1135_SEC" in prompt:
+        # 极短冷却, 供账号级判定用例使用, 避免污染同实例后续用例
+        return [_frame({
+            "code": 1135,
+            "msg": "You've reached the current usage limit. Please try again after 2 seconds.",
+            "data": None,
+        }), _done()], delay
     if "MOCK_1135" in prompt:
         return [_frame({"code": 1135, "msg": "quota exhausted", "data": None}), _done()], delay
+    if "MOCK_SLOW" in prompt:
+        # 慢响应, 用于观察上游并发闸门的排队行为
+        return [_frame(_message_start(seq)), _frame(_text("slow ok")), _done()], 0.6
     if "MOCK_1101" in prompt:
         return [_frame({"code": 1101, "msg": "busy", "data": None}), _done()], delay
     if "MOCK_603" in prompt:
@@ -198,8 +217,9 @@ def _handler_factory(state: MockSiderState):
     return MockSiderHandler
 
 
-@pytest.fixture(scope="session")
-def mock_stack():
+@contextmanager
+def _launch_stack(env_extra: dict[str, str] | None = None):
+    """起一套 mock 上游 + deno 实例; env_extra 可覆盖门控参数供专项用例使用。"""
     state = MockSiderState()
     mock_server = ThreadingHTTPServer(("127.0.0.1", _free_port()), _handler_factory(state))
     mock_thread = threading.Thread(target=mock_server.serve_forever, daemon=True)
@@ -221,6 +241,8 @@ def mock_stack():
         "STATS_KV_ROOT": "mock-regression",
         "DENO_NO_UPDATE_CHECK": "1",
     })
+    if env_extra:
+        env.update(env_extra)
     proc = subprocess.Popen(
         ["deno", "run", "--unstable-kv", "--allow-net", "--allow-env", "--allow-read", "--allow-write", "deno_pro.ts"],
         cwd=ROOT,
@@ -266,6 +288,49 @@ def mock_stack():
             proc.wait(timeout=5)
         mock_server.shutdown()
         mock_server.server_close()
+
+
+@pytest.fixture(scope="session")
+def mock_stack():
+    with _launch_stack() as stack:
+        yield stack
+
+
+@pytest.fixture(scope="session")
+def aimd_stack():
+    """独立实例, 验证 AIMD 自适应配额: 初始配额 2, 每连续 2 次成功放宽 1。"""
+    with _launch_stack({
+        "RATE_LIMIT_MAX_CALLS": "2",
+        "RATE_LIMIT_QUOTA_STEP_AFTER": "2",
+        "RATE_LIMIT_WINDOW_MS": "60000",
+    }) as stack:
+        yield stack
+
+
+@pytest.fixture(scope="session")
+def gate_stack():
+    """独立实例, 供门控用例使用, 并显式开启并发闸门 (默认关闭)。
+
+    并发闸门与账号级冷却都是【全局】状态, 在共享实例上会被其他用例的 1135 污染
+    (实测: 全量跑时前面用例触发的账号冷却会把并发用例的请求全拦下)。
+    """
+    with _launch_stack({"UPSTREAM_MAX_CONCURRENCY": "1"}) as stack:
+        yield stack
+
+
+@pytest.fixture(scope="session")
+def quota_stack():
+    """独立实例, 固定配额 (QUOTA_MAX = MAX_CALLS 即禁用 AIMD 增长)。
+
+    用于验证"配额耗尽即拦截"这一门控语义。这类用例原本打真实上游 (每次 7+ 调用),
+    但它们测的是门控逻辑而非上游行为, 放在 mock 里零额度且更精确。
+    """
+    with _launch_stack({
+        "RATE_LIMIT_MAX_CALLS": "6",
+        "RATE_LIMIT_QUOTA_MAX": "6",
+        "RATE_LIMIT_WINDOW_MS": "60000",
+    }) as stack:
+        yield stack
 
 
 @pytest.fixture(autouse=True)
@@ -602,3 +667,230 @@ def test_derived_session_id_is_scoped_by_caller_fingerprint(mock_stack):
     assert len(upstream_requests) == 2
     assert not upstream_requests[0].get("cid")
     assert not upstream_requests[1].get("cid")
+
+
+# ==================== 上游门控优化 (熔断时长/并发闸门/账号级/AIMD) ====================
+
+
+@pytest.mark.smoke
+def test_1135_breaker_follows_upstream_reported_duration(mock_stack):
+    """1135 应按上游消息里告知的时长熔断, 而不是按模型类型拍脑袋。
+
+    取 opus 模型: 旧逻辑一律罚 1 小时, 哪怕上游只说"1 分钟" —— 白白闲置 59 分钟的可用额度。
+    """
+    model = "claude-opus-4.6"
+    first = _post(mock_stack["base_url"], "/v1/chat/completions", {
+        "model": model,
+        "messages": [{"role": "user", "content": "MOCK_1135_MIN"}],
+        "stream": False,
+    })
+    assert first.status_code == 429, first.text
+    assert first.json()["error"]["upstream_code"] == 1135
+
+    second = _post(mock_stack["base_url"], "/v1/chat/completions", {
+        "model": model,
+        "messages": [{"role": "user", "content": "SHOULD_BE_BLOCKED"}],
+        "stream": False,
+    })
+    assert second.status_code == 429, second.text
+    assert second.headers.get("X-Model-Rate-Limited") == "1"
+    retry = int(second.headers["Retry-After"])
+    assert 30 <= retry <= 60, f"应按上游告知的 1 分钟熔断, 实际 Retry-After={retry}"
+    # 第二次被本地熔断拦下, 不应触达上游
+    assert len(mock_stack["state"].snapshot()) == 1
+
+
+@pytest.mark.smoke
+def test_1135_without_duration_falls_back_to_fixed_breaker(mock_stack):
+    """上游没告知时长时, 回退到固定兜底时长 (非 opus 为 1 分钟)。"""
+    model = "gpt-5.4-mini"
+    first = _post(mock_stack["base_url"], "/v1/chat/completions", {
+        "model": model,
+        "messages": [{"role": "user", "content": "MOCK_1135"}],
+        "stream": False,
+    })
+    assert first.status_code == 429, first.text
+
+    second = _post(mock_stack["base_url"], "/v1/chat/completions", {
+        "model": model,
+        "messages": [{"role": "user", "content": "SHOULD_BE_BLOCKED"}],
+        "stream": False,
+    })
+    assert second.status_code == 429, second.text
+    retry = int(second.headers["Retry-After"])
+    assert 30 <= retry <= 60, f"兜底应为 1 分钟, 实际 Retry-After={retry}"
+
+
+@pytest.mark.smoke
+def test_upstream_concurrency_gate_queues_instead_of_failing(gate_stack):
+    """上游单并发: 并发请求应排队依次成功, 而不是失败。
+
+    MOCK_SLOW 的延迟发生在响应头之后、body 之前, 因此也验证了槽位是在【流结束】时
+    释放的 —— 若在 fetch 返回时就释放, 三个请求会并行, 总耗时接近单次。
+    """
+    model = "gpt-5.1"
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "MOCK_SLOW"}],
+        "stream": False,
+    }
+    start = time.time()
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [
+            pool.submit(_post, gate_stack["base_url"], "/v1/chat/completions", dict(body))
+            for _ in range(3)
+        ]
+        results = [f.result() for f in futures]
+    elapsed = time.time() - start
+
+    assert [r.status_code for r in results] == [200, 200, 200], [r.text[:120] for r in results]
+    # 单次上游耗时 0.6s; 串行化后三次应显著超过一次的耗时
+    assert elapsed >= 1.2, f"并发未被串行化, 总耗时仅 {elapsed:.2f}s"
+    assert len(gate_stack["state"].snapshot()) == 3
+
+
+@pytest.mark.smoke
+def test_account_level_quota_exhaustion_blocks_untouched_model(gate_stack):
+    """多个模型短时内都 1135 -> 判定账号级枯竭, 未试过的模型也直接拒, 不再逐个试探。"""
+    for model in ("gpt-5-mini", "gpt-5.4", "grok-4.6"):
+        r = _post(gate_stack["base_url"], "/v1/chat/completions", {
+            "model": model,
+            "messages": [{"role": "user", "content": "MOCK_1135_SEC"}],
+            "stream": False,
+        })
+        assert r.status_code == 429, r.text
+
+    upstream_calls = len(gate_stack["state"].snapshot())
+    # 第 4 个模型此前从未 1135, 但账号级冷却应把它也拦下
+    blocked = _post(gate_stack["base_url"], "/v1/chat/completions", {
+        "model": "llama-3.1-405b",
+        "messages": [{"role": "user", "content": "NORMAL_OK"}],
+        "stream": False,
+    })
+    assert blocked.status_code == 429, blocked.text
+    assert len(gate_stack["state"].snapshot()) == upstream_calls, "账号冷却期内不应触达上游"
+
+    # 冷却仅 2 秒 (上游告知), 到期后应自动恢复
+    time.sleep(2.6)
+    recovered = _post(gate_stack["base_url"], "/v1/chat/completions", {
+        "model": "llama-3.1-405b",
+        "messages": [{"role": "user", "content": "NORMAL_OK"}],
+        "stream": False,
+    })
+    assert recovered.status_code == 200, recovered.text
+
+
+@pytest.mark.smoke
+def test_adaptive_quota_widens_after_consecutive_successes(aimd_stack):
+    """AIMD: 初始配额 2, 连续 2 次成功后放宽到 3 -> 第 3 次仍能成功, 第 4 次才被拦。
+
+    固定保守配额会闲置上游额度; 自适应让健康时段用得更满。
+    """
+    model = "gemini-3.0-flash"
+    codes = []
+    for i in range(4):
+        r = _post(aimd_stack["base_url"], "/v1/chat/completions", {
+            "model": model,
+            "messages": [{"role": "user", "content": f"NORMAL_{i}"}],
+            "stream": False,
+        })
+        codes.append(r.status_code)
+
+    assert codes[:3] == [200, 200, 200], f"配额应已从 2 放宽到 3, 实际: {codes}"
+    assert codes[3] == 429, f"超出放宽后的配额应被拦, 实际: {codes}"
+
+
+@pytest.mark.smoke
+def test_image_generation_releases_slot_when_stream_not_drained(gate_stack):
+    """图像生成成功路径提前 break, 上游流未读完; 必须 cancel 才能及时释放并发槽位。
+
+    在【开启并发闸门】的实例上并发两次图像生成: 应排队依次成功。若不 cancel reader,
+    第一个请求的槽位会一直挂到 UPSTREAM_SLOT_MAX_HOLD_MS 兜底 (180s), 第二个请求
+    就会卡到客户端读超时 —— 这正是加 finally cancel 之前观察到的失败。
+    """
+    def fire() -> requests.Response:
+        return _post(gate_stack["base_url"], "/v1/images/generations", {
+            "prompt": "MOCK_IMAGE_SUCCESS",
+            "n": 1,
+            "size": "1024x1024",
+        })
+
+    start = time.time()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda _: fire(), range(2)))
+    elapsed = time.time() - start
+
+    assert [r.status_code for r in responses] == [200, 200], [r.text[:120] for r in responses]
+    for resp in responses:
+        assert resp.json()["data"][0]["url"].startswith("https://example.test/image-")
+    assert elapsed < 8, f"槽位未及时释放, 两次图像生成耗时 {elapsed:.1f}s"
+
+
+@pytest.mark.smoke
+def test_stream_early_return_releases_slot(gate_stack):
+    """流式路径命中 stop_sequence 会提前 return, 上游流未读完。
+
+    四个流式 start() 里普遍是 1 处 cancel 对 5~6 处 return; 修复放在 SSELineReader
+    这个 async generator 的 finally 里 —— for await 提前 return 时 JS 会调用
+    generator 的 .return(), finally 必定执行, 从而覆盖所有调用点。
+    这里在开启并发闸门的实例上验证: 提前 return 后槽位应已释放, 后续请求不被卡住。
+    """
+    first = _post(gate_stack["base_url"], "/v1/chat/completions", {
+        "model": "gpt-5.4",
+        "messages": [{"role": "user", "content": "MOCK_STREAM_STOP"}],
+        "stream": True,
+        "stop": ["STOP"],
+    }, stream=True)
+    assert first.status_code == 200, first.text[:200]
+    first_body = first.text  # 读完客户端侧响应
+    assert "data:" in first_body
+
+    # 若上游流未被 cancel, 槽位会挂到 180s 兜底, 这个请求就会排队超时
+    start = time.time()
+    second = _post(gate_stack["base_url"], "/v1/chat/completions", {
+        "model": "gpt-5.4",
+        "messages": [{"role": "user", "content": "NORMAL_AFTER_EARLY_RETURN"}],
+        "stream": False,
+    })
+    elapsed = time.time() - start
+    assert second.status_code == 200, second.text[:200]
+    assert elapsed < 5, f"槽位未及时释放, 后续请求耗时 {elapsed:.1f}s"
+
+
+@pytest.mark.smoke
+def test_quota_exhaustion_blocks_and_isolates_by_model(quota_stack):
+    """固定配额下: 第 7 次被拦, 错误格式规范, 且不波及其他模型。
+
+    覆盖原 test_rate_limit.py 中打真实上游的三个用例 (after_6_calls / isolation /
+    error_format), 迁到 mock 后零额度且不受 AIMD 配额增长影响。
+    """
+    base, model, other = quota_stack["base_url"], "gpt-5-mini", "gpt-5.1"
+
+    for i in range(6):
+        r = _post(base, "/v1/chat/completions", {
+            "model": model,
+            "messages": [{"role": "user", "content": f"WARM_{i}"}],
+            "stream": False,
+        })
+        assert r.status_code == 200, f"第 {i+1} 次应成功: {r.text[:150]}"
+
+    blocked = _post(base, "/v1/chat/completions", {
+        "model": model,
+        "messages": [{"role": "user", "content": "SHOULD_BLOCK"}],
+        "stream": False,
+    })
+    assert blocked.status_code == 429, blocked.text[:200]
+    err = blocked.json()["error"]
+    assert err["type"] == "rate_limit_error"
+    assert err["code"] == "model_rate_limited"
+    assert err["model"] == model
+    assert int(blocked.headers["Retry-After"]) >= 1
+    assert blocked.headers.get("X-Model-Rate-Limited") == "1"
+
+    # 限速是模型级的: 另一个模型不应受影响
+    isolated = _post(base, "/v1/chat/completions", {
+        "model": other,
+        "messages": [{"role": "user", "content": "OTHER_MODEL"}],
+        "stream": False,
+    })
+    assert isolated.status_code == 200, f"限速不应波及其他模型: {isolated.text[:150]}"

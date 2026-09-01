@@ -28,15 +28,44 @@ const SSE_PING_INTERVAL_MS = parseInt(Deno.env.get("SSE_PING_INTERVAL_MS") || "1
 
 // ==================== 上游调用限速门控 ====================
 // 对 sider 上游的每次调用做模型级限速，防止单模型突发流量打爆上游额度/触发 IP 级限流。
-// - 滑动窗口: 每模型每 60s 最多 RATE_LIMIT_MAX_CALLS 次调用。
-// - 熔断: 调用失败后该模型熔断 RATE_LIMIT_BREAKER_MS；opus 模型熔断 1 小时 (旗舰级更保守)。
+// - 并发闸门: 上游账号实测为【单并发】(并发请求会被拒 "only one request at a time")，
+//   故超出并发数的请求排队等待而非直接失败，把并发冲突从"失败"变成"排队"。
+// - 滑动窗口: 每模型每 60s 最多 quota 次调用；quota 随上游反馈自适应 (AIMD)。
+// - 熔断: 1135 优先按上游消息中告知的时间熔断 (上游会明说 "try again after N minutes")，
+//   解析不出才回退到固定时长。
 // - 超限/熔断直接返回标准化 429 rate_limit_error，不消耗上游额度。
 const RATE_LIMIT_WINDOW_MS = parseInt(Deno.env.get("RATE_LIMIT_WINDOW_MS") || "60000", 10); // 窗口 60s
-const RATE_LIMIT_MAX_CALLS = parseInt(Deno.env.get("RATE_LIMIT_MAX_CALLS") || "6", 10);      // 每窗口最多 6 次
+const RATE_LIMIT_MAX_CALLS = parseInt(Deno.env.get("RATE_LIMIT_MAX_CALLS") || "6", 10);      // 每窗口初始配额
 const RATE_LIMIT_BREAKER_MS = parseInt(Deno.env.get("RATE_LIMIT_BREAKER_MS") || "60000", 10); // 普通模型熔断 1 分钟
 const RATE_LIMIT_BREAKER_OPUS_MS = parseInt(Deno.env.get("RATE_LIMIT_BREAKER_OPUS_MS") || "3600000", 10); // opus 熔断 1 小时
 // 是否启用限速 (默认开; 测试/调试可关)
 const RATE_LIMIT_ENABLED = (Deno.env.get("RATE_LIMIT_ENABLED") || "true").toLowerCase() === "true";
+
+// --- 自适应配额 (AIMD): 上游健康就逐步放宽以用足额度, 撞墙就减半快速避让 ---
+const RATE_LIMIT_QUOTA_MAX = parseInt(Deno.env.get("RATE_LIMIT_QUOTA_MAX") || "30", 10);   // 配额上限
+const RATE_LIMIT_QUOTA_MIN = parseInt(Deno.env.get("RATE_LIMIT_QUOTA_MIN") || "2", 10);    // 配额下限
+const RATE_LIMIT_QUOTA_STEP_AFTER = parseInt(Deno.env.get("RATE_LIMIT_QUOTA_STEP_AFTER") || "3", 10); // 连续成功多少次 +1
+
+// --- 上游并发闸门 (默认关闭) ---
+// 上游账号实测为单并发, 排队理论上优于让请求失败。但本项目此前已明确移除进程内全局锁
+// (见下方 handleImageGeneration 附近注释与 test_image_generation_has_no_process_global_
+// concurrency_lock): Deno Deploy 多实例下进程内锁无法提供跨实例保护, 并发保护统一交给
+// 模型级限速门控。故此处默认 0 = 不限制, 保持既有行为; 需要时才显式开启。
+// 已知限制: 开启后, 不读完上游响应流的调用路径 (如图像生成成功分支 break 后不 cancel)
+// 会把槽位一直持有到 UPSTREAM_SLOT_MAX_HOLD_MS 兜底, 启用前需先修这些路径。
+const UPSTREAM_MAX_CONCURRENCY = parseInt(Deno.env.get("UPSTREAM_MAX_CONCURRENCY") || "0", 10);
+const UPSTREAM_QUEUE_MAX = parseInt(Deno.env.get("UPSTREAM_QUEUE_MAX") || "8", 10);          // 最大排队数, 超出直接 429
+const UPSTREAM_QUEUE_WAIT_MS = parseInt(Deno.env.get("UPSTREAM_QUEUE_WAIT_MS") || "30000", 10); // 最长排队等待
+// 槽位最长持有时间兜底: 防止流悬挂导致槽位永不释放
+const UPSTREAM_SLOT_MAX_HOLD_MS = parseInt(Deno.env.get("UPSTREAM_SLOT_MAX_HOLD_MS") || "180000", 10);
+
+// --- 账号级额度耗尽判定: 短时间内多个不同模型都 1135, 说明不是单模型而是账号额度枯竭 ---
+const ACCOUNT_QUOTA_MODELS_THRESHOLD = parseInt(Deno.env.get("ACCOUNT_QUOTA_MODELS_THRESHOLD") || "3", 10);
+const ACCOUNT_QUOTA_WINDOW_MS = parseInt(Deno.env.get("ACCOUNT_QUOTA_WINDOW_MS") || "120000", 10);
+// 半开探测: 账号冷却期内每隔这么久放行一个请求去试探上游是否已恢复。
+// 没有它, 冷却期内所有请求都被拦, 就永远等不到"上游已恢复"的证据, 只能干等到期 ——
+// 那就把"惩罚过度"的毛病从模型级搬到了账号级。
+const ACCOUNT_PROBE_INTERVAL_MS = parseInt(Deno.env.get("ACCOUNT_PROBE_INTERVAL_MS") || "30000", 10);
 
 // 默认请求模板(基于真实成功的抓包数据)
 const DEFAULT_REQUEST_TEMPLATE = {
@@ -1205,27 +1234,54 @@ async function getStatsSnapshotMerged(now = Date.now()): Promise<StatsSnapshot> 
 
 // ==================== 上游调用限速门控 ====================
 
-// 每模型限速状态: 滑动窗口计数 + 熔断截止时间。
-// 窗口按 WINDOW_MS 对齐到整段 (与统计趋势桶同思路), 每窗口最多 MAX_CALLS 次。
+// 每模型限速状态: 滑动窗口计数 + 熔断截止时间 + 自适应配额。
+// 窗口按 WINDOW_MS 对齐到整段 (与统计趋势桶同思路), 每窗口最多 quota 次。
 interface RateLimitState {
   windowStart: number;  // 当前窗口起始 (毫秒时间戳)
   count: number;        // 当前窗口已调用次数
   breakerUntil: number; // 熔断截止时间; 0 = 未熔断
+  quota: number;        // 当前窗口配额 (AIMD 自适应, 初始 RATE_LIMIT_MAX_CALLS)
+  consecutiveOk: number; // 连续成功次数, 用于加性放宽
 }
 
 // 模型 → 限速状态 (内存 Map, 实例重启后重置; 与会话存储同生命周期)
 const rateLimitMap = new Map<string, RateLimitState>();
 
-/** opus 模型判定: 名字含 "opus" (claude-opus-*) 的旗舰级, 熔断时长更长。 */
+// 账号级额度耗尽: 记录各模型最近一次 1135 的时间; 短时多模型命中即判定账号枯竭。
+const quotaHitAt = new Map<string, number>();
+let accountCooldownUntil = 0;
+let accountProbeAt = 0; // 下次允许放行半开探测的时间
+
+/** opus 模型判定: 名字含 "opus" (claude-opus-*) 的旗舰级, 熔断兜底时长更长。 */
 function isOpusModel(model: string): boolean {
   return model.includes("opus");
+}
+
+/**
+ * 从上游错误消息中解析出建议的重试时长 (毫秒)。
+ * sider 的 1135 会明说 "Please try again after 117 minutes." —— 这个信息此前被丢弃,
+ * 导致 opus 撞到 1 分钟的短时节流却被罚 1 小时, 或 272 分钟的额度枯竭只罚 1 分钟后反复撞墙。
+ */
+function parseUpstreamRetryMs(msg?: string): number | null {
+  if (!msg) return null;
+  const m = msg.match(/after\s+(\d+)\s*(hours?|minutes?|mins?|seconds?|secs?)/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const unit = m[2].toLowerCase();
+  if (unit.startsWith("hour")) return n * 3600_000;
+  if (unit.startsWith("min")) return n * 60_000;
+  return n * 1000;
 }
 
 /** 获取或初始化某模型的限速状态。 */
 function getRateLimitState(model: string): RateLimitState {
   let st = rateLimitMap.get(model);
   if (!st) {
-    st = { windowStart: 0, count: 0, breakerUntil: 0 };
+    st = {
+      windowStart: 0, count: 0, breakerUntil: 0,
+      quota: RATE_LIMIT_MAX_CALLS, consecutiveOk: 0,
+    };
     rateLimitMap.set(model, st);
   }
   return st;
@@ -1239,6 +1295,18 @@ function checkRateLimit(model: string): { allowed: boolean; retryAfterSec: numbe
   if (!RATE_LIMIT_ENABLED) return { allowed: true, retryAfterSec: 0 };
 
   const now = Date.now();
+
+  // 0. 账号级冷却: 多个模型同时额度枯竭时, 不再让请求逐个模型去试探。
+  //    半开: 冷却期内每隔 ACCOUNT_PROBE_INTERVAL_MS 放行一个探测请求, 成功即解除冷却,
+  //    这样上游提前恢复时能及时发现, 而不是干等到名义到期。
+  if (accountCooldownUntil > now) {
+    if (now < accountProbeAt) {
+      return { allowed: false, retryAfterSec: Math.ceil((accountCooldownUntil - now) / 1000) };
+    }
+    accountProbeAt = now + ACCOUNT_PROBE_INTERVAL_MS;
+    console.log(`🔍 [限速] 账号冷却中, 放行一个半开探测请求 (${model})`);
+  }
+
   const st = getRateLimitState(model);
 
   // 1. 熔断检查: 熔断中且未到期 -> 拒绝
@@ -1254,7 +1322,7 @@ function checkRateLimit(model: string): { allowed: boolean; retryAfterSec: numbe
   }
 
   // 3. 配额检查: 达到上限 -> 拒绝, 建议等窗口剩余时间
-  if (st.count >= RATE_LIMIT_MAX_CALLS) {
+  if (st.count >= st.quota) {
     const windowRemain = RATE_LIMIT_WINDOW_MS - (now - st.windowStart);
     const retryAfterSec = Math.max(1, Math.ceil(windowRemain / 1000));
     return { allowed: false, retryAfterSec };
@@ -1274,15 +1342,38 @@ function acquireRateLimitSlot(model: string): void {
   st.count += 1;
 }
 
-/** 调用上游成功: 熔断状态复位 (成功后解除任何历史熔断)。 */
+/**
+ * 调用上游成功: 熔断复位, 并按 AIMD 加性放宽配额。
+ * 上游持续健康时逐步提高每窗口配额, 避免固定保守值闲置上游额度。
+ */
 function recordUpstreamSuccess(model: string): void {
   const st = getRateLimitState(model);
   st.breakerUntil = 0;
+  quotaHitAt.delete(model);
+  // 任何一次成功都证明账号仍可用 —— 半开探测成功即解除账号级冷却
+  if (accountCooldownUntil > 0) {
+    accountCooldownUntil = 0;
+    accountProbeAt = 0;
+    quotaHitAt.clear();
+    console.log("✅ [限速] 上游调用成功, 解除账号级冷却");
+  }
+  st.consecutiveOk += 1;
+  if (st.consecutiveOk >= RATE_LIMIT_QUOTA_STEP_AFTER && st.quota < RATE_LIMIT_QUOTA_MAX) {
+    st.quota = Math.min(st.quota + 1, RATE_LIMIT_QUOTA_MAX);
+    st.consecutiveOk = 0;
+  }
+}
+
+/** AIMD 乘性收紧: 撞到额度/并发类错误时配额减半, 快速避让。 */
+function shrinkQuota(model: string): void {
+  const st = getRateLimitState(model);
+  st.quota = Math.max(RATE_LIMIT_QUOTA_MIN, Math.floor(st.quota / 2));
+  st.consecutiveOk = 0;
 }
 
 /**
  * 调用上游失败: 触发熔断。opus 模型熔断 1 小时, 其他 1 分钟。
- * 熔断期内 checkRateLimit 会拒绝该模型的所有调用。
+ * 仅作为解析不出上游建议时长时的兜底。
  */
 function recordUpstreamFailure(model: string): void {
   const st = getRateLimitState(model);
@@ -1292,17 +1383,52 @@ function recordUpstreamFailure(model: string): void {
 }
 
 /**
- * 按 Sider SSE 业务错误码回写限速状态。
- * 只有 1135 代表额度真正耗尽；1101 是瞬时并发，603 是载荷过大，都不应触发长熔断。
+ * 记录一次 1135, 并判断是否已是【账号级】额度枯竭。
+ * 单模型 1135 只锁该模型 (实测 opus 锁死时其他模型仍可用); 但短时间内多个不同模型
+ * 都 1135, 说明是账号额度池枯竭 —— 此时让请求继续逐个模型试探纯属浪费。
  */
-function noteUpstreamOutcome(model: string, code: number): void {
+function noteQuotaHit(model: string, cooldownMs: number): void {
+  const now = Date.now();
+  quotaHitAt.set(model, now);
+  // 清理窗口外的旧记录
+  for (const [m, t] of quotaHitAt) {
+    if (now - t > ACCOUNT_QUOTA_WINDOW_MS) quotaHitAt.delete(m);
+  }
+  if (quotaHitAt.size >= ACCOUNT_QUOTA_MODELS_THRESHOLD) {
+    // 用本次告知的时长覆盖 (最新的上游反馈最准确), 而不是取历史最大值 ——
+    // 取最大值会让一次长冷却把后续更乐观的信息压住, 又回到"惩罚过度"。
+    accountCooldownUntil = now + cooldownMs;
+    accountProbeAt = now + Math.min(ACCOUNT_PROBE_INTERVAL_MS, cooldownMs);
+    console.warn(
+      `🚫 [限速] ${ACCOUNT_QUOTA_WINDOW_MS / 1000}s 内 ${quotaHitAt.size} 个模型额度耗尽, ` +
+      `判定账号级枯竭, 全局冷却至 ${new Date(accountCooldownUntil).toISOString()}`
+    );
+  }
+}
+
+/**
+ * 按 Sider SSE 业务错误码回写限速状态。
+ * 1135 = 额度耗尽 (优先按上游告知的时间熔断)；1101 = 瞬时并发；603 = 载荷过大 (不惩罚)。
+ */
+function noteUpstreamOutcome(model: string, code: number, msg?: string): void {
   const st = getRateLimitState(model);
   switch (code) {
-    case 1135:
-      recordUpstreamFailure(model);
+    case 1135: {
+      const parsed = parseUpstreamRetryMs(msg);
+      const cooldownMs = parsed ?? (isOpusModel(model) ? RATE_LIMIT_BREAKER_OPUS_MS : RATE_LIMIT_BREAKER_MS);
+      st.breakerUntil = Date.now() + cooldownMs;
+      shrinkQuota(model);
+      console.warn(
+        `⛔ [限速] ${model} 上游额度耗尽(1135), 熔断 ${Math.round(cooldownMs / 1000)} 秒` +
+        (parsed !== null ? " (按上游告知)" : " (上游未告知时长, 用兜底值)")
+      );
+      noteQuotaHit(model, cooldownMs);
       break;
+    }
     case 1101:
-      st.count = Math.min(st.count + 2, RATE_LIMIT_MAX_CALLS);
+      // 瞬时并发: 不熔断, 但收紧配额并占用额外窗口计数
+      st.count = Math.min(st.count + 2, st.quota);
+      shrinkQuota(model);
       break;
     case 707:
       st.breakerUntil = Date.now() + 5 * 60_000;
@@ -1314,16 +1440,15 @@ function noteUpstreamOutcome(model: string, code: number): void {
 }
 
 /** 限速拒绝的标准化响应 (OpenAI 兼容 rate_limit_error, 带 Retry-After)。 */
-function rateLimitedResponse(model: string, retryAfterSec: number): Response {
+function rateLimitedResponse(model: string, retryAfterSec: number, reason?: string): Response {
   const retryAfter = Math.max(1, retryAfterSec);
-  // 熔断时长文案按模型类型判定 (opus 1 小时/其他 1 分钟), 不依赖剩余秒数,
-  // 避免剩余时间略低于整时长时文案误判。
-  const breakerLabel = isOpusModel(model) ? "1 小时" : "1 分钟";
+  const st = rateLimitMap.get(model);
+  const quota = st?.quota ?? RATE_LIMIT_MAX_CALLS;
+  const detail = reason ??
+    `限速策略: 每 ${RATE_LIMIT_WINDOW_MS / 1000} 秒最多 ${quota} 次调用。`;
   return new Response(JSON.stringify({
     error: {
-      message: `模型 ${model} 的调用过于频繁, 请 ${retryAfter} 秒后重试。` +
-        `限速策略: 每 ${RATE_LIMIT_WINDOW_MS / 1000} 秒最多 ${RATE_LIMIT_MAX_CALLS} 次调用; ` +
-        `失败后熔断 ${breakerLabel}。`,
+      message: `模型 ${model} 的调用过于频繁, 请 ${retryAfter} 秒后重试。${detail}`,
       type: "rate_limit_error",
       code: "model_rate_limited",
       model,
@@ -1340,12 +1465,105 @@ function rateLimitedResponse(model: string, retryAfterSec: number): Response {
   });
 }
 
+// ==================== 上游并发闸门 ====================
+// 上游账号实测为单并发 ("Your account has an active request - only one request at a time"),
+// 并发请求注定只能成功一个。与其让其余请求失败, 不如排队 —— 它们通常只要等几秒。
+// 注意: 进程内队列不跨 Deno Deploy 实例 (与 rateLimitMap 同样的局限)。低流量个人网关
+// 场景通常只有一个活跃实例, 够用; 跨实例协调需 KV, 但 KV 延迟不适合做并发锁。
+
+class UpstreamQueueFullError extends Error {}
+class UpstreamQueueTimeoutError extends Error {}
+
+let upstreamActive = 0;
+interface QueueWaiter {
+  wake: () => void;
+  fail: (e: Error) => void;
+  timer: number;
+}
+const upstreamQueue: QueueWaiter[] = [];
+
+/** 造一个幂等的 release: 释放槽位并唤醒队首。 */
+function makeSlotRelease(): () => void {
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    upstreamActive -= 1;
+    const next = upstreamQueue.shift();
+    if (next) {
+      clearTimeout(next.timer);
+      upstreamActive += 1;
+      next.wake();
+    }
+  };
+}
+
+/** 取上游并发槽位; 满则排队。队列满或等待超时会抛出对应错误。 */
+function acquireUpstreamSlot(): Promise<() => void> {
+  if (!RATE_LIMIT_ENABLED || UPSTREAM_MAX_CONCURRENCY <= 0) {
+    return Promise.resolve(() => {});
+  }
+  if (upstreamActive < UPSTREAM_MAX_CONCURRENCY) {
+    upstreamActive += 1;
+    return Promise.resolve(makeSlotRelease());
+  }
+  if (upstreamQueue.length >= UPSTREAM_QUEUE_MAX) {
+    return Promise.reject(new UpstreamQueueFullError());
+  }
+  return new Promise<() => void>((resolve, reject) => {
+    const waiter: QueueWaiter = {
+      wake: () => resolve(makeSlotRelease()),
+      fail: reject,
+      timer: setTimeout(() => {
+        const i = upstreamQueue.indexOf(waiter);
+        if (i >= 0) upstreamQueue.splice(i, 1);
+        reject(new UpstreamQueueTimeoutError());
+      }, UPSTREAM_QUEUE_WAIT_MS),
+    };
+    upstreamQueue.push(waiter);
+  });
+}
+
+/**
+ * 包装响应体, 在流读完 / 被取消 / 出错时才释放并发槽位。
+ * 上游的单并发约束覆盖【整个请求周期】(含流式传输), 所以不能在响应头到达时就释放,
+ * 否则流还在传输, 下一个请求就已经发出去, 照样撞上游并发限制。
+ */
+function releaseSlotOnStreamEnd(
+  body: ReadableStream<Uint8Array>,
+  release: () => void,
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          release();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (err) {
+        release();
+        controller.error(err);
+      }
+    },
+    cancel(reason) {
+      release();
+      return reader.cancel(reason);
+    },
+  });
+}
+
 /**
  * 带限速门控的上游请求封装。所有 sider 上游 fetch 统一走这里:
- *   1) checkRateLimit: 熔断/超限 -> 直接返回 429 (不触达上游);
- *   2) acquireRateLimitSlot: 通过则占用 1 次配额;
- *   3) fetch 上游; 成功 -> recordUpstreamSuccess (复位熔断);
- *      401/403 才熔断。普通 5xx/网络异常不熔断，避免把一次抖动放大为长时间不可用。
+ *   1) checkRateLimit: 账号冷却/熔断/超配额 -> 直接返回 429 (不触达上游);
+ *   2) acquireUpstreamSlot: 上游单并发, 满则排队 (队列满/等待超时才 429);
+ *   3) acquireRateLimitSlot: 占用 1 次窗口配额;
+ *   4) fetch 上游; 成功 -> recordUpstreamSuccess (复位熔断 + 加性放宽配额);
+ *      401/403 才熔断。普通 5xx/网络异常不熔断，避免把一次抖动放大为长时间不可用;
+ *   5) 槽位在响应流结束/取消时释放, 另有最长持有时间兜底防止悬挂。
  *
  * 注意: 限速按【上游实际模型】统计 (siderModel, 即 MODEL_MAPPING 映射后的值),
  *       这样 gpt-4.1 与 claude-opus-4.8 等不同模型各自独立计数。
@@ -1355,16 +1573,35 @@ async function fetchSiderRateLimited(
   url: string,
   init: RequestInit,
 ): Promise<Response> {
-  // 1. 限速检查 (熔断 + 滑动窗口)
+  // 1. 限速检查 (账号冷却 + 熔断 + 滑动窗口)
   const { allowed, retryAfterSec } = checkRateLimit(model);
   if (!allowed) {
     return rateLimitedResponse(model, retryAfterSec);
   }
 
-  // 2. 占用配额
+  // 2. 并发闸门: 上游单并发, 排队等待而非直接失败
+  let release: () => void;
+  try {
+    release = await acquireUpstreamSlot();
+  } catch (err) {
+    const waitSec = Math.ceil(UPSTREAM_QUEUE_WAIT_MS / 1000);
+    const reason = err instanceof UpstreamQueueFullError
+      ? `上游为单并发, 排队已满 (${UPSTREAM_QUEUE_MAX} 个等待中)。`
+      : `上游为单并发, 排队等待超过 ${waitSec} 秒。`;
+    return rateLimitedResponse(model, Math.max(1, Math.ceil(waitSec / 2)), reason);
+  }
+
+  // 3. 占用窗口配额
   acquireRateLimitSlot(model);
 
-  // 3. 调用上游, 按结果记录成功/失败
+  // 槽位释放: 幂等 + 最长持有兜底 (防止流悬挂导致槽位永不释放)
+  const holdTimer = setTimeout(release, UPSTREAM_SLOT_MAX_HOLD_MS);
+  const finalRelease = () => {
+    clearTimeout(holdTimer);
+    release();
+  };
+
+  // 4. 调用上游, 按结果记录成功/失败
   try {
     const res = await fetch(url, init);
     if (res.ok) {
@@ -1372,8 +1609,19 @@ async function fetchSiderRateLimited(
     } else if (res.status === 401 || res.status === 403) {
       recordUpstreamFailure(model);
     }
-    return res;
+
+    // 5. 无响应体则立即释放; 有体则等流结束再释放
+    if (!res.body) {
+      finalRelease();
+      return res;
+    }
+    return new Response(releaseSlotOnStreamEnd(res.body, finalRelease), {
+      status: res.status,
+      statusText: res.statusText,
+      headers: res.headers,
+    });
   } catch (err) {
+    finalRelease();
     throw err; // 交给调用方 catch 处理 (已有统一错误翻译)
   }
 }
@@ -1454,22 +1702,33 @@ class SSELineReader {
   private decoder = new TextDecoder();
 
   async *readLines(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<string, void, unknown> {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    // 用 try/finally 兜住所有退出路径: 调用方在 for await 里 break / return / throw 时,
+    // JS 会调用本 generator 的 .return(), finally 必定执行 —— 从而保证上游流一定被 cancel。
+    //
+    // 这很重要: 各流式路径普遍存在"提前 return 但不 cancel"(实测四个流式 start() 每个都是
+    // 1 处 cancel 对 5~6 处 return), 图像生成的成功路径也是收够图就 break。不 cancel 会让
+    // 上游连接一直挂着, 上游很可能仍把该请求算作"进行中" —— 对单并发的 sider 账号尤其不利。
+    // 在 generator 这一处收口, 比在每个调用点补 cancel 更不容易遗漏。
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      this.buffer += this.decoder.decode(value, { stream: true });
+        this.buffer += this.decoder.decode(value, { stream: true });
 
-      const lines = this.buffer.split('\n');
-      this.buffer = lines.pop() || '';
+        const lines = this.buffer.split('\n');
+        this.buffer = lines.pop() || '';
 
-      for (const line of lines) {
-        yield line;
+        for (const line of lines) {
+          yield line;
+        }
       }
-    }
 
-    if (this.buffer) {
-      yield this.buffer;
+      if (this.buffer) {
+        yield this.buffer;
+      }
+    } finally {
+      try { await reader.cancel(); } catch { /* 流已读完/已取消时忽略 */ }
     }
   }
 }
@@ -1917,7 +2176,7 @@ async function handleNonStreamingResponse(
   // 构建 OpenAI 格式响应
   if (upstreamErrCode !== 0 && !fullText && !imageUrl) {
     recordFailure(modelName);
-    noteUpstreamOutcome(MODEL_MAPPING[modelName] || "sider", upstreamErrCode);
+    noteUpstreamOutcome(MODEL_MAPPING[modelName] || "sider", upstreamErrCode, upstreamErrMsg);
     return openAIErrorResponse(upstreamErrCode, upstreamErrMsg);
   }
 
@@ -2192,7 +2451,7 @@ function handleStreamingResponse(
               const errMsg = siderData.msg || "";
               console.error(`❌ 上游流内错误: code=${errCode} msg=${errMsg}`);
               if (streamOutputChars === 0 && imageUrls.length === 0) {
-                noteUpstreamOutcome(MODEL_MAPPING[modelName] || "sider", errCode);
+                noteUpstreamOutcome(MODEL_MAPPING[modelName] || "sider", errCode, errMsg);
                 const detail = upstreamErrorDetails(errCode, errMsg);
                 const errChunk = {
                   id: `chatcmpl-${Date.now()}`,
@@ -2581,7 +2840,7 @@ async function handleImageGeneration(req: Request): Promise<Response> {
           if (siderData.code && siderData.code !== 0) {
             const errCode = Number(siderData.code);
             const detail = upstreamErrorDetails(errCode, siderData.msg || "");
-            noteUpstreamOutcome(siderRequest.model, errCode);
+            noteUpstreamOutcome(siderRequest.model, errCode, siderData.msg || "");
             recordFailure(siderRequest.model);
             console.error(`❌ Sider API 错误 [行${lineCount}]:`, {
               code: errCode,
@@ -2932,7 +3191,7 @@ async function handleGeminiGenerate(
       }
       if (upstreamErrCode !== 0 && !fullText) {
         recordFailure(geminiModel);
-        noteUpstreamOutcome(siderModel, upstreamErrCode);
+        noteUpstreamOutcome(siderModel, upstreamErrCode, upstreamErrMsg);
         return openAIErrorResponse(upstreamErrCode, upstreamErrMsg);
       }
       if (!fullText) {
@@ -3026,7 +3285,7 @@ async function handleGeminiGenerate(
                 const errCode = Number(sd.code);
                 const detail = upstreamErrorDetails(errCode, sd.msg || "");
                 if (gOutputChars === 0) {
-                  noteUpstreamOutcome(siderModel, errCode);
+                  noteUpstreamOutcome(siderModel, errCode, sd.msg || "");
                   controller.enqueue(encoder.encode(`data: ${JSON.stringify({
                     error: { code: errCode, message: detail.message, type: detail.type }
                   })}\n\n`));
@@ -3288,7 +3547,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
       }
       if (upstreamErrCode !== 0 && !fullText) {
         recordFailure(anthroModel);
-        noteUpstreamOutcome(siderModel, upstreamErrCode);
+        noteUpstreamOutcome(siderModel, upstreamErrCode, upstreamErrMsg);
         const detail = upstreamErrorDetails(upstreamErrCode, upstreamErrMsg);
         return new Response(JSON.stringify({
           type: "error",
@@ -3438,7 +3697,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
                 const errCode = Number(sd.code);
                 const detail = upstreamErrorDetails(errCode, sd.msg || "");
                 if (outputTextAcc.length === 0) {
-                  noteUpstreamOutcome(siderModel, errCode);
+                  noteUpstreamOutcome(siderModel, errCode, sd.msg || "");
                   closeBlock();
                   sendEvent("error", {
                     type: "error",
@@ -3714,7 +3973,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
       }
       if (upstreamErrCode !== 0 && !fullText) {
         recordFailure(modelName);
-        noteUpstreamOutcome(siderModel, upstreamErrCode);
+        noteUpstreamOutcome(siderModel, upstreamErrCode, upstreamErrMsg);
         return openAIErrorResponse(upstreamErrCode, upstreamErrMsg);
       }
       if (!fullText) {
@@ -3830,7 +4089,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
                 const errCode = Number(sd.code);
                 const detail = upstreamErrorDetails(errCode, sd.msg || "");
                 if (outputTextAcc.length === 0) {
-                  noteUpstreamOutcome(siderModel, errCode);
+                  noteUpstreamOutcome(siderModel, errCode, sd.msg || "");
                   sendEvent("error", {
                     type: "error",
                     error: { type: detail.type, message: detail.message, upstream_code: errCode },
