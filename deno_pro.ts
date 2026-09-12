@@ -106,7 +106,9 @@ const MODEL_MAPPING: Record<string, string> = {
   "gpt-5.6-terra": "gpt-5.6-terra",
   "gpt-5.6-terra-think": "gpt-5.6-terra-think",
   "gpt-5.6-luna": "gpt-5.6-luna",
-  "gpt-5.6-luna-think": "gpt-5.6-luna-think", 
+  "gpt-5.6-luna-think": "gpt-5.6-luna-think",
+  "gpt-6-astra": "gpt-6-astra",
+  "gpt-6-astra-think": "gpt-6-astra-think", 
   
   // Claude 系列
   "claude-opus-4.5": "claude-opus-4.5",
@@ -117,8 +119,8 @@ const MODEL_MAPPING: Record<string, string> = {
   "claude-opus-4.8-think": "claude-opus-4.8-think", 
   "claude-opus-5": "claude-opus-5",
   "claude-opus-5-think": "claude-opus-5-think",
-  "claude-fable-5": "claude-fable-5",  
-  "claude-fable-5-think": "claude-fable-5-think", 
+  "claude-fable-5.1": "claude-fable-5.1",  
+  "claude-fable-5.1-think": "claude-fable-5.1-think", 
   "claude-4.5-sonnet": "claude-4.5-sonnet",
   "claude-4.5-sonnet-think": "claude-4.5-sonnet-think",
   "claude-sonnet-4.6": "claude-sonnet-4.6",
@@ -139,10 +141,11 @@ const MODEL_MAPPING: Record<string, string> = {
   "gemini-3.5-flash-think": "gemini-3.5-flash-think",
   "gemini-3.6-flash": "gemini-3.6-flash",
   "gemini-3.6-flash-think": "gemini-3.6-flash-think",
-  "gemini-3.7-flash": "gemini-3.7-flash",
-  "gemini-3.7-flash-think": "gemini-3.7-flash-think",
+  "gemini-3.8-flash": "gemini-3.8-flash",
+  "gemini-3.8-flash-think": "gemini-3.8-flash-think",
   
   // DeepSeek 系列
+  "deepseek-flash": "deepseek-flash",
   "deepseek-v4-flash": "deepseek-v4-flash",
   "deepseek-v4-flash-think": "deepseek-v4-flash-think",
   "deepseek-v4-pro": "deepseek-v4-pro",
