@@ -60,3 +60,9 @@
 - Python 一律用 anaconda3 管理的 `python310` 虚拟环境运行（`conda activate python310` 后用 `python`）。
 - **推送主分支/远端必须经用户明确同意**（推送即上线生产）。
 - Windows 注意：跑 python 测试设 `PYTHONIOENCODING=utf-8`；`requirements*.txt` 注释保持 ASCII（pip 用 GBK 解码会报错）；联网用 `requests`（verify=True 正常），anaconda 自带 `urllib` 因 certifi 过期会证书校验失败。
+
+## 七、项目记忆
+
+执行经验及已完成任务记录见 [docs/项目记忆.md](docs/项目记忆.md)。
+
+- **2026-10-07：JSON/类 JSON 模型信息 → Excel → 上游核实 → 更新 MODEL_MAPPING**：记录用户提供模型信息、按完整提示词用代码生成 `sider_models_no_icon.xlsx` 的前置流程，以及名称提取、串行限速（至少 11 秒间隔、每分钟最多 6 次）、上游响应与模型回显判定、失败分类、映射取舍及零上游成本回归。135 项核实，105 项通过；映射从 62 项更新为 105 项，新增 51 项、移除 8 项。完整结果见 [模型可用性核实报告](docs/模型可用性核实报告_20261007.md)。
