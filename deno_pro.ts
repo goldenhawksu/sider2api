@@ -90,12 +90,6 @@ const DEFAULT_REQUEST_TEMPLATE = {
 // 模型映射配置(扩展版 - 包含更多模型)
 const MODEL_MAPPING: Record<string, string> = {
   // GPT 系列
-  "gpt-4.1": "gpt-4.1",
-  "gpt-5": "gpt-5",
-  "gpt-5-think": "gpt-5-think",
-  "gpt-5-mini": "gpt-5-mini",
-  "gpt-5.1": "gpt-5.1",
-  "gpt-5.1-think": "gpt-5.1-think",
   "gpt-5.4-mini": "gpt-5.4-mini",
   "gpt-5.4-think": "gpt-5.4-think",
   "gpt-5.5": "gpt-5.5",
@@ -112,18 +106,6 @@ const MODEL_MAPPING: Record<string, string> = {
   "gpt-4.1-mini": "gpt-4.1-mini",
   "gpt-6-luna": "gpt-6-luna",
   "gpt-6.1-sol": "gpt-6.1-sol",
-  "gpt-5.2": "gpt-5.2",
-  "gpt-5.2-think": "gpt-5.2-think",
-  "o4-mini": "o4-mini",
-  "o3": "o3",
-  "o1": "o1",
-  "o3-mini": "o3-mini",
-  "gpt-4o": "gpt-4o",
-  "gpt-4o-mini": "gpt-4o-mini",
-  "gpt-4.5": "gpt-4.5",
-  "o1-mini": "o1-mini",
-  "gpt-3.5": "gpt-3.5",
-  "gpt-4": "gpt-4",
 
   // Claude 系列
   "claude-opus-4.8": "claude-opus-4.8",
