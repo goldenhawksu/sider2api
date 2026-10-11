@@ -164,13 +164,20 @@ def test_gemini_multiturn(client):
 
 # ==================== 边界 ====================
 
-def test_gemini_unknown_route(client):
-    """不存在的 Gemini 路由应返回 404。"""
+@pytest.mark.smoke
+def test_gemini_unknown_model_rejected(client):
+    """未知模型名的 Gemini 路由返回 404 model_not_found (入站拒绝, 零额度)。
+
+    旧行为是静默回退到 sider 智能路由返回 200 —— 一次模型名笔误会变成一次真实额度消耗,
+    且调用方以为自己用的是另一个模型。P2 起文本四端点统一拒绝未知模型。
+    """
     r = client.session.post(
         client._url("/v1beta/models/no-such-model-xyz:generateContent"),
         headers=client._headers(),
         json={"contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
         timeout=client._timeout(),
     )
-    # 应回退到 sider 智能路由, 返回 200
-    assert r.status_code == 200, r.text[:300]
+    assert r.status_code == 404, r.text[:300]
+    err = r.json()["error"]
+    assert err["status"] == "NOT_FOUND", err
+    assert err["details"][0]["reason"] == "model_not_found", err

@@ -118,6 +118,16 @@ def main():
         for k in total:
             total[k] += counts[k]
 
+        # 失败批次必须留下证据: 重跑一次要再花真实额度, 且上游状态未必可复现。
+        # 这里把 pytest 的失败行原样打出来 (capture_output 会把它们吞掉)。
+        if counts["failed"] or rc not in (0, 1):
+            print("       ---- 失败详情 ----")
+            for line in out.splitlines():
+                if any(t in line for t in ("FAILED", "ERROR", "assert", "AssertionError",
+                                           "Error:", "Traceback", "E   ")):
+                    print("       " + line[:220])
+            print("       --------------------")
+
         hit_quota = bool(QUOTA_EXHAUSTED.search(out))
         quota_streak = quota_streak + 1 if hit_quota else 0
         if hit_quota:
