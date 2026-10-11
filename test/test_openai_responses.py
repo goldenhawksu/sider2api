@@ -149,7 +149,10 @@ def test_responses_think_model(client, live_models):
 # ==================== 流式 ====================
 
 def test_responses_stream(client):
-    """Responses API 流式: SSE 事件序列应含 output_text.delta。"""
+    """Responses API 流式: 官方【类型化语义事件】序列, 以 response.completed 收尾。
+
+    官方契约未定义 [DONE] 终止符, 因此这里断言事件序列本身而不是终止符。
+    """
     body = {
         "model": RESPONSES_MODEL,
         "input": "从1数到5,用逗号分隔。",
@@ -165,34 +168,41 @@ def test_responses_stream(client):
     assert r.status_code == 200, r.text[:300]
     r.encoding = "utf-8"
 
-    event_types = set()
+    event_types = []
     text_pieces = []
+    saw_done = False
     for raw in r.iter_lines(decode_unicode=True):
         if not raw:
             continue
         line = raw.strip()
         if line.startswith("event:"):
-            event_types.add(line[len("event:"):].strip())
-        elif line.startswith("data:"):
+            continue
+        if line.startswith("data:"):
             payload = line[len("data:"):].strip()
             if payload == "[DONE]":
-                break
+                saw_done = True
+                continue
             try:
                 obj = json.loads(payload)
             except json.JSONDecodeError:
                 continue
             t = obj.get("type", "")
             if t:
-                event_types.add(t)
+                event_types.append(t)
             if t == "response.output_text.delta":
+                assert obj.get("item_id"), f"delta 缺少 item_id: {obj}"
+                assert obj.get("output_index") == 0, f"delta 缺少 output_index: {obj}"
+                assert obj.get("content_index") == 0, f"delta 缺少 content_index: {obj}"
                 if obj.get("delta"):
                     text_pieces.append(obj["delta"])
 
     content = "".join(text_pieces)
     assert content, "流式累计内容为空"
     assert "5" in content or "五" in content, f"未数到5: {content[:200]!r}"
-    assert ("response.created" in event_types) or ("response.output_text.delta" in event_types), \
-        f"缺少核心事件: {sorted(event_types)}"
+    assert not saw_done, "Responses 流不应出现 [DONE]"
+    assert event_types and event_types[-1] == "response.completed", \
+        f"流未以 response.completed 收尾: {event_types[-5:]}"
+    assert "response.created" in event_types, f"缺少 response.created: {event_types[:5]}"
 
 
 # ==================== 边界 ====================

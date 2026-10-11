@@ -25,7 +25,7 @@ pytestmark = [pytest.mark.cost, pytest.mark.rate_limit]
 
 # 各用例独立模型 (不在主套件 REPRESENTATIVE_MODELS 中, 避免干扰)
 CONTEXT_MODEL = "gpt-5.6-terra"   # 603 不熔断
-OPUS_CONTEXT_MODEL = "claude-opus-4.6"   # opus 的 603 也不熔断 (取额度较宽松的 opus 变体)
+OPUS_CONTEXT_MODEL = "claude-opus-4.8"   # opus 的 603 也不熔断 (取额度较宽松的 opus 变体)
 
 # 触发上游 code:603 的超长 prompt (~48000 字符, 超 8810~22000 阈值)
 _LONG_PROMPT = "请逐字复述。" + ("测试数据" * 12000)

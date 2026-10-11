@@ -25,7 +25,7 @@ except Exception:  # noqa: BLE001
     pass
 
 MODELS = [
-    ("OpenAI",    "gpt-5.4"),
+    ("OpenAI",    "gpt-5.6-sol"),
     ("Google",    "gemini-3.5-flash"),
     ("Anthropic", "claude-sonnet-4.6"),
     ("DeepSeek",  "deepseek-v4-pro"),

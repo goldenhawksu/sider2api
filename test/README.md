@@ -2,8 +2,8 @@
 
 针对 `deno_pro.ts` 部署实例的 pytest 回归测试框架。覆盖当前已实现能力:
 OpenAI Chat / Anthropic Messages / Gemini generateContent / OpenAI Responses /
-多轮会话 / think 模式 / 图像生成 / Function Calling 降级 / Vision 门控 /
-错误处理 / 性能度量。
+多轮会话 / think 模式 / 图像生成 / 门控与租约生命周期 / Function Calling 拒绝 /
+Vision 门控 / 错误处理 / 官方 SDK 契约 / 性能度量。
 
 ## 安装
 
@@ -52,13 +52,26 @@ BASE_URL=http://localhost:8000 pytest                    # 进程环境变量覆
 |---|---|---|
 | `test_meta.py` | `smoke` | 主页 / 模型清单契约 / CORS / 404 |
 | `test_chat.py` | `chat` | 非流式 6 模型 / 流式 / system 消息 / content 数组 |
-| `test_errors.py` | — | 缺参 400 / 鉴权 401 / 未知模型回退 / 并发 429 |
+| `test_errors.py` | `smoke`/`cost` | 缺参 400 / 鉴权 401 / 未知模型 404 / 并发 429 |
 | `test_multiturn.py` | `multiturn` | X-Session-ID 多轮记忆 |
 | `test_think.py` | `think` | -think 后缀推理 (非流式+流式) |
 | `test_image.py` | `image` | 图像生成端点 + 对话触发图像 |
 | `test_anthropic_format.py` | `anthropic` | Anthropic Messages API (7 条) |
 | `test_gemini_format.py` | `gemini` | Gemini generateContent (6 条) |
 | `test_openai_responses.py` | `openai` | OpenAI Responses API (7 条) |
-| `test_tools.py` | `tools` | Function Calling 降级 + tool_choice=none |
+| `test_tools.py` | `tools` | 自定义 tools → not_supported (4 端点) + tool_choice=none 放行 |
 | `test_vision.py` | `vision` | Vision 输入 → not_supported (4 端点) |
 | `test_performance.py` | `perf` | 非流式延迟 + 流式 TTFT/吞吐 |
+| `test_deno_pro_mock_regression.py` | `smoke` | **mock 上游驱动的门控/协议契约回归** (零额度): 三段超时、排队后二次准入、半开探测、成功判定、四协议错误出口矩阵、Context 预算、会话复用、官方 SDK 契约 (openai / anthropic / google-genai) |
+| `test_stream_contract.py` | `stream` | 流式事件契约 (Anthropic content-block 状态机) |
+| `test_rate_limit.py` | `cost`/`rate_limit` | 熔断语义 (603 不熔断) |
+| `test_stats.py` | `smoke`/`chat` | `/stats` 页面与 `/stats.json` 契约 |
+| `test_sdk_auth.py` | `smoke`/`cost` | 三家官方 SDK 的鉴权头兼容 |
+
+> **mock 回归是改动门控/协议时的第一道闸门**: 它自带 mock 上游与独立 deno 实例,
+> 不触达 sider.ai、零额度, 且能精确断言"排队是否复检""超时后槽位是否释放"这类
+> 真实上游无法稳定复现的行为。改 `deno_pro.ts` 的门控、超时或协议事件后请先跑它:
+
+```bash
+python -m pytest test/test_deno_pro_mock_regression.py -q
+```

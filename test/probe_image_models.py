@@ -37,8 +37,8 @@ ENDPOINT_PROMPT = "a cute orange cat sitting on a wooden table"
 
 # 默认代表模型子集 (覆盖各大模型家族; 含 -think 观察 think 模式对出图的影响)
 DEFAULT_MODELS = [
-    "gpt-4.1",
-    "gpt-5",
+    "gpt-4.1-mini",
+    "gpt-5.6-sol",
     "gpt-5.5",
     "gpt-5.5-think",
     "claude-opus-4.8",

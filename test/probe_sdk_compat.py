@@ -36,13 +36,13 @@ def openai_suite():
 
     def chat():
         r = cli.chat.completions.create(
-            model="gpt-4.1", messages=[{"role": "user", "content": "只回答: OK"}], max_tokens=20)
+            model="gpt-5.5", messages=[{"role": "user", "content": "只回答: OK"}], max_tokens=20)
         c = r.choices[0]
         return f"finish={c.finish_reason} text={c.message.content!r} usage={bool(r.usage)}"
 
     def chat_stream():
         s = cli.chat.completions.create(
-            model="gpt-4.1", messages=[{"role": "user", "content": "数到三"}], stream=True)
+            model="gpt-5.5", messages=[{"role": "user", "content": "数到三"}], stream=True)
         n, txt = 0, ""
         for ck in s:
             n += 1
@@ -51,7 +51,7 @@ def openai_suite():
         return f"{n} chunks, {len(txt)} chars"
 
     def responses():
-        r = cli.responses.create(model="gpt-4.1", input="只回答: OK")
+        r = cli.responses.create(model="gpt-5.5", input="只回答: OK")
         return f"status={r.status} output_text={r.output_text!r}"
 
     check("openai.models.list", models)
@@ -66,7 +66,7 @@ def anthropic_suite(inject_auth=False):
     # inject_auth: 手动补 Authorization 头, 用于区分"鉴权门不认 x-api-key"与"协议本身有问题"
     extra = {"Authorization": f"Bearer {TOKEN}"} if inject_auth else None
     cli = anthropic.Anthropic(base_url=BASE, api_key=TOKEN, default_headers=extra)
-    MODEL = "claude-opus-4.5"
+    MODEL = "claude-opus-4.8"
     tag = " [注入Authorization]" if inject_auth else ""
 
     def messages():
@@ -103,7 +103,7 @@ def genai_suite(inject_auth=False):
     cli = genai.Client(api_key=TOKEN,
                        http_options=types.HttpOptions(base_url=BASE, api_version="v1beta",
                                                       headers=extra))
-    MODEL = "gemini-2.5-flash"
+    MODEL = "gemini-3.0-flash"
     tag = " [注入Authorization]" if inject_auth else ""
 
     def generate():

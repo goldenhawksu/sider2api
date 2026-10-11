@@ -14,7 +14,7 @@ import requests
 
 import config
 
-BODY = {"model": "gpt-4.1", "messages": [{"role": "user", "content": "只回答: OK"}]}
+BODY = {"model": "gpt-5.5", "messages": [{"role": "user", "content": "只回答: OK"}]}
 
 # (用例名, 构造带 token 的 headers/params) — 覆盖三家官方 SDK 的鉴权约定
 AUTH_STYLES = [
@@ -68,7 +68,7 @@ def test_cors_preflight_allows_sdk_headers(client):
 @pytest.mark.cost
 @pytest.mark.parametrize(
     "name,build,model",
-    [("anthropic_x_api_key", AUTH_STYLES[1][1], "gemini-2.5-flash"),
+    [("anthropic_x_api_key", AUTH_STYLES[1][1], "gemini-3.0-flash"),
      ("gemini_x_goog_api_key", AUTH_STYLES[2][1], "deepseek-v4-flash"),
      ("gemini_query_key", AUTH_STYLES[3][1], "qwen3.8-max")],
     ids=["anthropic_x_api_key", "gemini_x_goog_api_key", "gemini_query_key"],

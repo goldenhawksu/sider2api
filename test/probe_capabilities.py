@@ -40,7 +40,7 @@ BETWEEN_S = 1.5
 
 # 各模型家族代表 (上下文/工具深度探测用)
 REPRESENTATIVES = [
-    "gpt-5.5", "gpt-4.1", "gpt-5",
+    "gpt-5.5", "gpt-4.1-mini", "gpt-5.6-sol",
     "claude-opus-4.8", "claude-sonnet-5", "claude-haiku-4.5",
     "gemini-2.5-pro", "gemini-3.5-flash",
     "deepseek-v4-pro", "grok-4", "glm-5", "qwen3.8-max", "kimi-k3",

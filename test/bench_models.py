@@ -19,9 +19,9 @@ TOKEN = config.DEFAULT_TOKEN
 PROMPT = "用中文写一段大约200字的短文, 介绍杭州西湖的四季景色。直接输出正文。"
 
 MODELS = [
-    "gpt-4.1", "gpt-5.5", "gpt-5.6-sol",
-    "claude-opus-4.5", "claude-sonnet-5", "claude-haiku-4.5",
-    "gemini-2.5-flash", "gemini-3.7-flash",
+    "gpt-4.1-mini", "gpt-5.5", "gpt-5.6-sol",
+    "claude-opus-4.8", "claude-sonnet-5", "claude-haiku-4.5",
+    "gemini-3.0-flash", "gemini-3.6-flash",
     "deepseek-v4-pro", "grok-4", "glm-5", "qwen3.8-max", "kimi-k3",
     "llama-3.1-405b", "sider",
 ]

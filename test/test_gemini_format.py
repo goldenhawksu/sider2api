@@ -13,7 +13,8 @@ Gemini API 拓补:
   { "candidates": [{ "content": {"role":"model", "parts":[{"text":"..."}]},
     "finishReason":"STOP", "index":0 }], "usageMetadata": {...} }
 
-流式 SSE: data: {"candidates":[{...}]}\\n\\n, 终以 data: [DONE] 结束
+流式 SSE: data: {"candidates":[{...}]}\\n\\n, 以带 finishReason 的最终候选事件收尾。
+(官方 streamGenerateContent 没有 [DONE] 终止符, 因此本文件不再要求它。)
 """
 import json
 import pytest
@@ -106,7 +107,8 @@ def test_gemini_stream_generate_content(client):
     assert r.status_code == 200, r.text[:300]
     r.encoding = "utf-8"
     pieces = []
-    done = False
+    finish_reasons = []
+    saw_done = False
     for raw in r.iter_lines(decode_unicode=True):
         if not raw:
             continue
@@ -115,21 +117,26 @@ def test_gemini_stream_generate_content(client):
             continue
         payload = line[len("data:"):].strip()
         if payload == "[DONE]":
-            done = True
-            break
+            saw_done = True
+            continue
         try:
             obj = json.loads(payload)
         except json.JSONDecodeError:
             continue
         cands = obj.get("candidates", [])
         for c in cands:
+            if c.get("finishReason"):
+                finish_reasons.append(c["finishReason"])
             for p in c.get("content", {}).get("parts", []):
                 if p.get("text"):
                     pieces.append(p["text"])
     content = "".join(pieces)
     assert content, "流式累计内容为空"
     assert "5" in content or "五" in content, f"未数到5: {content[:200]!r}"
-    assert done, "流未以 [DONE] 正常终止"
+    # Gemini 官方流式无 [DONE]; 以带 finishReason 的最终候选事件收尾
+    assert not saw_done, "Gemini 流不应出现 [DONE] 终止符"
+    assert finish_reasons and finish_reasons[-1] in ("STOP", "MAX_TOKENS"), \
+        f"流未以 finishReason 收尾: {finish_reasons}"
 
 
 # ==================== 多轮对话 ====================
