@@ -1781,6 +1781,7 @@ interface QueueWaiter {
   wake: () => void;
   fail: (e: Error) => void;
   timer: number;
+  cleanup: () => void;
 }
 const upstreamQueue: QueueWaiter[] = [];
 
@@ -1793,7 +1794,7 @@ function makeSlotRelease(): () => void {
     upstreamActive -= 1;
     const next = upstreamQueue.shift();
     if (next) {
-      clearTimeout(next.timer);
+      next.cleanup();
       upstreamActive += 1;
       next.wake();
     }
@@ -1801,7 +1802,12 @@ function makeSlotRelease(): () => void {
 }
 
 /** 取上游并发槽位; 满则排队。队列满或等待超时会抛出对应错误。 */
-function acquireUpstreamSlot(): Promise<() => void> {
+function acquireUpstreamSlot(signal?: AbortSignal): Promise<() => void> {
+  if (signal?.aborted) {
+    return Promise.reject(signal.reason instanceof Error
+      ? signal.reason
+      : new DOMException("client disconnected", "AbortError"));
+  }
   // 与 RATE_LIMIT_ENABLED 解耦: 这里保护的是上游"同一时刻只能有一个请求"这一物理约束,
   // 与配额策略无关 —— 关掉限速也不该把并发保护一起关掉。
   if (UPSTREAM_MAX_CONCURRENCY <= 0) {
@@ -1815,15 +1821,33 @@ function acquireUpstreamSlot(): Promise<() => void> {
     return Promise.reject(new UpstreamQueueFullError());
   }
   return new Promise<() => void>((resolve, reject) => {
+    let onAbort: (() => void) | undefined;
     const waiter: QueueWaiter = {
       wake: () => resolve(makeSlotRelease()),
       fail: reject,
-      timer: setTimeout(() => {
+      timer: 0,
+      cleanup: () => {
+        clearTimeout(waiter.timer);
+        if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+      },
+    };
+    waiter.timer = setTimeout(() => {
+      const i = upstreamQueue.indexOf(waiter);
+      if (i >= 0) upstreamQueue.splice(i, 1);
+      waiter.cleanup();
+      reject(new UpstreamQueueTimeoutError());
+    }, UPSTREAM_QUEUE_WAIT_MS);
+    if (signal) {
+      onAbort = () => {
         const i = upstreamQueue.indexOf(waiter);
         if (i >= 0) upstreamQueue.splice(i, 1);
-        reject(new UpstreamQueueTimeoutError());
-      }, UPSTREAM_QUEUE_WAIT_MS),
-    };
+        waiter.cleanup();
+        reject(signal.reason instanceof Error
+          ? signal.reason
+          : new DOMException("client disconnected", "AbortError"));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
     upstreamQueue.push(waiter);
   });
 }
@@ -1933,6 +1957,7 @@ async function fetchSiderRateLimited(
   url: string,
   init: RequestInit,
   protocol: ApiProtocol,
+  clientSignal?: AbortSignal,
 ): Promise<UpstreamCall> {
   // 1. 预检 (不认领半开探测名额): 账号闸门/熔断/超配额 -> 直接拒, 不触达上游
   const pre = checkRateLimit(model);
@@ -1943,8 +1968,16 @@ async function fetchSiderRateLimited(
   // 2. 并发闸门: 上游单并发, 满则 FIFO 排队而非直接失败
   let releaseSlot: () => void;
   try {
-    releaseSlot = await acquireUpstreamSlot();
+    releaseSlot = await acquireUpstreamSlot(clientSignal);
   } catch (err) {
+    if (clientSignal?.aborted) {
+      return detachedCall(protocolErrorResponse(protocol, {
+        statusCode: 499,
+        type: "canceled",
+        reason: "client_disconnected",
+        message: "客户端已断开连接。",
+      }));
+    }
     const waitSec = Math.ceil(UPSTREAM_QUEUE_WAIT_MS / 1000);
     const reason = err instanceof UpstreamQueueFullError
       ? `上游为单并发, 排队已满 (${UPSTREAM_QUEUE_MAX} 个等待中)。`
@@ -1972,6 +2005,7 @@ async function fetchSiderRateLimited(
   let sawValidData = false;
   let fatalCode = 0;
   let idleTimer: number | undefined;
+  let clientAbortHandler: (() => void) | undefined;
   const timers: number[] = [];
 
   const clearTimers = () => {
@@ -1980,6 +2014,10 @@ async function fetchSiderRateLimited(
     if (idleTimer !== undefined) {
       clearTimeout(idleTimer);
       idleTimer = undefined;
+    }
+    if (clientSignal && clientAbortHandler) {
+      clientSignal.removeEventListener("abort", clientAbortHandler);
+      clientAbortHandler = undefined;
     }
   };
   const releaseLease = () => {
@@ -2003,6 +2041,25 @@ async function fetchSiderRateLimited(
     }
     releaseLease();
   };
+  clientAbortHandler = () => {
+    if (released) return;
+    try {
+      controller.abort(clientSignal?.reason ?? new DOMException("client disconnected", "AbortError"));
+    } catch { /* 已中止 */ }
+    settle(false);
+  };
+  if (clientSignal) {
+    clientSignal.addEventListener("abort", clientAbortHandler, { once: true });
+    if (clientSignal.aborted) clientAbortHandler();
+  }
+  if (released) {
+    return detachedCall(protocolErrorResponse(protocol, {
+      statusCode: 499,
+      type: "canceled",
+      reason: "client_disconnected",
+      message: "客户端已断开连接。",
+    }));
+  }
   const armIdleWatchdog = () => {
     if (released) return;
     if (idleTimer !== undefined) clearTimeout(idleTimer);
@@ -2041,6 +2098,9 @@ async function fetchSiderRateLimited(
       settle(true);
     },
     release() {
+      try {
+        controller.abort(new DOMException("upstream call released", "AbortError"));
+      } catch { /* 已中止 */ }
       settle(false);
     },
   };
@@ -2055,6 +2115,14 @@ async function fetchSiderRateLimited(
     if (stage !== null) {
       console.warn(`⏱️ [上游超时] ${model} 阶段=${stage}`);
       return detachedCall(protocolErrorResponse(protocol, timeoutDetail(stage)));
+    }
+    if (clientSignal?.aborted) {
+      return detachedCall(protocolErrorResponse(protocol, {
+        statusCode: 499,
+        type: "canceled",
+        reason: "client_disconnected",
+        message: "客户端已断开连接。",
+      }));
     }
     console.error("❌ 上游 fetch 失败:", err);
     return detachedCall(protocolErrorResponse(protocol, {
@@ -2139,6 +2207,9 @@ async function fetchSiderRateLimited(
         clearTimeout(idleTimer);
         idleTimer = undefined;
       }
+      try {
+        controller.abort(reason);
+      } catch { /* 已中止 */ }
       settle(false);
       return upstreamReader.cancel(reason);
     },
@@ -2269,6 +2340,20 @@ type SiderEvent =
   | { kind: "business_error"; code: number; msg: string }
   | { kind: "done" };
 
+/** 1101 可能在完整正文后作为并发告警到达；只在已有可见输出时兼容保留。 */
+function isIgnorableLateBusinessWarning(code: number, hasOutput: boolean): boolean {
+  return code === 1101 && hasOutput;
+}
+
+function upstreamTruncatedDetail(): UpstreamErrorDetail {
+  return {
+    statusCode: 502,
+    type: "upstream_error",
+    reason: "upstream_truncated",
+    message: "上游响应在完成标记前异常截断。",
+  };
+}
+
 /** 会被记作"上游确实产出了内容"的事件类型 (用于成功判定)。 */
 const SIDER_CONTENT_EVENT_TYPES = new Set(["text", "file", "reasoning_content", "tool_call"]);
 
@@ -2340,13 +2425,21 @@ function createSSEHeartbeat(
   pingFrame: string,
 ) {
   let closed = false;
-  const timer = SSE_PING_INTERVAL_MS > 0
+  let timer: number | undefined;
+  const stopTimer = () => {
+    if (timer !== undefined) {
+      clearInterval(timer);
+      timer = undefined;
+    }
+  };
+  timer = SSE_PING_INTERVAL_MS > 0
     ? setInterval(() => {
         if (closed) return;
         try {
           controller.enqueue(encoder.encode(pingFrame));
         } catch {
           closed = true;
+          stopTimer();
         }
       }, SSE_PING_INTERVAL_MS)
     : undefined;
@@ -2358,7 +2451,7 @@ function createSSEHeartbeat(
     close() {
       if (closed) return;
       closed = true;
-      if (timer) clearInterval(timer);
+      stopTimer();
       try {
         controller.close();
       } catch { /* 已关闭 */ }
@@ -2366,7 +2459,7 @@ function createSSEHeartbeat(
     fail(err: unknown) {
       if (closed) return;
       closed = true;
-      if (timer) clearInterval(timer);
+      stopTimer();
       try {
         controller.error(err);
       } catch { /* 已关闭 */ }
@@ -2706,7 +2799,7 @@ async function handleChatCompletion(req: Request): Promise<Response> {
         "X-App-Version": "5.21.2"
       },
       body: JSON.stringify(siderRequest)
-    }, "openai");
+    }, "openai", req.signal);
     const siderResponse = call.response;
 
     if (!siderResponse.ok) {
@@ -2749,8 +2842,7 @@ async function handleNonStreamingResponse(
   let conversationId = "";
   let messageId = "";
   let parentMessageId = "";
-  let upstreamErrCode = 0;
-  let upstreamErrMsg = "";
+  let sawDone = false;
 
   const reader = siderResponse.body?.getReader();
   if (!reader) {
@@ -2762,8 +2854,13 @@ async function handleNonStreamingResponse(
     onValidData: () => call.reportSuccess(),
   })) {
     if (ev.kind === "business_error") {
-      upstreamErrCode = ev.code;
-      upstreamErrMsg = ev.msg || upstreamErrMsg;
+      if (isIgnorableLateBusinessWarning(ev.code, Boolean(fullText || imageUrl))) continue;
+      call.release();
+      recordFailure(modelName);
+      return protocolErrorResponse("openai", call.describeBusinessError(ev.code, ev.msg));
+    }
+    if (ev.kind === "done") {
+      sawDone = true;
       continue;
     }
     if (ev.kind !== "data") continue;
@@ -2812,17 +2909,14 @@ async function handleNonStreamingResponse(
         break;
     }
   }
-  // 响应体已消费完: 结算租约 (成功/失败判定 + 释放槽位)
-  call.complete();
-
-  // 构建 OpenAI 格式响应
-  if (upstreamErrCode !== 0 && !fullText && !imageUrl) {
+  if (!sawDone) {
+    call.release();
     recordFailure(modelName);
-    // 门控学习已在消费事件时完成 (与是否输出过正文无关), 这里只负责渲染给客户端
-    return protocolErrorResponse("openai", call.describeBusinessError(upstreamErrCode, upstreamErrMsg));
+    return protocolErrorResponse("openai", upstreamTruncatedDetail());
   }
 
   if (!fullText && !imageUrl) {
+    call.release();
     recordFailure(modelName);
     return new Response(JSON.stringify({
       error: {
@@ -2834,6 +2928,8 @@ async function handleNonStreamingResponse(
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
   }
+  // 只有显式完成且确有输出才结算成功。
+  call.complete();
 
   const limited = applyOutputLimits(fullText, outputLimits);
   let content = limited.text;
@@ -2944,6 +3040,7 @@ function handleStreamingResponse(
 ): Response {
   const siderResponse = call.response;
   let conversationId = "";
+  let closeHeartbeat = () => {};
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -2956,6 +3053,7 @@ function handleStreamingResponse(
 
       const encoder = new TextEncoder();
       const hb = createSSEHeartbeat(controller, encoder, COMMENT_PING_FRAME);
+      closeHeartbeat = () => hb.close();
       let hasStarted = false;
       let firstChunkAt: number | null = null;
       const streamT0 = Date.now();
@@ -2997,6 +3095,27 @@ function handleStreamingResponse(
         enqueueTextChunk("", openAIFinishReason(reason));
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         await new Promise(resolve => setTimeout(resolve, 50));
+        finishStreamStats();
+        hb.close();
+      };
+      const finishOpenAIError = (detail: UpstreamErrorDetail) => {
+        if (hb.closed) return;
+        try {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            id: `chatcmpl-${Date.now()}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: modelName,
+            choices: [{ delta: {}, finish_reason: "error", index: 0 }],
+            error: {
+              code: detail.upstreamCode ?? detail.statusCode,
+              message: detail.message,
+              type: detail.type,
+              reason: detail.reason,
+            },
+          })}\n\n`));
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        } catch { /* 客户端已断开 */ }
         finishStreamStats();
         hb.close();
       };
@@ -3072,28 +3191,17 @@ function handleStreamingResponse(
 
           if (ev.kind === "business_error") {
             console.error(`❌ 上游流内错误: code=${ev.code} msg=${ev.msg}`);
-            if (streamOutputChars === 0 && imageUrls.length === 0) {
-              const detail = call.describeBusinessError(ev.code, ev.msg);
-              const errChunk = {
-                id: `chatcmpl-${Date.now()}`,
-                object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
-                model: modelName,
-                choices: [{
-                  delta: {},
-                  finish_reason: "error",
-                  index: 0
-                }],
-                error: { code: ev.code, message: detail.message, type: detail.type }
-              };
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
-              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-              finishStreamStats();
-              hb.close();
-              call.complete();
-              return;
+            if (isIgnorableLateBusinessWarning(ev.code, streamOutputChars > 0 || imageUrls.length > 0)) {
+              continue;
             }
-            continue;
+            const flushed = textLimiter.flush();
+            if (flushed.text) {
+              streamOutputChars += flushed.text.length;
+              enqueueTextChunk(flushed.text);
+            }
+            finishOpenAIError(call.describeBusinessError(ev.code, ev.msg));
+            call.release();
+            return;
           }
 
           const data = ev.data;
@@ -3222,34 +3330,22 @@ function handleStreamingResponse(
           streamOutputChars += flushed.text.length;
           enqueueTextChunk(flushed.text);
         }
-        await finishOpenAIStream(flushed.stopReason);
-        call.complete();
+        finishOpenAIError(upstreamTruncatedDetail());
+        call.release();
 
       } catch (error) {
         console.error("❌ 流式处理错误:", error);
         call.release();
-        const detail = upstreamErrorFromException(error);
-        if (detail && !hb.closed) {
-          // 头已经发出去了, 改不了 HTTP 状态码; 至少把超时如实告诉客户端
-          try {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-              id: `chatcmpl-${Date.now()}`,
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model: modelName,
-              choices: [{ delta: {}, finish_reason: "error", index: 0 }],
-              error: { code: detail.statusCode, message: detail.message, type: detail.type },
-            })}\n\n`));
-            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-          } catch { /* 已关闭 */ }
-          hb.close();
-          return;
-        }
-        hb.fail(error);
+        finishOpenAIError(upstreamErrorFromException(error) ?? {
+          statusCode: 502,
+          type: "upstream_error",
+          message: error instanceof Error ? error.message : String(error),
+        });
       }
     },
     cancel() {
       // 客户端提前断开: 立即结算并释放上游并发槽位
+      closeHeartbeat();
       call.release();
     }
   });
@@ -3401,7 +3497,7 @@ async function handleImageGeneration(req: Request): Promise<Response> {
         "X-App-Version": "5.21.2"
       },
       body: JSON.stringify(siderRequest)
-    }, "openai");
+    }, "openai", req.signal);
     const siderResponse = call.response;
 
     if (!siderResponse.ok) {
@@ -3769,7 +3865,7 @@ async function handleGeminiGenerate(
         "X-App-Version": "5.21.2"
       },
       body: JSON.stringify(siderRequest)
-    }, "gemini");
+    }, "gemini", req.signal);
     const siderResponse = call.response;
 
     if (!siderResponse.ok) {
@@ -3781,8 +3877,7 @@ async function handleGeminiGenerate(
     // ===== 非流式: 消费上游流, 聚合后返回 Gemini 格式 =====
     if (!isStream) {
       let fullText = "", reasoningAcc = "";
-      let upstreamErrCode = 0;
-      let upstreamErrMsg = "";
+      let sawDone = false;
       const reader = siderResponse.body?.getReader();
       if (!reader) throw new Error("无法获取响应流");
       for await (const ev of iterateSiderEvents(reader, {
@@ -3790,8 +3885,13 @@ async function handleGeminiGenerate(
         onValidData: () => call.reportSuccess(),
       })) {
         if (ev.kind === "business_error") {
-          upstreamErrCode = ev.code;
-          upstreamErrMsg = ev.msg || upstreamErrMsg;
+          if (isIgnorableLateBusinessWarning(ev.code, Boolean(fullText))) continue;
+          call.release();
+          recordFailure(geminiModel);
+          return protocolErrorResponse("gemini", call.describeBusinessError(ev.code, ev.msg));
+        }
+        if (ev.kind === "done") {
+          sawDone = true;
           continue;
         }
         if (ev.kind !== "data") continue;
@@ -3804,17 +3904,19 @@ async function handleGeminiGenerate(
           }
         }
       }
-      call.complete();
-      if (upstreamErrCode !== 0 && !fullText) {
+      if (!sawDone) {
+        call.release();
         recordFailure(geminiModel);
-        return protocolErrorResponse("gemini", call.describeBusinessError(upstreamErrCode, upstreamErrMsg));
+        return protocolErrorResponse("gemini", upstreamTruncatedDetail());
       }
       if (!fullText) {
+        call.release();
         recordFailure(geminiModel);
         return new Response(JSON.stringify({
           error: { message: "上游响应没有生成任何文本内容。", type: "upstream_error" }
         }), { status: 502, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
       }
+      call.complete();
       const limited = applyOutputLimits(fullText, outputLimits);
       // 用量统计: Gemini 非流式
       recordUsage({
@@ -3841,6 +3943,7 @@ async function handleGeminiGenerate(
     // Gemini 官方 streamGenerateContent 没有 [DONE] 终止符: 以带 finishReason 的最终
     // 候选事件收尾, 然后直接关闭连接。多发一个 [DONE] 会让严格按 spec 实现的客户端
     // (如 google-genai) 解析到非 Gemini 结构。
+    let closeHeartbeat = () => {};
     const stream = new ReadableStream({
       async start(controller) {
         const reader = siderResponse.body?.getReader();
@@ -3851,6 +3954,7 @@ async function handleGeminiGenerate(
         }
         const encoder = new TextEncoder();
         const hb = createSSEHeartbeat(controller, encoder, COMMENT_PING_FRAME);
+        closeHeartbeat = () => hb.close();
         // 用量统计累积
         const gT0 = Date.now();
         let gOutputChars = 0;
@@ -3884,6 +3988,17 @@ async function handleGeminiGenerate(
           finishGeminiStats();
           hb.close();
         };
+        const finishGeminiError = (detail: UpstreamErrorDetail) => {
+          if (!hb.closed) {
+            try {
+              controller.enqueue(encoder.encode(
+                `data: ${JSON.stringify(protocolErrorPayload("gemini", detail))}\n\n`,
+              ));
+            } catch { /* 客户端已断开 */ }
+          }
+          finishGeminiStats();
+          hb.close();
+        };
 
         try {
           for await (const ev of iterateSiderEvents(reader, {
@@ -3903,17 +4018,17 @@ async function handleGeminiGenerate(
 
             if (ev.kind === "business_error") {
               const detail = call.describeBusinessError(ev.code, ev.msg);
-              if (gOutputChars === 0) {
-                // 还没吐出任何正文: 以 Gemini 原生错误事件收尾 (同样不发 [DONE])
-                controller.enqueue(encoder.encode(
-                  `data: ${JSON.stringify(protocolErrorPayload("gemini", detail))}\n\n`,
-                ));
-                finishGeminiStats();
-                hb.close();
-                call.complete();
-                return;
+              if (isIgnorableLateBusinessWarning(ev.code, gOutputChars > 0)) {
+                continue;
               }
-              continue;
+              const flushed = textLimiter.flush();
+              if (flushed.text) {
+                gOutputChars += flushed.text.length;
+                enqueueGeminiText(flushed.text);
+              }
+              finishGeminiError(detail);
+              call.release();
+              return;
             }
 
             const d = ev.data;
@@ -3957,26 +4072,21 @@ async function handleGeminiGenerate(
             gOutputChars += flushed.text.length;
             enqueueGeminiText(flushed.text);
           }
-          finishGeminiStream(flushed.stopReason);
-          call.complete();
+          finishGeminiError(upstreamTruncatedDetail());
+          call.release();
         } catch (err: any) {
           console.error("❌ Gemini流式错误:", err);
           call.release();
-          const detail = upstreamErrorFromException(err);
-          if (detail && !hb.closed) {
-            try {
-              controller.enqueue(encoder.encode(
-                `data: ${JSON.stringify(protocolErrorPayload("gemini", detail))}\n\n`,
-              ));
-            } catch { /* 已关闭 */ }
-            hb.close();
-            return;
-          }
-          hb.fail(err);
+          finishGeminiError(upstreamErrorFromException(err) ?? {
+            statusCode: 502,
+            type: "upstream_error",
+            message: err?.message || "stream error",
+          });
         }
       },
       cancel() {
         // 客户端提前断开: 立即结算并释放上游并发槽位
+        closeHeartbeat();
         call.release();
       }
     });
@@ -4156,7 +4266,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
         "X-App-Name": "ChitChat_Edge_Ext", "X-App-Version": "5.21.2",
       },
       body: JSON.stringify(siderRequest),
-    }, "anthropic");
+    }, "anthropic", req.signal);
     const siderResp = call.response;
 
     if (!siderResp.ok) {
@@ -4168,8 +4278,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
     // ---- 非流式 ----
     if (!isStream) {
       let fullText = "", reasoningAcc = "";
-      let upstreamErrCode = 0;
-      let upstreamErrMsg = "";
+      let sawDone = false;
       const reader = siderResp.body?.getReader();
       if (!reader) throw new Error("无法获取响应流");
       for await (const ev of iterateSiderEvents(reader, {
@@ -4177,8 +4286,13 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
         onValidData: () => call.reportSuccess(),
       })) {
         if (ev.kind === "business_error") {
-          upstreamErrCode = ev.code;
-          upstreamErrMsg = ev.msg || upstreamErrMsg;
+          if (isIgnorableLateBusinessWarning(ev.code, Boolean(fullText))) continue;
+          call.release();
+          recordFailure(anthroModel);
+          return protocolErrorResponse("anthropic", call.describeBusinessError(ev.code, ev.msg));
+        }
+        if (ev.kind === "done") {
+          sawDone = true;
           continue;
         }
         if (ev.kind !== "data") continue;
@@ -4191,12 +4305,13 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
           }
         }
       }
-      call.complete();
-      if (upstreamErrCode !== 0 && !fullText) {
+      if (!sawDone) {
+        call.release();
         recordFailure(anthroModel);
-        return protocolErrorResponse("anthropic", call.describeBusinessError(upstreamErrCode, upstreamErrMsg));
+        return protocolErrorResponse("anthropic", upstreamTruncatedDetail());
       }
       if (!fullText) {
+        call.release();
         recordFailure(anthroModel);
         return protocolErrorResponse("anthropic", {
           statusCode: 502,
@@ -4204,6 +4319,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
           message: "上游响应没有生成任何文本内容。",
         });
       }
+      call.complete();
       const limited = applyOutputLimits(fullText, outputLimits);
       // 用量统计: Anthropic 非流式
       recordUsage({
@@ -4233,6 +4349,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
 
     // ---- 流式: Anthropic SSE 事件序列 (content-block 状态机) ----
     // 惰性开块 + 单调 index + 成对 start/stop; reasoning_content->thinking, text->text。
+    let closeHeartbeat = () => {};
     const sstream = new ReadableStream<Uint8Array>({
       async start(controller) {
         const reader = siderResp.body?.getReader();
@@ -4243,10 +4360,15 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
         }
         const encoder = new TextEncoder();
         const hb = createSSEHeartbeat(controller, encoder, ANTHROPIC_PING_FRAME);
+        closeHeartbeat = () => hb.close();
 
         const sendEvent = (event: string, data: any) => {
           if (hb.closed) return;
-          controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+          try {
+            controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+          } catch {
+            hb.close();
+          }
         };
 
         // 状态机: started 保证 message_start 只发一次; blockIndex 单调递增;
@@ -4313,6 +4435,12 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
           finishAnthroStats();
           hb.close();
         };
+        const finishError = (detail: UpstreamErrorDetail) => {
+          closeBlock();
+          sendEvent("error", protocolErrorPayload("anthropic", detail));
+          finishAnthroStats();
+          hb.close();
+        };
 
         try {
           ensureStart();
@@ -4339,16 +4467,23 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
             }
 
             if (ev.kind === "business_error") {
-              if (outputTextAcc.length === 0) {
-                closeBlock();
-                sendEvent("error", protocolErrorPayload("anthropic", call.describeBusinessError(ev.code, ev.msg)));
-                sendEvent("message_stop", { type: "message_stop" });
-                finishAnthroStats();
-                hb.close();
-                call.complete();
-                return;
+              if (isIgnorableLateBusinessWarning(ev.code, outputTextAcc.length > 0)) {
+                continue;
               }
-              continue;
+              const flushed = textLimiter.flush();
+              if (flushed.text) {
+                if (currentBlock !== "text") openBlock("text");
+                outputChars += flushed.text.length;
+                outputTextAcc += flushed.text;
+                sendEvent("content_block_delta", {
+                  type: "content_block_delta",
+                  index: blockIndex,
+                  delta: { type: "text_delta", text: flushed.text },
+                });
+              }
+              finishError(call.describeBusinessError(ev.code, ev.msg));
+              call.release();
+              return;
             }
 
             const d = ev.data;
@@ -4387,7 +4522,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
             }
           }
 
-          // 上游未显式发 [DONE] 就结束的兜底
+          // EOF 不是成功终态；先保留已收到的正文，再明确报告异常截断。
           const flushed = textLimiter.flush();
           if (flushed.text) {
             if (currentBlock !== "text") openBlock("text");
@@ -4399,27 +4534,21 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
               delta: { type: "text_delta", text: flushed.text },
             });
           }
-          finishOk(flushed.stopReason);
-          call.complete();
+          finishError(upstreamTruncatedDetail());
+          call.release();
         } catch (err: any) {
           console.error("❌ Anthropic流错误:", err);
           call.release();
-          if (!hb.closed) {
-            closeBlock();
-            sendEvent("error", protocolErrorPayload("anthropic",
-              upstreamErrorFromException(err) ?? {
-                statusCode: 502,
-                type: "upstream_error",
-                message: err?.message || "stream error",
-              }));
-            sendEvent("message_stop", { type: "message_stop" });
-          }
-          finishAnthroStats();
-          hb.close();
+          finishError(upstreamErrorFromException(err) ?? {
+            statusCode: 502,
+            type: "upstream_error",
+            message: err?.message || "stream error",
+          });
         }
       },
       cancel() {
         // 客户端提前断开: 立即结算并释放上游并发槽位
+        closeHeartbeat();
         call.release();
       },
     });
@@ -4631,7 +4760,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
         "X-App-Name": "ChitChat_Edge_Ext", "X-App-Version": "5.21.2",
       },
       body: JSON.stringify(siderRequest),
-    }, "responses");
+    }, "responses", req.signal);
     const siderResp = call.response;
 
     if (!siderResp.ok) {
@@ -4643,8 +4772,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
     // ---- 非流式 ----
     if (!isStream) {
       let fullText = "", reasoningAcc = "";
-      let upstreamErrCode = 0;
-      let upstreamErrMsg = "";
+      let sawDone = false;
       const reader = siderResp.body?.getReader();
       if (!reader) throw new Error("无法获取响应流");
       for await (const ev of iterateSiderEvents(reader, {
@@ -4652,8 +4780,13 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
         onValidData: () => call.reportSuccess(),
       })) {
         if (ev.kind === "business_error") {
-          upstreamErrCode = ev.code;
-          upstreamErrMsg = ev.msg || upstreamErrMsg;
+          if (isIgnorableLateBusinessWarning(ev.code, Boolean(fullText))) continue;
+          call.release();
+          recordFailure(modelName);
+          return protocolErrorResponse("responses", call.describeBusinessError(ev.code, ev.msg));
+        }
+        if (ev.kind === "done") {
+          sawDone = true;
           continue;
         }
         if (ev.kind !== "data") continue;
@@ -4666,12 +4799,13 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
           }
         }
       }
-      call.complete();
-      if (upstreamErrCode !== 0 && !fullText) {
+      if (!sawDone) {
+        call.release();
         recordFailure(modelName);
-        return protocolErrorResponse("responses", call.describeBusinessError(upstreamErrCode, upstreamErrMsg));
+        return protocolErrorResponse("responses", upstreamTruncatedDetail());
       }
       if (!fullText) {
+        call.release();
         recordFailure(modelName);
         return protocolErrorResponse("responses", {
           statusCode: 502,
@@ -4679,6 +4813,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
           message: "上游响应没有生成任何文本内容。",
         });
       }
+      call.complete();
       const limited = applyOutputLimits(fullText, outputLimits);
       // 用量统计: Responses 非流式
       recordUsage({
@@ -4696,6 +4831,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
     }
 
     // ---- 流式: Responses API SSE ----
+    let closeHeartbeat = () => {};
     const respStream = new ReadableStream({
       async start(controller) {
         const reader = siderResp.body?.getReader();
@@ -4706,6 +4842,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
         }
         const encoder = new TextEncoder();
         const hb = createSSEHeartbeat(controller, encoder, COMMENT_PING_FRAME);
+        closeHeartbeat = () => hb.close();
         // 用量统计累积
         const rT0 = Date.now();
         let rOutputChars = 0;
@@ -4725,7 +4862,11 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
 
         const sendEvent = (event: string, data: any) => {
           if (hb.closed) return;
-          controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+          try {
+            controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+          } catch {
+            hb.close();
+          }
         };
 
         const itemId = `msg_${Date.now()}`;
@@ -4809,6 +4950,26 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
           finishResponsesStats();
           hb.close();
         };
+        const finishResponsesFailure = (detail: UpstreamErrorDetail) => {
+          const failedResp = {
+            ...initialResp,
+            status: "failed",
+            output: itemOpened ? [outputItem("incomplete")] : [],
+            error: {
+              code: detail.reason || detail.type,
+              message: detail.message,
+              upstream_code: detail.upstreamCode,
+            },
+            usage: {
+              input_tokens: estimateTokens(fullContext),
+              output_tokens: estimateTokens(outputTextAcc),
+              total_tokens: estimateTokens(fullContext) + estimateTokens(outputTextAcc),
+            },
+          };
+          sendEvent("response.failed", { type: "response.failed", response: failedResp });
+          finishResponsesStats();
+          hb.close();
+        };
 
         try {
           for await (const ev of iterateSiderEvents(reader, {
@@ -4824,14 +4985,14 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
             }
 
             if (ev.kind === "business_error") {
-              if (outputTextAcc.length === 0) {
-                sendEvent("error", protocolErrorPayload("responses", call.describeBusinessError(ev.code, ev.msg)));
-                finishResponsesStats();
-                hb.close();
-                call.complete();
-                return;
+              if (isIgnorableLateBusinessWarning(ev.code, outputTextAcc.length > 0)) {
+                continue;
               }
-              continue;
+              const flushed = textLimiter.flush();
+              if (flushed.text) sendDelta(flushed.text);
+              finishResponsesFailure(call.describeBusinessError(ev.code, ev.msg));
+              call.release();
+              return;
             }
 
             const d = ev.data;
@@ -4851,24 +5012,21 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
           }
           const flushed = textLimiter.flush();
           if (flushed.text) sendDelta(flushed.text);
-          finishResponsesStream(flushed.stopReason);
-          call.complete();
+          finishResponsesFailure(upstreamTruncatedDetail());
+          call.release();
         } catch (err: any) {
           console.error("❌ Responses流错误:", err);
           call.release();
-          const detail = upstreamErrorFromException(err);
-          if (detail) {
-            sendEvent("error", protocolErrorPayload("responses", detail));
-            finishResponsesStats();
-            hb.close();
-            return;
-          }
-          finishResponsesStats();
-          hb.fail(err);
+          finishResponsesFailure(upstreamErrorFromException(err) ?? {
+            statusCode: 502,
+            type: "upstream_error",
+            message: err?.message || "stream error",
+          });
         }
       },
       cancel() {
         // 客户端提前断开: 立即结算并释放上游并发槽位
+        closeHeartbeat();
         call.release();
       },
     });

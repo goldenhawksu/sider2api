@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import pytest
@@ -71,6 +72,7 @@ class MockSiderState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.requests: list[dict[str, Any]] = []
+        self.disconnected_prompts: list[str] = []
 
     def add(self, body: dict[str, Any]) -> int:
         with self._lock:
@@ -81,9 +83,18 @@ class MockSiderState:
         with self._lock:
             return list(self.requests)
 
+    def mark_disconnected(self, prompt: str) -> None:
+        with self._lock:
+            self.disconnected_prompts.append(prompt)
+
+    def disconnected_snapshot(self) -> list[str]:
+        with self._lock:
+            return list(self.disconnected_prompts)
+
     def clear(self) -> None:
         with self._lock:
             self.requests.clear()
+            self.disconnected_prompts.clear()
 
 
 def _prompt_from_sider_body(body: dict[str, Any]) -> str:
@@ -136,6 +147,21 @@ def _scenario_frames(prompt: str, seq: int) -> tuple[list[bytes], float]:
             _frame(_message_start(seq)),
             _frame(_text("正文仍然保留")),
             _frame({"code": 1101, "msg": "late warning", "data": None}),
+            _done(),
+        ], delay
+    if "MOCK_TERMINAL_AFTER_TEXT" in prompt:
+        return [
+            _frame(_message_start(seq)),
+            _frame(_text("partial before failure")),
+            _frame({"code": 9999, "msg": "terminal failure", "data": None}),
+            _done(),
+        ], delay
+    if "MOCK_EOF_AFTER_TEXT" in prompt:
+        return [_frame(_message_start(seq)), _frame(_text("partial before eof"))], delay
+    if "MOCK_LONG_STREAM" in prompt:
+        return [
+            _frame(_message_start(seq)),
+            *[_frame(_text(f"part-{i};")) for i in range(100)],
             _done(),
         ], delay
     if "MOCK_STREAM_STOP" in prompt:
@@ -243,10 +269,13 @@ def _handler_factory(state: MockSiderState):
                 time.sleep(delay)
             for item in frames:
                 try:
+                    if "MOCK_LONG_STREAM" in prompt:
+                        time.sleep(0.05)
                     self.wfile.write(item)
                     self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     # 客户端已按超时中止: 静默收尾, 不打印 traceback
+                    state.mark_disconnected(prompt)
                     break
 
         def do_GET(self) -> None:  # noqa: N802
@@ -362,6 +391,28 @@ def gate_stack():
 
 
 @pytest.fixture(scope="session")
+def disconnect_stack():
+    """低频心跳 + 单并发，用于验证排队及生成阶段的客户端取消传播。"""
+    with _launch_stack({
+        "UPSTREAM_MAX_CONCURRENCY": "1",
+        "SSE_PING_INTERVAL_MS": "25",
+        "RATE_LIMIT_MAX_CALLS": "1000",
+        "RATE_LIMIT_QUOTA_MAX": "1000",
+    }) as stack:
+        yield stack
+
+
+@pytest.fixture(scope="session")
+def terminal_stack():
+    """独立高配额实例，避免终态矩阵受其他用例的模型门控状态污染。"""
+    with _launch_stack({
+        "RATE_LIMIT_MAX_CALLS": "1000",
+        "RATE_LIMIT_QUOTA_MAX": "1000",
+    }) as stack:
+        yield stack
+
+
+@pytest.fixture(scope="session")
 def quota_stack():
     """独立实例, 固定配额 (QUOTA_MAX = MAX_CALLS 即禁用 AIMD 增长)。
 
@@ -455,6 +506,32 @@ def _post(base_url: str, path: str, body: dict[str, Any], *, headers: dict[str, 
         stream=stream,
         timeout=(3, 10),
     )
+
+
+def _send_and_disconnect(base_url: str, path: str, body: dict[str, Any], *, wait_for_headers: bool = False) -> None:
+    """用原始 TCP 请求模拟客户端断连；可等响应头到达后再关闭。"""
+    parsed = urlsplit(base_url)
+    payload = json.dumps(body).encode("utf-8")
+    request = (
+        f"POST {path} HTTP/1.1\r\n"
+        f"Host: {parsed.hostname}:{parsed.port}\r\n"
+        f"Authorization: Bearer {AUTH_TOKEN}\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(payload)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii") + payload
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=3) as sock:
+        sock.sendall(request)
+        if wait_for_headers:
+            sock.settimeout(3)
+            received = b""
+            while b"\r\n\r\n" not in received:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                received += chunk
+        else:
+            time.sleep(0.1)
 
 
 def _openai_text(body: dict[str, Any]) -> str:
@@ -1107,6 +1184,67 @@ def test_stream_early_return_releases_slot(gate_stack):
 
 
 @pytest.mark.smoke
+def test_queued_disconnect_never_reaches_upstream(disconnect_stack):
+    """客户端在 FIFO 排队时断开，等待项应立即移除，不能在槽位唤醒后触达上游。"""
+    base = disconnect_stack["base_url"]
+    state = disconnect_stack["state"]
+    state.clear()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(_post, base, "/v1/chat/completions", {
+            "model": "gpt-5.6-luna",
+            "messages": [{"role": "user", "content": "MOCK_SLOW QUEUE_HOLDER"}],
+        })
+        deadline = time.time() + 3
+        while len(state.snapshot()) < 1 and time.time() < deadline:
+            time.sleep(0.02)
+
+        _send_and_disconnect(base, "/v1/chat/completions", {
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "QUEUED_CLIENT_GONE"}],
+        })
+        assert first.result(timeout=5).status_code == 200
+
+    time.sleep(0.3)
+    prompts = [_prompt_from_sider_body(body) for body in state.snapshot()]
+    assert all("QUEUED_CLIENT_GONE" not in prompt for prompt in prompts), prompts
+
+    follow_up = _post(base, "/v1/chat/completions", {
+        "model": "gpt-5.6-terra",
+        "messages": [{"role": "user", "content": "AFTER_QUEUE_DISCONNECT"}],
+    })
+    assert follow_up.status_code == 200, follow_up.text[:200]
+
+
+@pytest.mark.smoke
+def test_stream_disconnect_aborts_upstream_and_clears_lifecycle(disconnect_stack):
+    """生成中断连必须关闭上游流；随后请求应正常进入且心跳不能残留占用生命周期。"""
+    base = disconnect_stack["base_url"]
+    state = disconnect_stack["state"]
+    state.clear()
+    marker = "MOCK_LONG_STREAM CLIENT_GONE_DURING_GENERATION"
+
+    _send_and_disconnect(base, "/v1/chat/completions", {
+        "model": "gpt-5.6-luna",
+        "messages": [{"role": "user", "content": marker}],
+        "stream": True,
+    }, wait_for_headers=True)
+
+    deadline = time.time() + 4
+    while marker not in state.disconnected_snapshot() and time.time() < deadline:
+        time.sleep(0.05)
+    assert marker in state.disconnected_snapshot(), "网关未在客户端断连后关闭上游连接"
+
+    start = time.time()
+    follow_up = _post(base, "/v1/chat/completions", {
+        "model": "gpt-5.6-sol",
+        "messages": [{"role": "user", "content": "AFTER_STREAM_DISCONNECT"}],
+    })
+    assert follow_up.status_code == 200, follow_up.text[:200]
+    assert time.time() - start < 3, "断连后槽位或心跳生命周期仍未清理"
+
+
+@pytest.mark.smoke
 def test_quota_exhaustion_blocks_and_isolates_by_model(quota_stack):
     """固定配额下: 第 7 次被拦, 错误格式规范, 且不波及其他模型。
 
@@ -1180,6 +1318,57 @@ _PROTOCOL_MODELS = {
     "anthropic": "claude-sonnet-5",
     "gemini": "gemini-2.5-pro",
 }
+
+
+@pytest.mark.smoke
+def test_terminal_business_error_after_text_is_never_reported_as_success(terminal_stack):
+    """正文后的终止性业务错误应保留已发送片段，但四协议都不能再发送成功终态。"""
+    base = terminal_stack["base_url"]
+    for protocol, model in _PROTOCOL_MODELS.items():
+        nonstream = _post_protocol(base, protocol, model, "MOCK_TERMINAL_AFTER_TEXT")
+        assert nonstream.status_code == 502, \
+            f"{protocol} 非流式错误被标成成功: {nonstream.status_code} {nonstream.text[:200]}"
+
+        stream = _post_protocol(base, protocol, model, "MOCK_TERMINAL_AFTER_TEXT", stream=True)
+        assert stream.status_code == 200, stream.text[:200]
+        events = _collect_sse(stream)
+        blob = json.dumps(events, ensure_ascii=False)
+        assert "partial before failure" in blob, f"{protocol} 丢失已发送正文: {events}"
+        assert "terminal failure" in blob, f"{protocol} 未暴露终止错误: {events}"
+
+        payloads = [p for _, p in events if isinstance(p, dict)]
+        if protocol == "openai":
+            assert not any(p.get("choices", [{}])[0].get("finish_reason") in {"stop", "length"}
+                           for p in payloads if p.get("choices")), events
+        elif protocol == "responses":
+            types = [p.get("type") for p in payloads]
+            assert "response.completed" not in types and "response.incomplete" not in types, types
+        elif protocol == "anthropic":
+            assert not any(p.get("type") == "message_stop" for p in payloads), events
+        else:
+            assert not any(candidate.get("finishReason") in {"STOP", "MAX_TOKENS"}
+                           for p in payloads for candidate in p.get("candidates", [])), events
+
+
+@pytest.mark.smoke
+def test_eof_without_done_is_an_error_for_all_protocols(terminal_stack):
+    """上游传输 EOF 不等于生成完成；缺少 [DONE] 时不得记成功或发成功终态。"""
+    base = terminal_stack["base_url"]
+    for protocol, model in _PROTOCOL_MODELS.items():
+        nonstream = _post_protocol(base, protocol, model, "MOCK_EOF_AFTER_TEXT")
+        assert nonstream.status_code == 502, \
+            f"{protocol} 异常 EOF 被标成成功: {nonstream.status_code} {nonstream.text[:200]}"
+
+        stream = _post_protocol(base, protocol, model, "MOCK_EOF_AFTER_TEXT", stream=True)
+        events = _collect_sse(stream)
+        blob = json.dumps(events, ensure_ascii=False).lower()
+        assert "partial before eof" in blob, f"{protocol} 丢失异常截断前正文: {events}"
+        assert "truncated" in blob, f"{protocol} 未报告异常截断: {events}"
+        payloads = [p for _, p in events if isinstance(p, dict)]
+        assert not any(p.get("type") == "response.completed" for p in payloads), events
+        assert not any(p.get("type") == "message_stop" for p in payloads), events
+        assert not any(candidate.get("finishReason") in {"STOP", "MAX_TOKENS"}
+                       for p in payloads for candidate in p.get("candidates", [])), events
 
 
 @pytest.mark.smoke
