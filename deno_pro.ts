@@ -2421,7 +2421,7 @@ interface BoundedContext {
  * 四个端点共用同一份实现 —— 此前只有 OpenAI Chat 端点做了预算保护, Gemini /
  * Anthropic / Responses 直接拼接全部历史, 长对话会一路撞到上游 603 (词数超限)。
  *
- * 优先级: system > 当前问题 > 历史 (从最新往最旧填充), 严守 SIDER_MAX_CHARS / SIDER_MAX_WORDS。
+ * 优先级: system/developer > 当前问题 > 历史 (从最新往最旧填充), 严守字符/词数预算。
  * 固定部分自身超限时返回 overflow=true, 由调用方在本地返回 context_length_exceeded。
  */
 function buildBoundedContext(msgs: any[]): BoundedContext {
@@ -2433,21 +2433,26 @@ function buildBoundedContext(msgs: any[]): BoundedContext {
   // 按更长的那个标签预留, 避免"裁剪后标签变长"反而挤爆预算
   const LABEL_RESERVE = Math.max(HISTORY_LABEL.length, HISTORY_LABEL_PARTIAL.length);
 
-  const systemMsg = msgs.find((m) => m.role === "system");
-  const nonSystemMsgs = msgs.filter((m) => m.role !== "system");
-  const currentText = flattenMessageContent(nonSystemMsgs[nonSystemMsgs.length - 1]?.content);
+  const instructionMsgs = msgs.filter((m) => m.role === "system" || m.role === "developer");
+  const conversationMsgs = msgs.filter((m) => m.role !== "system" && m.role !== "developer");
+  const currentMsg = conversationMsgs[conversationMsgs.length - 1];
+  const currentText = flattenMessageContent(currentMsg?.content);
 
-  // 仅有一条消息且无 system 时直接返回原文
-  if (nonSystemMsgs.length <= 1 && !systemMsg) {
+  // 仅有一条对话消息且无固定指令时直接返回原文
+  if (conversationMsgs.length <= 1 && instructionMsgs.length === 0) {
     const overflow = currentText.length > SIDER_MAX_CHARS || estimateWordCount(currentText) > SIDER_MAX_WORDS;
     return { text: overflow ? "" : currentText, truncated: false, overflow };
   }
 
-  const systemPart = systemMsg ? `[System]\n${flattenMessageContent(systemMsg.content)}` : "";
-  const currentPart = `[Current Question]\n${currentText}`;
-
-  const fixedChars = (systemPart ? systemPart.length + SEP.length : 0) + currentPart.length;
-  const fixedWords = estimateWordCount((systemPart ? systemPart + "\n\n" : "") + currentPart);
+  const instructionParts = instructionMsgs.map((m) => {
+    const label = m.role === "developer" ? "Developer" : "System";
+    return `[${label}]\n${flattenMessageContent(m.content)}`;
+  });
+  const currentRole = currentMsg?.role === "assistant" ? "Assistant" : "User";
+  const currentPart = `[Current ${currentRole}]\n${currentText}`;
+  const fixedText = [...instructionParts, currentPart].join(SEP);
+  const fixedChars = fixedText.length;
+  const fixedWords = estimateWordCount(fixedText);
 
   // 固定部分自身超限: 丢掉 system 或当前问题都会让回答失去意义, 只能本地拒绝
   if (fixedChars > SIDER_MAX_CHARS || fixedWords > SIDER_MAX_WORDS) {
@@ -2455,7 +2460,7 @@ function buildBoundedContext(msgs: any[]): BoundedContext {
   }
 
   const historyBudget = SIDER_MAX_CHARS - fixedChars - SEP.length - LABEL_RESERVE;
-  const historyMsgs = nonSystemMsgs.slice(0, -1);
+  const historyMsgs = conversationMsgs.slice(0, -1);
   const selectedLines: string[] = [];
   let usedChars = 0;
   let usedWords = fixedWords;
@@ -2477,7 +2482,7 @@ function buildBoundedContext(msgs: any[]): BoundedContext {
   }
 
   const parts: string[] = [];
-  if (systemPart) parts.push(systemPart);
+  parts.push(...instructionParts);
   if (selectedLines.length > 0) {
     const label = truncated ? HISTORY_LABEL_PARTIAL : HISTORY_LABEL;
     parts.push(label + selectedLines.join("\n\n"));
@@ -2485,6 +2490,12 @@ function buildBoundedContext(msgs: any[]): BoundedContext {
   parts.push(currentPart);
 
   return { text: parts.join(SEP), truncated, overflow: false };
+}
+
+function logContextTruncation(protocol: ApiProtocol, model: string, ctx: BoundedContext): void {
+  if (ctx.truncated) {
+    console.warn("✂️ [上下文裁剪]", { protocol, model, maxChars: SIDER_MAX_CHARS, maxWords: SIDER_MAX_WORDS });
+  }
 }
 
 /** 能力门控: 上下文预算溢出时在本地拒绝, 不消耗上游额度。 */
@@ -2617,6 +2628,7 @@ async function handleChatCompletion(req: Request): Promise<Response> {
       recordFailure(modelName);
       return contextOverflowResponse("openai");
     }
+    logContextTruncation("openai", modelName, ctx);
     const fullContext = ctx.text;
 
     // 会话复用只在调用方【显式回传 X-Session-ID】时发生 (见 resolveSessionId)
@@ -3726,6 +3738,7 @@ async function handleGeminiGenerate(
       recordFailure(geminiModel);
       return contextOverflowResponse("gemini");
     }
+    logContextTruncation("gemini", geminiModel, ctx);
     const fullContext = ctx.text;
 
     // 构建 Sider 上游请求
@@ -4115,6 +4128,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
       recordFailure(anthroModel);
       return contextOverflowResponse("anthropic");
     }
+    logContextTruncation("anthropic", anthroModel, ctx);
     const fullContext = ctx.text;
 
     const enableSearch = shouldEnableAutoSearch(prompt);
@@ -4427,7 +4441,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
 // ==================== OpenAI Responses API 格式处理 ====================
 
 // Responses API 入站适配: input(字符串/数组) + instructions → messages[]
-function responsesToMessages(body: any): { messages: any[]; prompt: string } {
+function responsesToMessages(body: any): { messages: any[]; prompt: string; unsupportedType?: string } {
   const messages: any[] = [];
 
   // instructions → system message
@@ -4441,13 +4455,32 @@ function responsesToMessages(body: any): { messages: any[]; prompt: string } {
     messages.push({ role: "user", content: input });
   } else if (Array.isArray(input)) {
     for (const m of input) {
-      const role = m.role === "assistant" ? "assistant" : "user";
+      if (!m || typeof m !== "object") {
+        return { messages: [], prompt: "", unsupportedType: typeof m };
+      }
+      if (m.type && m.type !== "message") {
+        return { messages: [], prompt: "", unsupportedType: String(m.type) };
+      }
+      const role = String(m.role || "user");
+      if (!new Set(["user", "assistant", "system", "developer"]).has(role)) {
+        return { messages: [], prompt: "", unsupportedType: `role:${role}` };
+      }
       let content = "";
       if (typeof m.content === "string") {
         content = m.content;
       } else if (Array.isArray(m.content)) {
-        content = m.content.filter((b: any) => b.type === "text")
-          .map((b: any) => b.text || "").join("\n");
+        const textParts: string[] = [];
+        for (const block of m.content) {
+          const type = block?.type;
+          if (!block || typeof block.text !== "string" ||
+            !new Set(["text", "input_text", "output_text"]).has(type)) {
+            return { messages: [], prompt: "", unsupportedType: String(type || typeof block) };
+          }
+          textParts.push(block.text);
+        }
+        content = textParts.join("\n");
+      } else {
+        return { messages: [], prompt: "", unsupportedType: typeof m.content };
       }
       messages.push({ role, content });
     }
@@ -4501,7 +4534,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
     console.log(`📥 Responses ${isStream ? "stream" : "nonstream"}: model=${body.model}`);
     const outputLimits = responsesOutputLimits(body);
 
-    const { messages, prompt } = responsesToMessages(body);
+    const { messages, prompt, unsupportedType } = responsesToMessages(body);
 
     // 能力门控: Responses input 数组含 input_image 块 => not_supported
     const respHasVision = Array.isArray(body.input) && body.input.some((m: any) =>
@@ -4514,6 +4547,16 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
         "responses",
         "上游 sider 不支持视觉输入 (图像理解)。请仅发送文本。",
         "vision_not_supported",
+      );
+    }
+
+    if (unsupportedType) {
+      console.warn(`⛔ Responses 收到不支持的输入类型: ${unsupportedType}`);
+      recordFailure(modelName);
+      return notSupportedResponse(
+        "responses",
+        `Responses 输入类型 ${unsupportedType} 暂不支持；仅支持字符串或文本消息块。`,
+        "input_type_not_supported",
       );
     }
 
@@ -4560,6 +4603,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
       recordFailure(modelName);
       return contextOverflowResponse("responses");
     }
+    logContextTruncation("responses", modelName, ctx);
     const fullContext = ctx.text;
 
     const enableSearch = shouldEnableAutoSearch(prompt);

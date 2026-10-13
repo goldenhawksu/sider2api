@@ -561,6 +561,76 @@ def test_openai_non_stream_keeps_text_when_late_warning_arrives(mock_stack):
 
 
 @pytest.mark.smoke
+def test_responses_array_input_preserves_text_blocks_and_instruction_roles(mock_stack):
+    """Responses 标准 input_text 及 system/developer 角色必须原样进入上游上下文。"""
+    r = _post(mock_stack["base_url"], "/v1/responses", {
+        "model": "deepseek-v4-pro",
+        "instructions": "ROOT_INSTRUCTION",
+        "input": [
+            {"role": "system", "content": [
+                {"type": "input_text", "text": "SECOND_SYSTEM"},
+            ]},
+            {"role": "developer", "content": [
+                {"type": "input_text", "text": "DEVELOPER_RULE"},
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "output_text", "text": "EARLIER_ANSWER"},
+            ]},
+            {"role": "user", "content": [
+                {"type": "input_text", "text": "FINAL_QUESTION"},
+            ]},
+        ],
+    })
+
+    assert r.status_code == 200, r.text
+    upstream = mock_stack["state"].snapshot()
+    assert len(upstream) == 1
+    prompt = _prompt_from_sider_body(upstream[0])
+    for expected in ("ROOT_INSTRUCTION", "SECOND_SYSTEM", "DEVELOPER_RULE",
+                     "EARLIER_ANSWER", "FINAL_QUESTION"):
+        assert expected in prompt, f"上游正文丢失 {expected}: {prompt[:500]}"
+    assert prompt.count("[System]") == 2, prompt
+    assert "[Developer]\nDEVELOPER_RULE" in prompt, prompt
+    assert "Assistant: EARLIER_ANSWER" in prompt, prompt
+    assert "[Current User]\nFINAL_QUESTION" in prompt, prompt
+
+
+@pytest.mark.smoke
+def test_responses_rejects_unsupported_input_before_upstream(mock_stack):
+    """不支持的 Responses 输入项不能被静默过滤后继续请求上游。"""
+    r = _post(mock_stack["base_url"], "/v1/responses", {
+        "model": "deepseek-v4-pro",
+        "input": [{
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "tool result",
+        }],
+    })
+
+    assert r.status_code == 422, r.text
+    assert "input_type_not_supported" in r.text
+    assert mock_stack["state"].snapshot() == []
+
+
+@pytest.mark.smoke
+def test_all_system_and_developer_messages_share_fixed_context_budget(mock_stack):
+    """每条 system/developer 都属于不可裁剪固定部分，合计超限必须本地拒绝。"""
+    fixed = "a" * 24_800
+    r = _post(mock_stack["base_url"], "/v1/chat/completions", {
+        "model": "gpt-5.4-mini",
+        "messages": [
+            {"role": "system", "content": fixed},
+            {"role": "developer", "content": fixed},
+            {"role": "user", "content": "FINAL_QUESTION"},
+        ],
+    })
+
+    assert r.status_code == 400, r.text
+    assert "context_length_exceeded" in r.text
+    assert mock_stack["state"].snapshot() == []
+
+
+@pytest.mark.smoke
 def test_openai_stop_sequence_and_max_tokens_are_applied(mock_stack):
     stop_resp = _post(mock_stack["base_url"], "/v1/chat/completions", {
         "model": "glm-5",
