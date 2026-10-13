@@ -37,6 +37,7 @@ const SIDER_MAX_WORDS = 6000;
 // 防止 nginx / 负载均衡 / 客户端在无字节间隔时掐断连接。0 关闭心跳。
 // 默认 15s，小于常见 30~60s 代理空闲超时。
 const SSE_PING_INTERVAL_MS = parseInt(Deno.env.get("SSE_PING_INTERVAL_MS") || "15000", 10);
+const SERVICE_VERSION = Deno.env.get("SERVICE_VERSION") || Deno.env.get("DENO_DEPLOYMENT_ID") || "dev";
 
 // ==================== 上游调用限速门控 ====================
 // 对 sider 上游的每次调用做模型级限速，防止单模型突发流量打爆上游额度/触发 IP 级限流。
@@ -554,6 +555,51 @@ function geminiFinishReason(reason: OutputStopReason): "STOP" | "MAX_TOKENS" {
 //   protocolErrorResponse()  -> 各协议原生错误结构 (+ 所有 429/503 都带 Retry-After)
 type ApiProtocol = "openai" | "responses" | "anthropic" | "gemini";
 
+interface RequestTrace {
+  requestId: string;
+  protocol: ApiProtocol;
+  externalModel: string;
+  upstreamModel: string;
+  startedAt: number;
+  queueWaitMs: number;
+  responseHeaderMs: number | null;
+  firstContentMs: number | null;
+  finished: boolean;
+}
+
+function createRequestTrace(req: Request, protocol: ApiProtocol): RequestTrace {
+  const supplied = req.headers.get("X-Request-ID")?.trim() || "";
+  const requestId = (supplied || crypto.randomUUID()).replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 128);
+  return {
+    requestId,
+    protocol,
+    externalModel: "",
+    upstreamModel: "",
+    startedAt: Date.now(),
+    queueWaitMs: 0,
+    responseHeaderMs: null,
+    firstContentMs: null,
+    finished: false,
+  };
+}
+
+function finishRequestTrace(trace: RequestTrace | undefined, endReason: string): void {
+  if (!trace || trace.finished) return;
+  trace.finished = true;
+  console.log("📈 [请求完成] " + JSON.stringify({
+    requestId: trace.requestId,
+    protocol: trace.protocol,
+    externalModel: trace.externalModel,
+    upstreamModel: trace.upstreamModel,
+    queueWaitMs: trace.queueWaitMs,
+    responseHeaderMs: trace.responseHeaderMs,
+    firstContentMs: trace.firstContentMs,
+    totalMs: Date.now() - trace.startedAt,
+    endReason,
+    version: SERVICE_VERSION,
+  }));
+}
+
 interface UpstreamErrorDetail {
   statusCode: number;
   /** 统一错误类型 (与协议无关), 由 renderer 决定落到各协议的哪个字段。 */
@@ -820,6 +866,19 @@ function detectVisionInput(messages: any[]): boolean {
     }
   }
   return false;
+}
+
+/** 检测四种入站协议里的工具调用/结果历史，避免转换器把它们静默过滤。 */
+function detectToolHistory(value: any): boolean {
+  if (Array.isArray(value)) return value.some(detectToolHistory);
+  if (!value || typeof value !== "object") return false;
+  const type = String(value.type || "");
+  if (new Set(["tool_use", "tool_result", "tool_call", "function_call", "function_call_output"])
+    .has(type)) return true;
+  if (value.role === "tool" || value.tool_call_id || value.tool_use_id) return true;
+  if (Array.isArray(value.tool_calls) && value.tool_calls.length > 0) return true;
+  if (value.functionCall || value.function_call || value.functionResponse || value.function_response) return true;
+  return Object.values(value).some(detectToolHistory);
 }
 
 // 标准化 not_supported 错误响应 (能力门控统一出口): HTTP 422 + 该协议的原生错误结构。
@@ -1865,13 +1924,18 @@ interface UpstreamCall {
   /** 把上游业务码按统一分类器翻译成错误详情 (已带该模型专属的 1135 兜底时长)。 */
   describeBusinessError(code: number, msg?: string): UpstreamErrorDetail;
   /** 消费方正常消费完响应体后调用: 结算成功/失败并释放槽位。 */
-  complete(): void;
+  complete(reason?: string): void;
   /** 幂等释放 (取消/异常路径); 同样会结算。 */
-  release(): void;
+  release(reason?: string): void;
 }
 
 /** 没有租约的响应 (预检拒绝 / 排队失败 / 超时): 申报与释放都是空操作。 */
-function detachedCall(response: Response): UpstreamCall {
+function detachedCall(
+  response: Response,
+  trace?: RequestTrace,
+  endReason = "rejected",
+): UpstreamCall {
+  finishRequestTrace(trace, endReason);
   return {
     response,
     reportSuccess() {},
@@ -1958,25 +2022,30 @@ async function fetchSiderRateLimited(
   init: RequestInit,
   protocol: ApiProtocol,
   clientSignal?: AbortSignal,
+  trace?: RequestTrace,
 ): Promise<UpstreamCall> {
+  if (trace) trace.upstreamModel = model;
   // 1. 预检 (不认领半开探测名额): 账号闸门/熔断/超配额 -> 直接拒, 不触达上游
   const pre = checkRateLimit(model);
   if (!pre.allowed) {
-    return detachedCall(gateRejectionResponse(protocol, model, pre));
+    return detachedCall(gateRejectionResponse(protocol, model, pre), trace, "gate_rejected");
   }
 
   // 2. 并发闸门: 上游单并发, 满则 FIFO 排队而非直接失败
   let releaseSlot: () => void;
+  const queueStartedAt = Date.now();
   try {
     releaseSlot = await acquireUpstreamSlot(clientSignal);
+    if (trace) trace.queueWaitMs = Date.now() - queueStartedAt;
   } catch (err) {
+    if (trace) trace.queueWaitMs = Date.now() - queueStartedAt;
     if (clientSignal?.aborted) {
       return detachedCall(protocolErrorResponse(protocol, {
         statusCode: 499,
         type: "canceled",
         reason: "client_disconnected",
         message: "客户端已断开连接。",
-      }));
+      }), trace, "client_disconnected");
     }
     const waitSec = Math.ceil(UPSTREAM_QUEUE_WAIT_MS / 1000);
     const reason = err instanceof UpstreamQueueFullError
@@ -1986,7 +2055,7 @@ async function fetchSiderRateLimited(
       allowed: false,
       retryAfterSec: Math.max(1, Math.ceil(waitSec / 2)),
       reason,
-    }));
+    }), trace, err instanceof UpstreamQueueFullError ? "queue_full" : "queue_timeout");
   }
 
   // 3. 二次准入: 排队期间前序请求可能已经触发 1135 熔断或鉴权故障。
@@ -1994,7 +2063,7 @@ async function fetchSiderRateLimited(
   const admitted = admitUpstreamCall(model);
   if (!admitted.allowed) {
     releaseSlot();
-    return detachedCall(gateRejectionResponse(protocol, model, admitted));
+    return detachedCall(gateRejectionResponse(protocol, model, admitted), trace, "gate_rejected_after_queue");
   }
 
   // 4. 租约: 三段超时 + 结果申报 + 幂等释放
@@ -2033,12 +2102,16 @@ async function fetchSiderRateLimited(
     releaseSlot();
   };
   /** 结算: creditSuccess=true 时 (消费方正常读完) 才可能记一次成功。 */
-  const settle = (creditSuccess: boolean) => {
+  const settle = (creditSuccess: boolean, endReason: string) => {
     if (settled) return;
     settled = true;
     if (creditSuccess && fatalCode === 0 && sawValidData && timedOut === null) {
       recordUpstreamSuccess(model);
     }
+    const finalReason = creditSuccess && fatalCode !== 0
+      ? `completed_with_business_code_${fatalCode}`
+      : endReason;
+    finishRequestTrace(trace, finalReason);
     releaseLease();
   };
   clientAbortHandler = () => {
@@ -2046,7 +2119,7 @@ async function fetchSiderRateLimited(
     try {
       controller.abort(clientSignal?.reason ?? new DOMException("client disconnected", "AbortError"));
     } catch { /* 已中止 */ }
-    settle(false);
+    settle(false, "client_disconnected");
   };
   if (clientSignal) {
     clientSignal.addEventListener("abort", clientAbortHandler, { once: true });
@@ -2058,7 +2131,7 @@ async function fetchSiderRateLimited(
       type: "canceled",
       reason: "client_disconnected",
       message: "客户端已断开连接。",
-    }));
+    }), trace, "client_disconnected");
   }
   const armIdleWatchdog = () => {
     if (released) return;
@@ -2080,12 +2153,20 @@ async function fetchSiderRateLimited(
     controller.abort(new UpstreamTimeoutError("total"));
   }, UPSTREAM_TOTAL_TIMEOUT_MS);
   // 兜底: 任何路径都没释放时, 到点强制释放 (正常路径永远先于它释放)
-  timers.push(headerTimer, totalTimer, setTimeout(releaseLease, UPSTREAM_SLOT_MAX_HOLD_MS));
+  timers.push(headerTimer, totalTimer, setTimeout(() => {
+    try {
+      controller.abort(new UpstreamTimeoutError("total"));
+    } catch { /* 已中止 */ }
+    settle(false, "lease_timeout");
+  }, UPSTREAM_SLOT_MAX_HOLD_MS));
 
   const call: UpstreamCall = {
     response: new Response(null, { status: 502 }),
     reportSuccess() {
       sawValidData = true;
+      if (trace && trace.firstContentMs === null) {
+        trace.firstContentMs = Date.now() - trace.startedAt;
+      }
     },
     reportBusinessError(code: number, msg?: string) {
       if (FATAL_GATE_CODES.has(code)) fatalCode = code;
@@ -2094,14 +2175,14 @@ async function fetchSiderRateLimited(
     describeBusinessError(code: number, msg = "") {
       return classifyUpstreamError(code, msg, modelBreakerMs(model));
     },
-    complete() {
-      settle(true);
+    complete(reason = "completed") {
+      settle(true, reason);
     },
-    release() {
+    release(reason = "canceled") {
       try {
         controller.abort(new DOMException("upstream call released", "AbortError"));
       } catch { /* 已中止 */ }
-      settle(false);
+      settle(false, reason);
     },
   };
 
@@ -2109,12 +2190,13 @@ async function fetchSiderRateLimited(
   let res: Response;
   try {
     res = await fetch(url, { ...init, signal: controller.signal });
+    if (trace) trace.responseHeaderMs = Date.now() - trace.startedAt;
   } catch (err) {
     const stage = timedOut;
-    settle(false);
+    settle(false, stage !== null ? `timeout_${stage}` : clientSignal?.aborted ? "client_disconnected" : "fetch_error");
     if (stage !== null) {
       console.warn(`⏱️ [上游超时] ${model} 阶段=${stage}`);
-      return detachedCall(protocolErrorResponse(protocol, timeoutDetail(stage)));
+      return detachedCall(protocolErrorResponse(protocol, timeoutDetail(stage)), trace, `timeout_${stage}`);
     }
     if (clientSignal?.aborted) {
       return detachedCall(protocolErrorResponse(protocol, {
@@ -2122,14 +2204,14 @@ async function fetchSiderRateLimited(
         type: "canceled",
         reason: "client_disconnected",
         message: "客户端已断开连接。",
-      }));
+      }), trace, "client_disconnected");
     }
     console.error("❌ 上游 fetch 失败:", err);
     return detachedCall(protocolErrorResponse(protocol, {
       statusCode: 502,
       type: "upstream_error",
       message: `上游连接失败: ${err instanceof Error ? err.message : String(err)}`,
-    }));
+    }), trace, "fetch_error");
   }
   clearTimeout(headerTimer);
 
@@ -2148,19 +2230,19 @@ async function fetchSiderRateLimited(
     } else if (res.status === 429) {
       shrinkQuota(model);
     }
-    settle(false);
+    settle(false, "upstream_http_error");
     console.error(`❌ 上游 HTTP ${res.status}:`, rawBody.slice(0, 200));
-    return detachedCall(protocolErrorResponse(protocol, detail));
+    return detachedCall(protocolErrorResponse(protocol, detail), trace, "upstream_http_error");
   }
 
   // 7. 无响应体: 拿不到任何数据, 不记成功
   if (!res.body) {
-    settle(false);
+    settle(false, "empty_response_body");
     return detachedCall(new Response(null, {
       status: res.status,
       statusText: res.statusText,
       headers: res.headers,
-    }));
+    }), trace, "empty_response_body");
   }
 
   // 8. 包装响应体: 流空闲看门狗 + 结束结算 + 取消即释放
@@ -2180,7 +2262,7 @@ async function fetchSiderRateLimited(
           } catch { /* 已关闭 */ }
           // 流读完了, 但消费方还没申报; 给一小段宽限期, 逾期强制结算
           if (!released) {
-            timers.push(setTimeout(() => settle(false), UPSTREAM_STREAM_END_GRACE_MS));
+            timers.push(setTimeout(() => settle(false, "consumer_did_not_settle"), UPSTREAM_STREAM_END_GRACE_MS));
           }
           return;
         }
@@ -2194,7 +2276,7 @@ async function fetchSiderRateLimited(
         try {
           await upstreamReader.cancel(err);
         } catch { /* 已关闭 */ }
-        settle(false);
+        settle(false, timedOut !== null ? `timeout_${timedOut}` : "stream_error");
         // 超时必须在响应流内部暴露成可识别的错误类型, 否则消费方只能报 500
         const failure = timedOut !== null ? new UpstreamTimeoutError(timedOut) : err;
         try {
@@ -2210,7 +2292,7 @@ async function fetchSiderRateLimited(
       try {
         controller.abort(reason);
       } catch { /* 已中止 */ }
-      settle(false);
+      settle(false, clientSignal?.aborted ? "client_disconnected" : "upstream_stream_canceled");
       return upstreamReader.cancel(reason);
     },
   });
@@ -2650,6 +2732,7 @@ function resolveSessionId(req: Request): SessionInfo {
 // 处理文本对话请求
 async function handleChatCompletion(req: Request): Promise<Response> {
   let modelName = "sider"; // 函数级: catch 出口的失败统计也要用
+  const trace = createRequestTrace(req, "openai");
   try {
     const requestBody = await req.json();
     console.log("📥 收到聊天请求:", {
@@ -2659,6 +2742,7 @@ async function handleChatCompletion(req: Request): Promise<Response> {
     });
 
     modelName = requestBody.model || "sider";
+    trace.externalModel = modelName;
     // 未知模型一律拒绝 (P2): 除显式 "sider" 智能路由外, MODEL_MAPPING 里没有的名字都是笔误。
     // 静默回退会让调用方以为在用另一个模型, 同时白白消耗一次真实上游额度。
     const siderModel = resolveSiderModel(modelName);
@@ -2667,6 +2751,7 @@ async function handleChatCompletion(req: Request): Promise<Response> {
       recordFailure(modelName); // 失败统计: 模型门控拒绝
       return modelNotFoundResponse("openai", modelName);
     }
+    trace.upstreamModel = siderModel;
 
     const isStreaming = requestBody.stream ?? false;
     const outputLimits = openAIOutputLimits(requestBody);
@@ -2684,6 +2769,16 @@ async function handleChatCompletion(req: Request): Promise<Response> {
         "上游 sider 不支持视觉输入 (图像理解)。请仅发送文本内容。" +
         "如需图像生成, 请用绘图关键词描述 (如'画一只猫') 或调用 /v1/images/generations。",
         "vision_not_supported",
+      );
+    }
+
+    if (detectToolHistory(messages)) {
+      console.warn("⛔ 收到工具调用历史, 上游不支持自定义工具执行; 返回 not_supported。");
+      recordFailure(modelName);
+      return notSupportedResponse(
+        "openai",
+        "上游 sider 不支持自定义工具调用及其历史消息，请仅发送文本对话历史。",
+        "tools_not_supported",
       );
     }
 
@@ -2762,7 +2857,9 @@ async function handleChatCompletion(req: Request): Promise<Response> {
       console.log(`🆕 无状态会话: ${sessionId} (未回传 X-Session-ID, 本次不读写上游会话)`);
     }
 
-    if (isImageGen) {
+    if (toolChoiceNone) {
+      siderRequest.tools = { auto: [] };
+    } else if (isImageGen) {
       console.log("🎨 检测到图像生成请求");
       siderRequest.tools = {
         image: {
@@ -2799,7 +2896,7 @@ async function handleChatCompletion(req: Request): Promise<Response> {
         "X-App-Version": "5.21.2"
       },
       body: JSON.stringify(siderRequest)
-    }, "openai", req.signal);
+    }, "openai", req.signal, trace);
     const siderResponse = call.response;
 
     if (!siderResponse.ok) {
@@ -2819,6 +2916,7 @@ async function handleChatCompletion(req: Request): Promise<Response> {
     return handleStreamingResponse(call, modelName, isImageGen, sessionInfo, outputLimits, fullContext);
 
   } catch (error: any) {
+    finishRequestTrace(trace, "handler_error");
     console.error("❌ 处理请求异常:", error);
     recordFailure(modelName); // 失败统计: 异常出口
     return handlerFailureResponse("openai", error);
@@ -2855,7 +2953,7 @@ async function handleNonStreamingResponse(
   })) {
     if (ev.kind === "business_error") {
       if (isIgnorableLateBusinessWarning(ev.code, Boolean(fullText || imageUrl))) continue;
-      call.release();
+      call.release("business_error");
       recordFailure(modelName);
       return protocolErrorResponse("openai", call.describeBusinessError(ev.code, ev.msg));
     }
@@ -2910,13 +3008,13 @@ async function handleNonStreamingResponse(
     }
   }
   if (!sawDone) {
-    call.release();
+    call.release("upstream_truncated");
     recordFailure(modelName);
     return protocolErrorResponse("openai", upstreamTruncatedDetail());
   }
 
   if (!fullText && !imageUrl) {
-    call.release();
+    call.release("empty_output");
     recordFailure(modelName);
     return new Response(JSON.stringify({
       error: {
@@ -2928,10 +3026,9 @@ async function handleNonStreamingResponse(
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
   }
-  // 只有显式完成且确有输出才结算成功。
-  call.complete();
-
   const limited = applyOutputLimits(fullText, outputLimits);
+  // 只有显式完成且确有输出才结算成功。
+  call.complete(limited.stopReason);
   let content = limited.text;
 
   // 图像生成优化: 在文本中添加Markdown格式的图片URL (双保险)
@@ -3047,13 +3144,15 @@ function handleStreamingResponse(
       const reader = siderResponse.body?.getReader();
       if (!reader) {
         controller.error(new Error("无法获取响应流"));
-        call.release();
+        call.release("missing_response_body");
         return;
       }
 
       const encoder = new TextEncoder();
       const hb = createSSEHeartbeat(controller, encoder, COMMENT_PING_FRAME);
       closeHeartbeat = () => hb.close();
+      const responseId = `chatcmpl-${crypto.randomUUID()}`;
+      const responseCreated = Math.floor(Date.now() / 1000);
       let hasStarted = false;
       let firstChunkAt: number | null = null;
       const streamT0 = Date.now();
@@ -3079,9 +3178,9 @@ function handleStreamingResponse(
       const enqueueTextChunk = (text: string, finishReason: "stop" | "length" | null = null) => {
         if (!text && finishReason === null) return;
         controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-          id: `chatcmpl-${Date.now()}`,
+          id: responseId,
           object: "chat.completion.chunk",
-          created: Math.floor(Date.now() / 1000),
+          created: responseCreated,
           model: modelName,
           choices: [{
             delta: text ? { content: text } : {},
@@ -3102,9 +3201,9 @@ function handleStreamingResponse(
         if (hb.closed) return;
         try {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-            id: `chatcmpl-${Date.now()}`,
+            id: responseId,
             object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
+            created: responseCreated,
             model: modelName,
             choices: [{ delta: {}, finish_reason: "error", index: 0 }],
             error: {
@@ -3135,9 +3234,9 @@ function handleStreamingResponse(
             // 如果是图像生成且收集到了图像,在DONE前发送元数据chunk
             if (isImageGen && imageUrls.length > 0) {
               const metadataChunk = {
-                id: `chatcmpl-${Date.now()}`,
+                id: responseId,
                 object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
+                created: responseCreated,
                 model: modelName,
                 choices: [{
                   delta: {
@@ -3185,7 +3284,7 @@ function handleStreamingResponse(
             }
 
             await finishOpenAIStream(flushed.stopReason);
-            call.complete();
+            call.complete(flushed.stopReason);
             return;
           }
 
@@ -3200,7 +3299,7 @@ function handleStreamingResponse(
               enqueueTextChunk(flushed.text);
             }
             finishOpenAIError(call.describeBusinessError(ev.code, ev.msg));
-            call.release();
+            call.release("business_error");
             return;
           }
 
@@ -3239,7 +3338,7 @@ function handleStreamingResponse(
               }
               if (textResult.done) {
                 await finishOpenAIStream(textResult.stopReason || "end_turn");
-                call.complete();
+                call.complete(textResult.stopReason || "completed");
                 return;
               }
               break;
@@ -3258,9 +3357,9 @@ function handleStreamingResponse(
                 }
                 // 发送文本提示 + Markdown格式的图片URL (双保险)
                 openAIChunk = {
-                  id: `chatcmpl-${Date.now()}`,
+                  id: responseId,
                   object: "chat.completion.chunk",
-                  created: Math.floor(Date.now() / 1000),
+                  created: responseCreated,
                   model: modelName,
                   choices: [{
                     delta: {
@@ -3292,9 +3391,9 @@ function handleStreamingResponse(
                 : "";
               if (reasoningText) {
                 openAIChunk = {
-                  id: `chatcmpl-${Date.now()}`,
+                  id: responseId,
                   object: "chat.completion.chunk",
-                  created: Math.floor(Date.now() / 1000),
+                  created: responseCreated,
                   model: modelName,
                   choices: [{
                     delta: {
@@ -3331,11 +3430,11 @@ function handleStreamingResponse(
           enqueueTextChunk(flushed.text);
         }
         finishOpenAIError(upstreamTruncatedDetail());
-        call.release();
+        call.release("upstream_truncated");
 
       } catch (error) {
         console.error("❌ 流式处理错误:", error);
-        call.release();
+        call.release("stream_error");
         finishOpenAIError(upstreamErrorFromException(error) ?? {
           statusCode: 502,
           type: "upstream_error",
@@ -3346,7 +3445,7 @@ function handleStreamingResponse(
     cancel() {
       // 客户端提前断开: 立即结算并释放上游并发槽位
       closeHeartbeat();
-      call.release();
+      call.release("client_disconnected");
     }
   });
 
@@ -3365,6 +3464,7 @@ function handleStreamingResponse(
 // 处理图像生成请求(专用端点)
 async function handleImageGeneration(req: Request): Promise<Response> {
   let model = "dall-e-3"; // 函数级: catch 出口的失败统计也要用
+  const trace = createRequestTrace(req, "openai");
   try {
     const requestBody = await req.json();
     console.log("🎨 收到图像生成请求:", requestBody);
@@ -3391,6 +3491,7 @@ async function handleImageGeneration(req: Request): Promise<Response> {
 
     // 可选参数 - 完全符合 OpenAI 标准
     model = requestBody.model || "dall-e-3";  // 默认模型
+    trace.externalModel = model;
     const n = Math.min(Math.max(parseInt(requestBody.n) || 1, 1), 10);  // 1-10 之间
     const size = requestBody.size || "1024x1024";  // 支持: 256x256, 512x512, 1024x1024, 1024x1792, 1792x1024
     const quality = requestBody.quality || "standard";  // standard 或 hd
@@ -3474,6 +3575,7 @@ async function handleImageGeneration(req: Request): Promise<Response> {
     // 模型命名空间 (dall-e-2/3、gpt-image-1 等), 它们本来就不在 MODEL_MAPPING 里,
     // 上游 sider 也没有对应条目。故仍回退到智能路由, 由 sider 自己决定用哪个出图模型。
     siderRequest.model = MODEL_MAPPING[model] || "sider";
+    trace.upstreamModel = siderRequest.model;
     siderRequest.stream = true; // 图像生成必须使用流式以接收图像
 
     console.log("🚀 发送图像生成请求到 Sider");
@@ -3497,7 +3599,7 @@ async function handleImageGeneration(req: Request): Promise<Response> {
         "X-App-Version": "5.21.2"
       },
       body: JSON.stringify(siderRequest)
-    }, "openai", req.signal);
+    }, "openai", req.signal, trace);
     const siderResponse = call.response;
 
     if (!siderResponse.ok) {
@@ -3510,7 +3612,7 @@ async function handleImageGeneration(req: Request): Promise<Response> {
     const imageUrls: string[] = [];
     const reader = siderResponse.body?.getReader();
     if (!reader) {
-      call.release();
+      call.release("missing_response_body");
       throw new Error("无法获取响应流");
     }
 
@@ -3540,12 +3642,10 @@ async function handleImageGeneration(req: Request): Promise<Response> {
         upstreamErrCode = ev.code;
         upstreamErrMsg = ev.msg;
         console.error(`❌ Sider API 错误 [行${lineCount}]:`, { code: ev.code, msg: ev.msg });
-        if (imageUrls.length === 0) {
-          recordFailure(MODEL_MAPPING[model] || "sider");
-          call.complete();
-          return protocolErrorResponse("openai", call.describeBusinessError(ev.code, ev.msg));
-        }
-        continue;
+        if (isIgnorableLateBusinessWarning(ev.code, imageUrls.length > 0)) continue;
+        recordFailure(MODEL_MAPPING[model] || "sider");
+        call.release("business_error");
+        return protocolErrorResponse("openai", call.describeBusinessError(ev.code, ev.msg));
       }
 
       if (ev.kind === "done") {
@@ -3629,9 +3729,6 @@ async function handleImageGeneration(req: Request): Promise<Response> {
       }
     }
 
-    // 提前 break 时, iterateSiderEvents 的 finally 会 cancel 上游 reader, 槽位及时释放
-    call.complete();
-
     console.log(`\n📊 流处理完成统计:`);
     console.log(`   - 总行数: ${lineCount}`);
     console.log(`   - 是否有工具调用: ${hasToolCall ? "是" : "否"}`);
@@ -3643,6 +3740,7 @@ async function handleImageGeneration(req: Request): Promise<Response> {
 
     // 增强的错误处理
     if (imageUrls.length === 0) {
+      call.release(hasDoneMarker ? "empty_output" : "upstream_truncated");
       // 提供更详细的错误信息
       let errorMessage = "未能获取生成的图像";
       const debugInfo = {
@@ -3665,6 +3763,14 @@ async function handleImageGeneration(req: Request): Promise<Response> {
 
       throw new Error(`${errorMessage}。调试信息: ${JSON.stringify(debugInfo)}`);
     }
+
+    if (!hasDoneMarker && imageUrls.length < n) {
+      call.release("upstream_truncated");
+      throw new Error(`上游响应在完成标记前异常截断，仅收到 ${imageUrls.length}/${n} 个图像。`);
+    }
+
+    // 达到本地请求数量时可提前取消上游，其余路径必须有显式完成标记。
+    call.complete(hasDoneMarker ? "completed" : "image_target_reached");
 
     console.log(`✅ 成功收集到 ${imageUrls.length} 个图像`);
 
@@ -3695,6 +3801,7 @@ async function handleImageGeneration(req: Request): Promise<Response> {
     });
 
   } catch (error: any) {
+    finishRequestTrace(trace, "handler_error");
     console.error("❌ 处理请求异常:", error);
     recordFailure(MODEL_MAPPING[model] || "sider"); // 失败统计: 异常/上游错误出口
     return handlerFailureResponse("openai", error);
@@ -3767,6 +3874,8 @@ function buildGeminiResponse(
 async function handleGeminiGenerate(
   req: Request, geminiModel: string, isStream: boolean
 ): Promise<Response> {
+  const trace = createRequestTrace(req, "gemini");
+  trace.externalModel = geminiModel;
   try {
     const body = await req.json();
     console.log(`📥 Gemini ${isStream ? "stream" : "generate"}: model=${geminiModel}`);
@@ -3786,6 +3895,16 @@ async function handleGeminiGenerate(
         "gemini",
         "上游 sider 不支持视觉输入 (图像理解)。请仅发送文本。",
         "vision_not_supported",
+      );
+    }
+
+    if (detectToolHistory(body.contents)) {
+      console.warn("⛔ Gemini 收到函数调用历史, 上游不支持; 返回 not_supported。");
+      recordFailure(geminiModel);
+      return notSupportedResponse(
+        "gemini",
+        "上游 sider 不支持自定义函数调用及其历史消息，请仅发送文本对话历史。",
+        "tools_not_supported",
       );
     }
 
@@ -3822,6 +3941,7 @@ async function handleGeminiGenerate(
       recordFailure(geminiModel);
       return modelNotFoundResponse("gemini", geminiModel);
     }
+    trace.upstreamModel = siderModel;
 
     const isThink = shouldEnableThinkMode(geminiModel);
     const lastMsg = messages[messages.length - 1];
@@ -3847,9 +3967,9 @@ async function handleGeminiGenerate(
     }];
 
     const enableSearch = shouldEnableAutoSearch(prompt);
-    siderRequest.tools = {
-      auto: enableSearch ? ["search", "data_analysis"] : ["data_analysis"]
-    };
+    siderRequest.tools = geminiMode === "NONE"
+      ? { auto: [] }
+      : { auto: enableSearch ? ["search", "data_analysis"] : ["data_analysis"] };
 
     // 发送上游请求: 三段超时/排队/配额/错误分类统一由 UpstreamLease 负责
     const call = await fetchSiderRateLimited(siderModel, SIDER_API_ENDPOINT, {
@@ -3865,7 +3985,7 @@ async function handleGeminiGenerate(
         "X-App-Version": "5.21.2"
       },
       body: JSON.stringify(siderRequest)
-    }, "gemini", req.signal);
+    }, "gemini", req.signal, trace);
     const siderResponse = call.response;
 
     if (!siderResponse.ok) {
@@ -3886,7 +4006,7 @@ async function handleGeminiGenerate(
       })) {
         if (ev.kind === "business_error") {
           if (isIgnorableLateBusinessWarning(ev.code, Boolean(fullText))) continue;
-          call.release();
+          call.release("business_error");
           recordFailure(geminiModel);
           return protocolErrorResponse("gemini", call.describeBusinessError(ev.code, ev.msg));
         }
@@ -3905,19 +4025,19 @@ async function handleGeminiGenerate(
         }
       }
       if (!sawDone) {
-        call.release();
+        call.release("upstream_truncated");
         recordFailure(geminiModel);
         return protocolErrorResponse("gemini", upstreamTruncatedDetail());
       }
       if (!fullText) {
-        call.release();
+        call.release("empty_output");
         recordFailure(geminiModel);
         return new Response(JSON.stringify({
           error: { message: "上游响应没有生成任何文本内容。", type: "upstream_error" }
         }), { status: 502, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
       }
-      call.complete();
       const limited = applyOutputLimits(fullText, outputLimits);
+      call.complete(limited.stopReason);
       // 用量统计: Gemini 非流式
       recordUsage({
         model: geminiModel,
@@ -3949,7 +4069,7 @@ async function handleGeminiGenerate(
         const reader = siderResponse.body?.getReader();
         if (!reader) {
           controller.error(new Error("无法获取响应流"));
-          call.release();
+          call.release("missing_response_body");
           return;
         }
         const encoder = new TextEncoder();
@@ -4012,7 +4132,7 @@ async function handleGeminiGenerate(
                 enqueueGeminiText(flushed.text);
               }
               finishGeminiStream(flushed.stopReason);
-              call.complete();
+              call.complete(flushed.stopReason);
               return;
             }
 
@@ -4027,7 +4147,7 @@ async function handleGeminiGenerate(
                 enqueueGeminiText(flushed.text);
               }
               finishGeminiError(detail);
-              call.release();
+              call.release("business_error");
               return;
             }
 
@@ -4044,7 +4164,7 @@ async function handleGeminiGenerate(
               }
               if (textResult.done) {
                 finishGeminiStream(textResult.stopReason || "end_turn");
-                call.complete();
+                call.complete(textResult.stopReason || "completed");
                 return;
               }
             } else if (d.type === "reasoning_content") {
@@ -4073,10 +4193,10 @@ async function handleGeminiGenerate(
             enqueueGeminiText(flushed.text);
           }
           finishGeminiError(upstreamTruncatedDetail());
-          call.release();
+          call.release("upstream_truncated");
         } catch (err: any) {
           console.error("❌ Gemini流式错误:", err);
-          call.release();
+          call.release("stream_error");
           finishGeminiError(upstreamErrorFromException(err) ?? {
             statusCode: 502,
             type: "upstream_error",
@@ -4087,7 +4207,7 @@ async function handleGeminiGenerate(
       cancel() {
         // 客户端提前断开: 立即结算并释放上游并发槽位
         closeHeartbeat();
-        call.release();
+        call.release("client_disconnected");
       }
     });
 
@@ -4100,6 +4220,7 @@ async function handleGeminiGenerate(
       }
     });
   } catch (error: any) {
+    finishRequestTrace(trace, "handler_error");
     console.error("❌ 处理请求异常:", error);
     recordFailure(geminiModel); // 失败统计: 异常出口
     return handlerFailureResponse("gemini", error);
@@ -4168,6 +4289,7 @@ function buildAnthropicResponse(
 // 处理 Anthropic 请求 (非流式 + 流式)
 async function handleAnthropicMessage(req: Request): Promise<Response> {
   let anthroModel = "claude-sonnet-4.6"; // 函数级: catch 出口的失败统计也要用
+  const trace = createRequestTrace(req, "anthropic");
   try {
     const body = await req.json();
     const isStream = body.stream === true;
@@ -4178,6 +4300,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
 
     // 提前赋值模型名: 视觉门控等早期出口的失败统计需要真实模型 (而非默认值)
     anthroModel = body.model || "claude-sonnet-4.6";
+    trace.externalModel = anthroModel;
 
     // 能力门控: Anthropic content 块含 {type:"image",source:{...}} => not_supported
     const anthroHasVision = (body.messages || []).some((m: any) =>
@@ -4190,6 +4313,16 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
         "anthropic",
         "上游 sider 不支持视觉输入 (图像理解)。请仅发送文本。",
         "vision_not_supported",
+      );
+    }
+
+    if (detectToolHistory(body.messages)) {
+      console.warn("⛔ Anthropic 收到工具调用历史, 上游不支持; 返回 not_supported。");
+      recordFailure(anthroModel);
+      return notSupportedResponse(
+        "anthropic",
+        "上游 sider 不支持自定义工具调用及其历史消息，请仅发送文本对话历史。",
+        "tools_not_supported",
       );
     }
 
@@ -4225,6 +4358,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
       recordFailure(anthroModel);
       return modelNotFoundResponse("anthropic", anthroModel);
     }
+    trace.upstreamModel = siderModel;
 
     const isThink = shouldEnableThinkMode(anthroModel);
     const msgId = `msg_${Date.now()}`;
@@ -4251,9 +4385,9 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
     siderRequest.multi_content = [{
       type: "text", text: fullContext, user_input_text: fullContext,
     }];
-    siderRequest.tools = {
-      auto: enableSearch ? ["search", "data_analysis"] : ["data_analysis"],
-    };
+    siderRequest.tools = anthroToolNone
+      ? { auto: [] }
+      : { auto: enableSearch ? ["search", "data_analysis"] : ["data_analysis"] };
 
     // 发送上游请求: 三段超时/排队/配额/错误分类统一由 UpstreamLease 负责
     const call = await fetchSiderRateLimited(siderModel, SIDER_API_ENDPOINT, {
@@ -4266,7 +4400,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
         "X-App-Name": "ChitChat_Edge_Ext", "X-App-Version": "5.21.2",
       },
       body: JSON.stringify(siderRequest),
-    }, "anthropic", req.signal);
+    }, "anthropic", req.signal, trace);
     const siderResp = call.response;
 
     if (!siderResp.ok) {
@@ -4287,7 +4421,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
       })) {
         if (ev.kind === "business_error") {
           if (isIgnorableLateBusinessWarning(ev.code, Boolean(fullText))) continue;
-          call.release();
+          call.release("business_error");
           recordFailure(anthroModel);
           return protocolErrorResponse("anthropic", call.describeBusinessError(ev.code, ev.msg));
         }
@@ -4306,12 +4440,12 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
         }
       }
       if (!sawDone) {
-        call.release();
+        call.release("upstream_truncated");
         recordFailure(anthroModel);
         return protocolErrorResponse("anthropic", upstreamTruncatedDetail());
       }
       if (!fullText) {
-        call.release();
+        call.release("empty_output");
         recordFailure(anthroModel);
         return protocolErrorResponse("anthropic", {
           statusCode: 502,
@@ -4319,8 +4453,8 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
           message: "上游响应没有生成任何文本内容。",
         });
       }
-      call.complete();
       const limited = applyOutputLimits(fullText, outputLimits);
+      call.complete(limited.stopReason);
       // 用量统计: Anthropic 非流式
       recordUsage({
         model: anthroModel,
@@ -4355,7 +4489,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
         const reader = siderResp.body?.getReader();
         if (!reader) {
           controller.error(new Error("无响应流"));
-          call.release();
+          call.release("missing_response_body");
           return;
         }
         const encoder = new TextEncoder();
@@ -4462,7 +4596,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
                 });
               }
               finishOk(flushed.stopReason);
-              call.complete();
+              call.complete(flushed.stopReason);
               return;
             }
 
@@ -4482,7 +4616,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
                 });
               }
               finishError(call.describeBusinessError(ev.code, ev.msg));
-              call.release();
+              call.release("business_error");
               return;
             }
 
@@ -4501,7 +4635,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
               }
               if (textResult.done) {
                 finishOk(textResult.stopReason || "end_turn", textResult.stopSequence || null);
-                call.complete();
+                call.complete(textResult.stopReason || "completed");
                 return;
               }
             } else if (d.type === "reasoning_content") {
@@ -4535,10 +4669,10 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
             });
           }
           finishError(upstreamTruncatedDetail());
-          call.release();
+          call.release("upstream_truncated");
         } catch (err: any) {
           console.error("❌ Anthropic流错误:", err);
-          call.release();
+          call.release("stream_error");
           finishError(upstreamErrorFromException(err) ?? {
             statusCode: 502,
             type: "upstream_error",
@@ -4549,7 +4683,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
       cancel() {
         // 客户端提前断开: 立即结算并释放上游并发槽位
         closeHeartbeat();
-        call.release();
+        call.release("client_disconnected");
       },
     });
 
@@ -4561,6 +4695,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
       },
     });
   } catch (error: any) {
+    finishRequestTrace(trace, "handler_error");
     console.error("❌ 处理请求异常:", error);
     recordFailure(anthroModel); // 失败统计: 异常出口
     return handlerFailureResponse("anthropic", error);
@@ -4657,6 +4792,7 @@ function buildResponsesResponse(
 
 async function handleOpenAIResponse(req: Request): Promise<Response> {
   let modelName = "sider"; // 函数级: catch 出口的失败统计也要用
+  const trace = createRequestTrace(req, "responses");
   try {
     const body = await req.json();
     const isStream = body.stream === true;
@@ -4676,6 +4812,16 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
         "responses",
         "上游 sider 不支持视觉输入 (图像理解)。请仅发送文本。",
         "vision_not_supported",
+      );
+    }
+
+    if (detectToolHistory(body.input)) {
+      console.warn("⛔ Responses 收到工具调用历史, 上游不支持; 返回 not_supported。");
+      recordFailure(modelName);
+      return notSupportedResponse(
+        "responses",
+        "上游 sider 不支持自定义工具调用及其历史输入，请仅发送文本消息。",
+        "tools_not_supported",
       );
     }
 
@@ -4714,6 +4860,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
     }
 
     modelName = body.model || "sider";
+    trace.externalModel = modelName;
     // 未知模型一律拒绝 (P2), 与其余三个端点同契约
     const siderModel = resolveSiderModel(modelName);
     if (siderModel === null) {
@@ -4721,6 +4868,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
       recordFailure(modelName);
       return modelNotFoundResponse("responses", modelName);
     }
+    trace.upstreamModel = siderModel;
 
     const isThink = shouldEnableThinkMode(modelName);
     const respId = `resp_${Date.now()}`;
@@ -4745,9 +4893,9 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
     siderRequest.multi_content = [{
       type: "text", text: fullContext, user_input_text: fullContext,
     }];
-    siderRequest.tools = {
-      auto: enableSearch ? ["search", "data_analysis"] : ["data_analysis"],
-    };
+    siderRequest.tools = body.tool_choice === "none"
+      ? { auto: [] }
+      : { auto: enableSearch ? ["search", "data_analysis"] : ["data_analysis"] };
 
     // 发送上游请求: 三段超时/排队/配额/错误分类统一由 UpstreamLease 负责
     const call = await fetchSiderRateLimited(siderModel, SIDER_API_ENDPOINT, {
@@ -4760,7 +4908,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
         "X-App-Name": "ChitChat_Edge_Ext", "X-App-Version": "5.21.2",
       },
       body: JSON.stringify(siderRequest),
-    }, "responses", req.signal);
+    }, "responses", req.signal, trace);
     const siderResp = call.response;
 
     if (!siderResp.ok) {
@@ -4781,7 +4929,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
       })) {
         if (ev.kind === "business_error") {
           if (isIgnorableLateBusinessWarning(ev.code, Boolean(fullText))) continue;
-          call.release();
+          call.release("business_error");
           recordFailure(modelName);
           return protocolErrorResponse("responses", call.describeBusinessError(ev.code, ev.msg));
         }
@@ -4800,12 +4948,12 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
         }
       }
       if (!sawDone) {
-        call.release();
+        call.release("upstream_truncated");
         recordFailure(modelName);
         return protocolErrorResponse("responses", upstreamTruncatedDetail());
       }
       if (!fullText) {
-        call.release();
+        call.release("empty_output");
         recordFailure(modelName);
         return protocolErrorResponse("responses", {
           statusCode: 502,
@@ -4813,8 +4961,8 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
           message: "上游响应没有生成任何文本内容。",
         });
       }
-      call.complete();
       const limited = applyOutputLimits(fullText, outputLimits);
+      call.complete(limited.stopReason);
       // 用量统计: Responses 非流式
       recordUsage({
         model: modelName,
@@ -4837,7 +4985,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
         const reader = siderResp.body?.getReader();
         if (!reader) {
           controller.error(new Error("无响应流"));
-          call.release();
+          call.release("missing_response_body");
           return;
         }
         const encoder = new TextEncoder();
@@ -4914,10 +5062,11 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
         };
 
         // 收尾事件序列: output_text.done -> content_part.done -> output_item.done
-        // -> response.completed, 之后直接关流。
+        // -> response.completed 或 response.incomplete, 之后直接关流。
         // 官方 Responses 流式契约是【类型化语义事件】, 未定义 [DONE] 终止符。
         const finishResponsesStream = (reason: OutputStopReason = "end_turn") => {
           const status = reason === "max_tokens" ? "incomplete" : "completed";
+          const itemStatus = status === "incomplete" ? "incomplete" : "completed";
           if (itemOpened) {
             sendEvent("response.output_text.done", {
               type: "response.output_text.done",
@@ -4930,13 +5079,13 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
             sendEvent("response.output_item.done", {
               type: "response.output_item.done",
               output_index: 0,
-              item: outputItem("completed"),
+              item: outputItem(itemStatus),
             });
           }
           const completedResp: any = {
             ...initialResp,
             status,
-            output: itemOpened ? [outputItem("completed")] : [],
+            output: itemOpened ? [outputItem(itemStatus)] : [],
             usage: {
               input_tokens: estimateTokens(fullContext),
               output_tokens: estimateTokens(outputTextAcc),
@@ -4946,7 +5095,8 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
           if (reason === "max_tokens") {
             completedResp.incomplete_details = { reason: "max_output_tokens" };
           }
-          sendEvent("response.completed", { type: "response.completed", response: completedResp });
+          const terminalEvent = status === "incomplete" ? "response.incomplete" : "response.completed";
+          sendEvent(terminalEvent, { type: terminalEvent, response: completedResp });
           finishResponsesStats();
           hb.close();
         };
@@ -4980,7 +5130,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
               const flushed = textLimiter.flush();
               if (flushed.text) sendDelta(flushed.text);
               finishResponsesStream(flushed.stopReason);
-              call.complete();
+              call.complete(flushed.stopReason);
               return;
             }
 
@@ -4991,7 +5141,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
               const flushed = textLimiter.flush();
               if (flushed.text) sendDelta(flushed.text);
               finishResponsesFailure(call.describeBusinessError(ev.code, ev.msg));
-              call.release();
+              call.release("business_error");
               return;
             }
 
@@ -5001,7 +5151,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
               if (textResult.text) sendDelta(textResult.text);
               if (textResult.done) {
                 finishResponsesStream(textResult.stopReason || "end_turn");
-                call.complete();
+                call.complete(textResult.stopReason || "completed");
                 return;
               }
             }
@@ -5013,10 +5163,10 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
           const flushed = textLimiter.flush();
           if (flushed.text) sendDelta(flushed.text);
           finishResponsesFailure(upstreamTruncatedDetail());
-          call.release();
+          call.release("upstream_truncated");
         } catch (err: any) {
           console.error("❌ Responses流错误:", err);
-          call.release();
+          call.release("stream_error");
           finishResponsesFailure(upstreamErrorFromException(err) ?? {
             statusCode: 502,
             type: "upstream_error",
@@ -5027,7 +5177,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
       cancel() {
         // 客户端提前断开: 立即结算并释放上游并发槽位
         closeHeartbeat();
-        call.release();
+        call.release("client_disconnected");
       },
     });
 
@@ -5039,6 +5189,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
       },
     });
   } catch (error: any) {
+    finishRequestTrace(trace, "handler_error");
     console.error("❌ 处理请求异常:", error);
     recordFailure(modelName); // 失败统计: 异常出口
     return handlerFailureResponse("responses", error);
@@ -5749,7 +5900,7 @@ async function handleRequest(req: Request): Promise<Response> {
       headers: {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "POST, GET, PUT, DELETE, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Session-ID, x-api-key, x-goog-api-key, anthropic-version"
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Request-ID, X-Session-ID, x-api-key, x-goog-api-key, anthropic-version"
       }
     });
   }

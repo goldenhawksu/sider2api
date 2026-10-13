@@ -164,6 +164,14 @@ def _scenario_frames(prompt: str, seq: int) -> tuple[list[bytes], float]:
             *[_frame(_text(f"part-{i};")) for i in range(100)],
             _done(),
         ], delay
+    if "MOCK_DELAY_CHUNKS" in prompt:
+        return [
+            _frame(_message_start(seq)),
+            _frame(_text("first")),
+            _frame(_text("second")),
+            _frame(_text("third")),
+            _done(),
+        ], delay
     if "MOCK_STREAM_STOP" in prompt:
         return [
             _frame(_message_start(seq)),
@@ -269,7 +277,7 @@ def _handler_factory(state: MockSiderState):
                 time.sleep(delay)
             for item in frames:
                 try:
-                    if "MOCK_LONG_STREAM" in prompt:
+                    if "MOCK_LONG_STREAM" in prompt or "MOCK_DELAY_CHUNKS" in prompt:
                         time.sleep(0.05)
                     self.wfile.write(item)
                     self.wfile.flush()
@@ -312,6 +320,7 @@ def _launch_stack(env_extra: dict[str, str] | None = None):
         "STATS_KV": "memory",
         "STATS_KV_ROOT": "mock-regression",
         "DENO_NO_UPDATE_CHECK": "1",
+        "SERVICE_VERSION": "mock-test-version",
     })
     if env_extra:
         env.update(env_extra)
@@ -678,9 +687,9 @@ def test_responses_rejects_unsupported_input_before_upstream(mock_stack):
     r = _post(mock_stack["base_url"], "/v1/responses", {
         "model": "deepseek-v4-pro",
         "input": [{
-            "type": "function_call_output",
+            "type": "computer_call_output",
             "call_id": "call_1",
-            "output": "tool result",
+            "output": {"type": "computer_screenshot", "image_url": "data:image/png;base64,AA=="},
         }],
     })
 
@@ -1578,6 +1587,85 @@ def test_custom_tools_are_rejected_uniformly_across_protocols(matrix_stack):
     assert gemini_none.status_code == 200, gemini_none.text[:200]
 
 
+@pytest.mark.smoke
+def test_disabling_tools_removes_all_upstream_builtin_tools(terminal_stack):
+    """客户端声明 none/NONE 时，不能继续向 Sider 开启 data_analysis 等内置工具。"""
+    base = terminal_stack["base_url"]
+    state = terminal_stack["state"]
+    state.clear()
+    schema = {"type": "object", "properties": {}}
+    cases = [
+        ("/v1/chat/completions", {
+            "model": "qwen3.8-max",
+            "messages": [{"role": "user", "content": "NO_TOOLS_OPENAI"}],
+            "tools": [{"type": "function", "function": {"name": "noop", "parameters": schema}}],
+            "tool_choice": "none",
+        }),
+        ("/v1/responses", {
+            "model": "deepseek-v4-pro",
+            "input": "NO_TOOLS_RESPONSES",
+            "tools": [{"type": "function", "name": "noop", "parameters": schema}],
+            "tool_choice": "none",
+        }),
+        ("/v1/messages", {
+            "model": "claude-sonnet-5", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "NO_TOOLS_ANTHROPIC"}],
+            "tools": [{"name": "noop", "input_schema": schema}],
+            "tool_choice": {"type": "none"},
+        }),
+        ("/v1beta/models/gemini-2.5-pro:generateContent", {
+            "contents": [{"role": "user", "parts": [{"text": "NO_TOOLS_GEMINI"}]}],
+            "tools": [{"functionDeclarations": [{"name": "noop", "parameters": schema}]}],
+            "toolConfig": {"functionCallingConfig": {"mode": "NONE"}},
+        }),
+    ]
+
+    for path, body in cases:
+        response = _post(base, path, body)
+        assert response.status_code == 200, f"{path}: {response.status_code} {response.text[:200]}"
+        upstream = state.snapshot()[-1]
+        assert upstream.get("tools") == {"auto": []}, \
+            f"{path} 仍向上游开启工具: {upstream.get('tools')}"
+
+
+@pytest.mark.smoke
+def test_tool_history_is_rejected_before_upstream_for_all_protocols(terminal_stack):
+    """上游不能执行自定义工具时，工具调用/结果历史也不能被静默过滤。"""
+    base = terminal_stack["base_url"]
+    state = terminal_stack["state"]
+    state.clear()
+    cases = [
+        ("openai", "/v1/chat/completions", {
+            "model": "gpt-5.6-sol",
+            "messages": [
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1"}]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            ],
+        }),
+        ("responses", "/v1/responses", {
+            "model": "deepseek-v4-pro",
+            "input": [{"type": "function_call_output", "call_id": "call_1", "output": "result"}],
+        }),
+        ("anthropic", "/v1/messages", {
+            "model": "claude-sonnet-5", "max_tokens": 64,
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tool_1", "content": "result"},
+            ]}],
+        }),
+        ("gemini", "/v1beta/models/gemini-2.5-pro:generateContent", {
+            "contents": [{"role": "model", "parts": [
+                {"functionCall": {"name": "noop", "args": {}}},
+            ]}],
+        }),
+    ]
+
+    for protocol, path, body in cases:
+        response = _post(base, path, body)
+        assert response.status_code == 422, f"{protocol}: {response.status_code} {response.text[:200]}"
+        assert "tools_not_supported" in response.text, f"{protocol}: {response.text[:200]}"
+    assert state.snapshot() == [], "工具历史应在请求上游前被拒绝"
+
+
 # ==================== 协议契约修正 (P1) ====================
 
 
@@ -1668,6 +1756,66 @@ def test_responses_stream_emits_full_semantic_event_sequence(matrix_stack):
                  and p.get("type") == "response.completed"][-1]
     assert completed["response"]["status"] == "completed"
     assert completed["response"]["output"], "completed 事件应带上最终 output"
+
+
+@pytest.mark.smoke
+def test_openai_stream_reuses_one_response_id_and_created_time(terminal_stack):
+    """延迟到达的 Chat 分块也必须属于同一个响应，不能逐块重新生成 ID。"""
+    response = _post(terminal_stack["base_url"], "/v1/chat/completions", {
+        "model": "gpt-5.6-sol",
+        "messages": [{"role": "user", "content": "MOCK_DELAY_CHUNKS"}],
+        "stream": True,
+    }, stream=True)
+    events = _collect_sse(response)
+    chunks = [payload for _, payload in events
+              if isinstance(payload, dict) and payload.get("object") == "chat.completion.chunk"]
+    assert len(chunks) >= 4, chunks
+    assert len({chunk.get("id") for chunk in chunks}) == 1, chunks
+    assert len({chunk.get("created") for chunk in chunks}) == 1, chunks
+
+
+@pytest.mark.smoke
+def test_responses_stream_max_tokens_uses_incomplete_terminal_event(terminal_stack):
+    """status=incomplete 必须配 response.incomplete，不能包在 response.completed 事件中。"""
+    response = _post(terminal_stack["base_url"], "/v1/responses", {
+        "model": "deepseek-v4-pro",
+        "input": "MOCK_RESPONSES_MAX",
+        "max_output_tokens": 2,
+        "stream": True,
+    }, stream=True)
+    events = _collect_sse(response)
+    payloads = [payload for _, payload in events if isinstance(payload, dict)]
+    types = [payload.get("type") for payload in payloads]
+    assert types[-1] == "response.incomplete", types
+    assert "response.completed" not in types, types
+    terminal = payloads[-1]["response"]
+    assert terminal["status"] == "incomplete", terminal
+    assert terminal["incomplete_details"]["reason"] == "max_output_tokens", terminal
+
+
+@pytest.mark.smoke
+def test_request_completion_log_contains_correlation_and_latency_metadata(terminal_stack):
+    """请求日志只记关联与耗时元数据，不依赖正文断言。"""
+    request_id = f"regression-{uuid4()}"
+    response = _post(terminal_stack["base_url"], "/v1/chat/completions", {
+        "model": "gpt-5.6-luna",
+        "messages": [{"role": "user", "content": "OBSERVABILITY_OK"}],
+    }, headers={"X-Request-ID": request_id})
+    assert response.status_code == 200, response.text[:200]
+
+    deadline = time.time() + 3
+    line = ""
+    while time.time() < deadline:
+        line = next((item for item in reversed(terminal_stack["logs"])
+                     if request_id in item and "[请求完成]" in item), "")
+        if line:
+            break
+        time.sleep(0.05)
+    assert line, "缺少请求完成关联日志"
+    for field in ("requestId", "protocol", "externalModel", "upstreamModel", "queueWaitMs",
+                  "responseHeaderMs", "firstContentMs", "endReason", "version"):
+        assert f'"{field}"' in line, line
+    assert '"version":"mock-test-version"' in line, line
 
 
 @pytest.mark.smoke
@@ -1870,6 +2018,53 @@ def test_official_openai_sdk_streams_responses_api(mock_stack):
     assert "".join(pieces), f"Responses 流未取到内容; 事件序列: {types}"
     assert types[-1] == "response.completed", f"事件序列应以 response.completed 收尾: {types}"
     assert "response.output_item.added" in types, types
+
+
+@pytest.mark.smoke
+def test_official_openai_sdk_responses_array_input_preserves_text(terminal_stack):
+    """官方 SDK 的 input_text 数组输入必须完整到达上游，不能只验证最终 HTTP 200。"""
+    openai = pytest.importorskip("openai")
+    cli = openai.OpenAI(base_url=terminal_stack["base_url"] + "/v1", api_key=AUTH_TOKEN)
+    terminal_stack["state"].clear()
+
+    response = cli.responses.create(
+        model="deepseek-v4-pro",
+        input=[
+            {"role": "developer", "content": [
+                {"type": "input_text", "text": "SDK_DEVELOPER_RULE"},
+            ]},
+            {"role": "user", "content": [
+                {"type": "input_text", "text": "SDK_ARRAY_QUESTION"},
+            ]},
+        ],
+    )
+    assert response.output_text
+    prompt = _prompt_from_sider_body(terminal_stack["state"].snapshot()[-1])
+    assert "[Developer]\nSDK_DEVELOPER_RULE" in prompt, prompt
+    assert "[Current User]\nSDK_ARRAY_QUESTION" in prompt, prompt
+
+
+@pytest.mark.smoke
+def test_official_openai_sdk_responses_surfaces_failed_terminal(terminal_stack):
+    """官方 SDK 必须能解析异常 EOF 的 response.failed，而不是误收 response.completed。"""
+    openai = pytest.importorskip("openai")
+    cli = openai.OpenAI(base_url=terminal_stack["base_url"] + "/v1", api_key=AUTH_TOKEN)
+
+    types: list[str] = []
+    pieces: list[str] = []
+    for event in cli.responses.create(
+        model="deepseek-v4-pro",
+        input="MOCK_EOF_AFTER_TEXT",
+        stream=True,
+    ):
+        event_type = getattr(event, "type", "")
+        types.append(event_type)
+        if event_type == "response.output_text.delta":
+            pieces.append(event.delta)
+
+    assert "partial before eof" in "".join(pieces)
+    assert types[-1] == "response.failed", types
+    assert "response.completed" not in types, types
 
 
 @pytest.mark.smoke
