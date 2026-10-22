@@ -18,7 +18,7 @@ const AUTH_TOKEN = Deno.env.get("AUTH_TOKEN");
 // 也不释放。拆成三段后, 每个阶段都有各自的 watchdog:
 //   header: fetch 到响应头; 超时说明上游根本没接单。
 //   idle  : 相邻两个响应体分片之间的最大间隔; 覆盖"头到了但正文卡死"。
-//   total : 整个调用生命周期(排队之后的 fetch + 流式传输)的硬上限。
+//   total : 从请求进入起，包含读入、排队、fetch 与正文传输的硬上限。
 // 三者统一 abort + cancel + release, 并映射为 504 gateway_timeout。
 const UPSTREAM_HEADER_TIMEOUT_MS = parseInt(Deno.env.get("UPSTREAM_HEADER_TIMEOUT_MS") || "30000", 10);
 const UPSTREAM_STREAM_IDLE_TIMEOUT_MS = parseInt(Deno.env.get("UPSTREAM_STREAM_IDLE_TIMEOUT_MS") || "60000", 10);
@@ -26,6 +26,11 @@ const UPSTREAM_STREAM_IDLE_TIMEOUT_MS = parseInt(Deno.env.get("UPSTREAM_STREAM_I
 const UPSTREAM_TOTAL_TIMEOUT_MS = parseInt(
   Deno.env.get("UPSTREAM_TOTAL_TIMEOUT_MS") || Deno.env.get("UPSTREAM_TIMEOUT_MS") || "180000",
   10,
+);
+// 在部署期限前预留响应收尾时间；短预算最多预留十分之一。
+const REQUEST_TIMEOUT_RESERVE_MS = Math.min(
+  Math.max(0, Number(Deno.env.get("REQUEST_TIMEOUT_RESERVE_MS") || "1000")),
+  UPSTREAM_TOTAL_TIMEOUT_MS / 10,
 );
 // 是否默认启用自动搜索(会显著影响 TTFT/长尾)
 const ENABLE_AUTO_SEARCH = (Deno.env.get("ENABLE_AUTO_SEARCH") || "true").toLowerCase() === "true";
@@ -226,6 +231,7 @@ const MODELS = Object.keys(MODEL_MAPPING).map(modelId => ({
 interface ConversationSession {
   cid: string;
   parent_message_id: string;
+  model: string;
   created_at: number;
   last_used: number;
 }
@@ -565,9 +571,15 @@ interface RequestTrace {
   responseHeaderMs: number | null;
   firstContentMs: number | null;
   finished: boolean;
+  contextTruncated?: boolean;
+  cleanup?: () => void;
 }
 
+const requestTraces = new WeakMap<Request, RequestTrace>();
+
 function createRequestTrace(req: Request, protocol: ApiProtocol): RequestTrace {
+  const existing = requestTraces.get(req);
+  if (existing) return existing;
   const supplied = req.headers.get("X-Request-ID")?.trim() || "";
   const requestId = (supplied || crypto.randomUUID()).replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 128);
   return {
@@ -586,6 +598,7 @@ function createRequestTrace(req: Request, protocol: ApiProtocol): RequestTrace {
 function finishRequestTrace(trace: RequestTrace | undefined, endReason: string): void {
   if (!trace || trace.finished) return;
   trace.finished = true;
+  trace.cleanup?.();
   console.log("📈 [请求完成] " + JSON.stringify({
     requestId: trace.requestId,
     protocol: trace.protocol,
@@ -1917,6 +1930,8 @@ function acquireUpstreamSlot(signal?: AbortSignal): Promise<() => void> {
  */
 interface UpstreamCall {
   response: Response;
+  /** 仅暂存上游会话候选，完整生成成功后才提交。 */
+  stageSession(cid: string, messageId: string): void;
   /** 消费方解析出有效数据 (text/file/tool_call...) 时申报。 */
   reportSuccess(): void;
   /** 消费方发现上游业务码时申报; 门控学习与"是否已吐出正文"无关。 */
@@ -1938,6 +1953,7 @@ function detachedCall(
   finishRequestTrace(trace, endReason);
   return {
     response,
+    stageSession() {},
     reportSuccess() {},
     reportBusinessError() {},
     describeBusinessError(code: number, msg = "") {
@@ -1996,6 +2012,7 @@ function upstreamErrorFromException(err: unknown): UpstreamErrorDetail | null {
  * 客户端无法区分"上游挂了"和"我们自己写错了"。
  */
 function handlerFailureResponse(protocol: ApiProtocol, err: unknown): Response {
+  if (err instanceof RequestValidationError) return protocolErrorResponse(protocol, err.detail);
   const detail = upstreamErrorFromException(err);
   if (detail) return protocolErrorResponse(protocol, detail);
   const message = err instanceof Error ? err.message : String(err);
@@ -2023,6 +2040,7 @@ async function fetchSiderRateLimited(
   protocol: ApiProtocol,
   clientSignal?: AbortSignal,
   trace?: RequestTrace,
+  sessionInfo?: SessionInfo,
 ): Promise<UpstreamCall> {
   if (trace) trace.upstreamModel = model;
   // 1. 预检 (不认领半开探测名额): 账号闸门/熔断/超配额 -> 直接拒, 不触达上游
@@ -2032,13 +2050,39 @@ async function fetchSiderRateLimited(
   }
 
   // 2. 并发闸门: 上游单并发, 满则 FIFO 排队而非直接失败
-  let releaseSlot: () => void;
+  let releaseSlot = () => {};
+  let releaseSession = () => {};
   const queueStartedAt = Date.now();
   try {
-    releaseSlot = await acquireUpstreamSlot(clientSignal);
+    if (sessionInfo?.reusable) {
+      releaseSession = await acquireSessionSlot(sessionInfo.id, clientSignal);
+      const previous = conversationSessions.get(sessionInfo.id);
+      if (previous && previous.model !== model) {
+        releaseSession();
+        return detachedCall(protocolErrorResponse(protocol, {
+          statusCode: 400, type: "invalid_request_error", reason: "session_model_mismatch",
+          message: "会话已绑定其他模型，请使用新的 X-Session-ID。",
+        }), trace, "session_model_mismatch");
+      }
+    }
+    const releaseUpstream = await acquireUpstreamSlot(clientSignal);
+    releaseSlot = () => { releaseUpstream(); releaseSession(); };
+    // 在同会话前序请求完成后读取检查点，避免排队前读到旧 parent。
+    const previous = sessionInfo?.reusable ? conversationSessions.get(sessionInfo.id) : undefined;
+    if (previous) {
+      const body = JSON.parse(String(init.body));
+      body.cid = previous.cid;
+      body.parent_message_id = previous.parent_message_id;
+      init = { ...init, body: JSON.stringify(body) };
+    }
     if (trace) trace.queueWaitMs = Date.now() - queueStartedAt;
   } catch (err) {
+    releaseSlot();
+    releaseSession();
     if (trace) trace.queueWaitMs = Date.now() - queueStartedAt;
+    if (clientSignal?.reason instanceof UpstreamTimeoutError) {
+      return detachedCall(protocolErrorResponse(protocol, timeoutDetail("total")), trace, "timeout_total");
+    }
     if (clientSignal?.aborted) {
       return detachedCall(protocolErrorResponse(protocol, {
         statusCode: 499,
@@ -2073,6 +2117,7 @@ async function fetchSiderRateLimited(
   let timedOut: UpstreamTimeoutStage | null = null;
   let sawValidData = false;
   let fatalCode = 0;
+  let stagedSession: { cid: string; messageId: string } | undefined;
   let idleTimer: number | undefined;
   let clientAbortHandler: (() => void) | undefined;
   const timers: number[] = [];
@@ -2107,6 +2152,13 @@ async function fetchSiderRateLimited(
     settled = true;
     if (creditSuccess && fatalCode === 0 && sawValidData && timedOut === null) {
       recordUpstreamSuccess(model);
+      if (endReason === "end_turn" && sessionInfo?.reusable && stagedSession && !clientSignal?.aborted) {
+        conversationSessions.set(sessionInfo.id, {
+          cid: stagedSession.cid, parent_message_id: stagedSession.messageId, model,
+          created_at: conversationSessions.get(sessionInfo.id)?.created_at ?? Date.now(),
+          last_used: Date.now(),
+        });
+      }
     }
     const finalReason = creditSuccess && fatalCode !== 0
       ? `completed_with_business_code_${fatalCode}`
@@ -2116,16 +2168,18 @@ async function fetchSiderRateLimited(
   };
   clientAbortHandler = () => {
     if (released) return;
+    if (clientSignal?.reason instanceof UpstreamTimeoutError) timedOut = clientSignal.reason.stage;
     try {
       controller.abort(clientSignal?.reason ?? new DOMException("client disconnected", "AbortError"));
     } catch { /* 已中止 */ }
-    settle(false, "client_disconnected");
+    settle(false, timedOut ? `timeout_${timedOut}` : "client_disconnected");
   };
   if (clientSignal) {
     clientSignal.addEventListener("abort", clientAbortHandler, { once: true });
     if (clientSignal.aborted) clientAbortHandler();
   }
   if (released) {
+    if (timedOut) return detachedCall(protocolErrorResponse(protocol, timeoutDetail(timedOut)), trace, `timeout_${timedOut}`);
     return detachedCall(protocolErrorResponse(protocol, {
       statusCode: 499,
       type: "canceled",
@@ -2151,7 +2205,7 @@ async function fetchSiderRateLimited(
   const totalTimer = setTimeout(() => {
     timedOut = "total";
     controller.abort(new UpstreamTimeoutError("total"));
-  }, UPSTREAM_TOTAL_TIMEOUT_MS);
+  }, Math.max(1, UPSTREAM_TOTAL_TIMEOUT_MS - REQUEST_TIMEOUT_RESERVE_MS - (Date.now() - (trace?.startedAt ?? queueStartedAt))));
   // 兜底: 任何路径都没释放时, 到点强制释放 (正常路径永远先于它释放)
   timers.push(headerTimer, totalTimer, setTimeout(() => {
     try {
@@ -2162,6 +2216,9 @@ async function fetchSiderRateLimited(
 
   const call: UpstreamCall = {
     response: new Response(null, { status: 502 }),
+    stageSession(cid, messageId) {
+      if (cid && messageId) stagedSession = { cid, messageId };
+    },
     reportSuccess() {
       sawValidData = true;
       if (trace && trace.firstContentMs === null) {
@@ -2217,10 +2274,27 @@ async function fetchSiderRateLimited(
 
   // 6. HTTP 非 2xx: 与 SSE 业务码走【同一套分类器】, 再按调用方协议渲染
   if (!res.ok) {
-    const rawBody = await res.text().catch(() => "");
+    let rawBody = "";
+    const errorReader = res.body?.getReader();
+    const decoder = new TextDecoder();
     try {
-      await res.body?.cancel();
-    } catch { /* 已消费/已关闭 */ }
+      if (errorReader) {
+        while (true) {
+          armIdleWatchdog();
+          const { done, value } = await errorReader.read();
+          if (done) break;
+          rawBody += decoder.decode(value, { stream: true });
+        }
+        rawBody += decoder.decode();
+      }
+    } catch { /* 超时按下方统一出口处理 */ }
+    finally {
+      try { await errorReader?.cancel(); } catch { /* 已关闭 */ }
+    }
+    if (timedOut) {
+      settle(false, `timeout_${timedOut}`);
+      return detachedCall(protocolErrorResponse(protocol, timeoutDetail(timedOut)), trace, `timeout_${timedOut}`);
+    }
     const detail = classifyUpstreamHttpError(res.status, rawBody);
     if (detail.upstreamCode !== undefined && detail.upstreamCode !== 0) {
       call.reportBusinessError(detail.upstreamCode, detail.message);
@@ -2605,8 +2679,6 @@ function buildBoundedContext(msgs: any[]): BoundedContext {
   const SEP = "\n\n---\n\n";
   const HISTORY_LABEL = "[Conversation History]\n";
   const HISTORY_LABEL_PARTIAL = "[Conversation History (partial, oldest trimmed)]\n";
-  // 按更长的那个标签预留, 避免"裁剪后标签变长"反而挤爆预算
-  const LABEL_RESERVE = Math.max(HISTORY_LABEL.length, HISTORY_LABEL_PARTIAL.length);
 
   const instructionMsgs = msgs.filter((m) => m.role === "system" || m.role === "developer");
   const conversationMsgs = msgs.filter((m) => m.role !== "system" && m.role !== "developer");
@@ -2634,40 +2706,35 @@ function buildBoundedContext(msgs: any[]): BoundedContext {
     return { text: "", truncated: false, overflow: true };
   }
 
-  const historyBudget = SIDER_MAX_CHARS - fixedChars - SEP.length - LABEL_RESERVE;
   const historyMsgs = conversationMsgs.slice(0, -1);
   const selectedLines: string[] = [];
-  let usedChars = 0;
-  let usedWords = fixedWords;
   let truncated = false;
+  const assemble = (label: string) => [
+    ...instructionParts,
+    ...(selectedLines.length ? [label + selectedLines.join("\n\n")] : []),
+    currentPart,
+  ].join(SEP);
+  const fits = (text: string) => text.length <= SIDER_MAX_CHARS && estimateWordCount(text) <= SIDER_MAX_WORDS;
 
   for (let i = historyMsgs.length - 1; i >= 0; i--) {
     const m = historyMsgs[i];
     const role = m.role === "assistant" ? "Assistant" : "User";
     const line = `${role}: ${flattenMessageContent(m.content)}`;
-    const lineChars = line.length + (selectedLines.length > 0 ? "\n\n".length : 0);
-    const lineWords = estimateWordCount(line);
-    if (historyBudget <= 0 || usedChars + lineChars > historyBudget || usedWords + lineWords > SIDER_MAX_WORDS) {
+    selectedLines.unshift(line);
+    if (!fits(assemble(i === 0 ? HISTORY_LABEL : HISTORY_LABEL_PARTIAL))) {
+      selectedLines.shift();
       truncated = true;
       break;
     }
-    selectedLines.unshift(line);
-    usedChars += lineChars;
-    usedWords += lineWords;
   }
 
-  const parts: string[] = [];
-  parts.push(...instructionParts);
-  if (selectedLines.length > 0) {
-    const label = truncated ? HISTORY_LABEL_PARTIAL : HISTORY_LABEL;
-    parts.push(label + selectedLines.join("\n\n"));
-  }
-  parts.push(currentPart);
-
-  return { text: parts.join(SEP), truncated, overflow: false };
+  const text = assemble(truncated ? HISTORY_LABEL_PARTIAL : HISTORY_LABEL);
+  const overflow = !fits(text);
+  return { text: overflow ? "" : text, truncated, overflow };
 }
 
-function logContextTruncation(protocol: ApiProtocol, model: string, ctx: BoundedContext): void {
+function logContextTruncation(protocol: ApiProtocol, model: string, ctx: BoundedContext, trace: RequestTrace): void {
+  trace.contextTruncated = ctx.truncated;
   if (ctx.truncated) {
     console.warn("✂️ [上下文裁剪]", { protocol, model, maxChars: SIDER_MAX_CHARS, maxWords: SIDER_MAX_WORDS });
   }
@@ -2692,8 +2759,13 @@ function contextOverflowResponse(protocol: ApiProtocol): Response {
  * @returns null 表示未知模型
  */
 function resolveSiderModel(modelName?: string): string | null {
-  if (!modelName) return "sider";
-  return MODEL_MAPPING[modelName] ?? null;
+  if (modelName === undefined) return "sider";
+  if (typeof modelName !== "string") return null;
+  // 窗口标签只是客户端别名；不会扩大已验证的上游预算。
+  const registered = modelName.replace(/\s*\[\d+(?:\.\d+)?[km]\]$/i, "");
+  if (!Object.hasOwn(MODEL_MAPPING, registered)) return null;
+  const mapped = MODEL_MAPPING[registered];
+  return typeof mapped === "string" && mapped.length > 0 ? mapped : null;
 }
 
 function modelNotFoundResponse(protocol: ApiProtocol, modelName: string): Response {
@@ -2721,6 +2793,33 @@ interface SessionInfo {
   reusable: boolean;
 }
 
+const sessionTails = new Map<string, Promise<void>>();
+
+/** 同会话先后轮串行；取消等待项仍保留前序依赖，不会越过正在运行的轮次。 */
+async function acquireSessionSlot(id: string, signal?: AbortSignal): Promise<() => void> {
+  const previous = sessionTails.get(id) ?? Promise.resolve();
+  let release = () => {};
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const tail = previous.then(() => gate);
+  sessionTails.set(id, tail);
+  void tail.then(() => { if (sessionTails.get(id) === tail) sessionTails.delete(id); });
+  let abort = () => {};
+  try {
+    await new Promise<void>((resolve, reject) => {
+      abort = () => reject(signal?.reason ?? new DOMException("客户端已断开", "AbortError"));
+      previous.then(resolve, reject);
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
+    });
+    return release;
+  } catch (error) {
+    release();
+    throw error;
+  } finally {
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
 function resolveSessionId(req: Request): SessionInfo {
   const explicit = req.headers.get("X-Session-ID")?.trim();
   if (explicit) return { id: explicit, reusable: true };
@@ -2729,12 +2828,151 @@ function resolveSessionId(req: Request): SessionInfo {
 
 // ==================== 请求处理器 ====================
 
+class RequestValidationError extends Error {
+  constructor(public detail: UpstreamErrorDetail) {
+    super(detail.message);
+  }
+}
+
+function invalidInput(message: string): never {
+  throw new RequestValidationError({ statusCode: 400, type: "invalid_request_error", reason: "invalid_request", message });
+}
+
+function unsupportedInput(message: string, reason = "input_type_not_supported"): never {
+  throw new RequestValidationError({ statusCode: 422, type: "not_supported", reason, message });
+}
+
+function isRecord(value: any): value is Record<string, any> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** 在任何转换器运行前校验，防止过滤未知块或把错误类型转成字符串。 */
+function validateTextContent(content: any, types: string[], gemini = false): void {
+  if (!gemini && typeof content === "string") {
+    if (!content.trim()) invalidInput("消息内容不能为空。");
+    return;
+  }
+  if (!Array.isArray(content) || !content.length) invalidInput("消息内容必须是非空文本或内容块数组。");
+  for (const block of content) {
+    if (!isRecord(block)) invalidInput("内容块必须是对象。");
+    if (gemini) {
+      if (Object.keys(block).some(key => !["text", "thought", "thoughtSignature"].includes(key))) {
+        unsupportedInput("仅支持文本 parts，不能静默丢弃其他内容。");
+      }
+    } else {
+      if (typeof block.type !== "string") invalidInput("内容块必须包含字符串 type。");
+      if (!types.includes(block.type)) unsupportedInput(`暂不支持内容块类型 ${block.type}。`);
+    }
+    if (typeof block.text !== "string" || !block.text.trim()) invalidInput("文本内容块必须包含非空字符串 text。");
+  }
+}
+
+async function readValidatedBody(req: Request, protocol: ApiProtocol): Promise<any> {
+  const reader = req.body?.getReader();
+  const chunks: Uint8Array[] = [];
+  const abort = () => { void reader?.cancel(req.signal.reason).catch(() => {}); };
+  req.signal.addEventListener("abort", abort, { once: true });
+  let body: any;
+  try {
+    if (req.signal.aborted) throw req.signal.reason;
+    if (reader) {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (req.signal.aborted) throw req.signal.reason;
+        if (done) break;
+        chunks.push(value);
+      }
+    }
+    try {
+      body = JSON.parse(await new Blob(chunks as BlobPart[]).text());
+    } catch {
+      invalidInput("请求体必须是有效 JSON。");
+    }
+  } finally {
+    req.signal.removeEventListener("abort", abort);
+    reader?.releaseLock();
+  }
+  if (!isRecord(body)) invalidInput("请求体必须是 JSON 对象。");
+  if (body.model !== undefined && (typeof body.model !== "string" || !body.model.trim())) invalidInput("model 必须是非空字符串。");
+  const trace = requestTraces.get(req);
+  if (trace && protocol !== "gemini" && typeof body.model === "string") trace.externalModel = body.model;
+  if (body.stream !== undefined && typeof body.stream !== "boolean") invalidInput("stream 必须是布尔值。");
+
+  const raw = protocol === "gemini" ? body.contents : protocol === "responses" ? body.input : body.messages;
+  if (detectToolHistory(raw)) unsupportedInput("上游不支持自定义工具调用及其历史消息。", "tools_not_supported");
+  const visionMessages = protocol === "gemini"
+    ? (Array.isArray(raw) ? raw.map(c => ({ content: c?.parts })) : [])
+    : Array.isArray(raw) ? raw : [];
+  if (detectVisionInput(visionMessages)) unsupportedInput("上游不支持视觉及媒体输入。", "vision_not_supported");
+
+  if (protocol === "responses" && typeof raw === "string") {
+    validateTextContent(raw, []);
+  } else {
+    if (!Array.isArray(raw) || !raw.length) invalidInput("消息数组不能为空。");
+    for (const message of raw) {
+      if (!isRecord(message)) invalidInput("每条消息必须是对象。");
+      if (protocol === "responses" && message.type !== undefined && message.type !== "message") {
+        unsupportedInput(`暂不支持 Responses 输入类型 ${String(message.type)}。`);
+      }
+      const roles = protocol === "anthropic" ? ["user", "assistant"]
+        : protocol === "gemini" ? ["user", "model"] : ["system", "developer", "user", "assistant"];
+      const role = message.role === undefined && ["gemini", "responses"].includes(protocol) ? "user" : message.role;
+      if (!roles.includes(role)) invalidInput("消息角色无效。");
+      const types = protocol === "responses" ? ["text", "input_text", "output_text"]
+        : protocol === "openai" ? ["text", "input_text", "inputText"] : ["text"];
+      validateTextContent(protocol === "gemini" ? message.parts : message.content, types, protocol === "gemini");
+    }
+  }
+  if (protocol === "responses" && body.instructions !== undefined && typeof body.instructions !== "string") {
+    invalidInput("instructions 必须是字符串。");
+  }
+  if (protocol === "anthropic" && body.system !== undefined && body.system !== "") validateTextContent(body.system, ["text"]);
+  if (protocol === "gemini" && body.systemInstruction !== undefined) {
+    if (!isRecord(body.systemInstruction)) invalidInput("systemInstruction 必须是对象。");
+    validateTextContent(body.systemInstruction.parts, [], true);
+  }
+  return body;
+}
+
+/** 为四协议统一附加请求预算、关联编号和早期拒绝完成日志。 */
+async function handleTracedRequest(original: Request): Promise<Response> {
+  const path = new URL(original.url).pathname;
+  const protocol: ApiProtocol | undefined = original.method !== "POST" ? undefined
+    : path === "/v1/chat/completions" ? "openai"
+    : path === "/v1/responses" ? "responses"
+    : path === "/v1/messages" ? "anthropic"
+    : /^\/v1beta\/models\/.+:(generateContent|streamGenerateContent)$/.test(path) ? "gemini" : undefined;
+  if (!protocol) return handleRequest(original);
+  const controller = new AbortController();
+  const req = new Request(original, { signal: AbortSignal.any([original.signal, controller.signal]) });
+  const trace = createRequestTrace(req, protocol);
+  requestTraces.set(req, trace);
+  const timer = setTimeout(() => controller.abort(new UpstreamTimeoutError("total")),
+    Math.max(1, UPSTREAM_TOTAL_TIMEOUT_MS - REQUEST_TIMEOUT_RESERVE_MS));
+  trace.cleanup = () => clearTimeout(timer);
+  try {
+    const response = await handleRequest(req);
+    response.headers.set("X-Request-ID", trace.requestId);
+    response.headers.set("X-Context-Truncated", String(trace.contextTruncated ?? false));
+    response.headers.set("Access-Control-Expose-Headers", "X-Request-ID, X-Context-Truncated, X-Session-ID, X-Conversation-ID, Retry-After");
+    if (!response.headers.get("Content-Type")?.includes("text/event-stream")) {
+      finishRequestTrace(trace, `http_${response.status}`);
+    }
+    return response;
+  } catch (error) {
+    finishRequestTrace(trace, "handler_error");
+    const response = handlerFailureResponse(protocol, error);
+    response.headers.set("X-Request-ID", trace.requestId);
+    return response;
+  }
+}
+
 // 处理文本对话请求
 async function handleChatCompletion(req: Request): Promise<Response> {
   let modelName = "sider"; // 函数级: catch 出口的失败统计也要用
   const trace = createRequestTrace(req, "openai");
   try {
-    const requestBody = await req.json();
+    const requestBody = await readValidatedBody(req, "openai");
     console.log("📥 收到聊天请求:", {
       model: requestBody.model,
       stream: requestBody.stream,
@@ -2816,13 +3054,12 @@ async function handleChatCompletion(req: Request): Promise<Response> {
       recordFailure(modelName);
       return contextOverflowResponse("openai");
     }
-    logContextTruncation("openai", modelName, ctx);
+    logContextTruncation("openai", modelName, ctx, trace);
     const fullContext = ctx.text;
 
     // 会话复用只在调用方【显式回传 X-Session-ID】时发生 (见 resolveSessionId)
     const sessionInfo = resolveSessionId(req);
     const sessionId = sessionInfo.id;
-    const session = sessionInfo.reusable ? conversationSessions.get(sessionId) : undefined;
 
     // 构建 Sider 请求
     const siderRequest = JSON.parse(JSON.stringify(DEFAULT_REQUEST_TEMPLATE));
@@ -2846,16 +3083,6 @@ async function handleChatCompletion(req: Request): Promise<Response> {
 
     // 设置 Think 模式
     siderRequest.think_mode = { enable: enableThink };
-
-    // 多轮对话支持
-    if (session) {
-      siderRequest.cid = session.cid;
-      siderRequest.parent_message_id = session.parent_message_id;
-      session.last_used = Date.now();
-      console.log(`♻️ 使用现有会话: ${sessionId} (cid: ${session.cid})`);
-    } else {
-      console.log(`🆕 无状态会话: ${sessionId} (未回传 X-Session-ID, 本次不读写上游会话)`);
-    }
 
     if (toolChoiceNone) {
       siderRequest.tools = { auto: [] };
@@ -2896,7 +3123,7 @@ async function handleChatCompletion(req: Request): Promise<Response> {
         "X-App-Version": "5.21.2"
       },
       body: JSON.stringify(siderRequest)
-    }, "openai", req.signal, trace);
+    }, "openai", req.signal, trace, sessionInfo);
     const siderResponse = call.response;
 
     if (!siderResponse.ok) {
@@ -2918,7 +3145,7 @@ async function handleChatCompletion(req: Request): Promise<Response> {
   } catch (error: any) {
     finishRequestTrace(trace, "handler_error");
     console.error("❌ 处理请求异常:", error);
-    recordFailure(modelName); // 失败统计: 异常出口
+    recordFailure(trace.externalModel || modelName); // 失败统计: 异常出口
     return handlerFailureResponse("openai", error);
   }
 }
@@ -2971,15 +3198,7 @@ async function handleNonStreamingResponse(
         parentMessageId = data.message_start.parent_message_id || "";
         console.log("📝 会话信息:", { conversationId, messageId, parentMessageId });
 
-        // 只有调用方显式回传 X-Session-ID 时才把会话写进存储
-        if (session.reusable) {
-          conversationSessions.set(session.id, {
-            cid: conversationId,
-            parent_message_id: messageId, // 下一轮使用当前 assistant 消息作为 parent
-            created_at: conversationSessions.get(session.id)?.created_at || Date.now(),
-            last_used: Date.now()
-          });
-        }
+        call.stageSession(conversationId, messageId);
         break;
 
       case "text":
@@ -3312,15 +3531,7 @@ function handleStreamingResponse(
               const messageId = data.message_start.assistant_message_id || "";
               console.log("📝 流式会话开始:", conversationId);
 
-              // 只有调用方显式回传 X-Session-ID 时才把会话写进存储
-              if (session.reusable) {
-                conversationSessions.set(session.id, {
-                  cid: conversationId,
-                  parent_message_id: messageId,
-                  created_at: conversationSessions.get(session.id)?.created_at || Date.now(),
-                  last_used: Date.now()
-                });
-              }
+              call.stageSession(conversationId, messageId);
               break;
 
             case "text":
@@ -3877,7 +4088,7 @@ async function handleGeminiGenerate(
   const trace = createRequestTrace(req, "gemini");
   trace.externalModel = geminiModel;
   try {
-    const body = await req.json();
+    const body = await readValidatedBody(req, "gemini");
     console.log(`📥 Gemini ${isStream ? "stream" : "generate"}: model=${geminiModel}`);
     const outputLimits = geminiOutputLimits(body);
 
@@ -3954,7 +4165,7 @@ async function handleGeminiGenerate(
       recordFailure(geminiModel);
       return contextOverflowResponse("gemini");
     }
-    logContextTruncation("gemini", geminiModel, ctx);
+    logContextTruncation("gemini", geminiModel, ctx, trace);
     const fullContext = ctx.text;
 
     // 构建 Sider 上游请求
@@ -4291,7 +4502,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
   let anthroModel = "claude-sonnet-4.6"; // 函数级: catch 出口的失败统计也要用
   const trace = createRequestTrace(req, "anthropic");
   try {
-    const body = await req.json();
+    const body = await readValidatedBody(req, "anthropic");
     const isStream = body.stream === true;
     console.log(`📥 Anthropic ${isStream ? "stream" : "message"}: model=${body.model}`);
     const outputLimits = anthropicOutputLimits(body);
@@ -4372,7 +4583,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
       recordFailure(anthroModel);
       return contextOverflowResponse("anthropic");
     }
-    logContextTruncation("anthropic", anthroModel, ctx);
+    logContextTruncation("anthropic", anthroModel, ctx, trace);
     const fullContext = ctx.text;
 
     const enableSearch = shouldEnableAutoSearch(prompt);
@@ -4697,7 +4908,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
   } catch (error: any) {
     finishRequestTrace(trace, "handler_error");
     console.error("❌ 处理请求异常:", error);
-    recordFailure(anthroModel); // 失败统计: 异常出口
+    recordFailure(trace.externalModel || anthroModel); // 失败统计: 异常出口
     return handlerFailureResponse("anthropic", error);
   }
 }
@@ -4794,7 +5005,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
   let modelName = "sider"; // 函数级: catch 出口的失败统计也要用
   const trace = createRequestTrace(req, "responses");
   try {
-    const body = await req.json();
+    const body = await readValidatedBody(req, "responses");
     const isStream = body.stream === true;
     console.log(`📥 Responses ${isStream ? "stream" : "nonstream"}: model=${body.model}`);
     const outputLimits = responsesOutputLimits(body);
@@ -4880,7 +5091,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
       recordFailure(modelName);
       return contextOverflowResponse("responses");
     }
-    logContextTruncation("responses", modelName, ctx);
+    logContextTruncation("responses", modelName, ctx, trace);
     const fullContext = ctx.text;
 
     const enableSearch = shouldEnableAutoSearch(prompt);
@@ -5191,7 +5402,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
   } catch (error: any) {
     finishRequestTrace(trace, "handler_error");
     console.error("❌ 处理请求异常:", error);
-    recordFailure(modelName); // 失败统计: 异常出口
+    recordFailure(trace.externalModel || modelName); // 失败统计: 异常出口
     return handlerFailureResponse("responses", error);
   }
 }
@@ -5968,7 +6179,14 @@ async function handleRequest(req: Request): Promise<Response> {
   // 匹配 /v1beta/models/{model}:generateContent 或 :streamGenerateContent
   const geminiMatch = path.match(/^\/v1beta\/models\/(.+):(generateContent|streamGenerateContent)$/);
   if (req.method === "POST" && geminiMatch) {
-    const geminiModel = geminiMatch[1];
+    let geminiModel: string;
+    try {
+      geminiModel = decodeURIComponent(geminiMatch[1]);
+    } catch {
+      return protocolErrorResponse("gemini", {
+        statusCode: 400, type: "invalid_request_error", message: "模型路径编码无效。",
+      });
+    }
     const geminiAction = geminiMatch[2];
     const isStream = geminiAction === "streamGenerateContent";
     return authMiddleware(async (req: Request) =>
@@ -6201,7 +6419,7 @@ Deno.serve({
     // 服务启动成功后，再在后台加载自定义模型
     loadCustomModels().catch(err => console.error("⚠️ 自定义模型加载失败:", err));
   }
-}, handleRequest);
+}, handleTracedRequest);
 
 console.log("📍 监听端口: 8000");
 console.log("🔗 主页: http://localhost:8000");

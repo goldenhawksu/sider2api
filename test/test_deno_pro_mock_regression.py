@@ -266,6 +266,21 @@ def _handler_factory(state: MockSiderState):
                 self.close_connection = True
                 return
 
+            if "MOCK_HTTP_SLOW_BODY" in prompt:
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                try:
+                    for _ in range(60):
+                        self.wfile.write(b"still waiting ")
+                        self.wfile.flush()
+                        time.sleep(0.05)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    state.mark_disconnected(prompt)
+                return
+
             frames, delay = _scenario_frames(prompt, seq)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")

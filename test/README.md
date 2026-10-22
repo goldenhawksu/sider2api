@@ -63,6 +63,7 @@ BASE_URL=http://localhost:8000 pytest                    # 进程环境变量覆
 | `test_vision.py` | `vision` | Vision 输入 → not_supported (4 端点) |
 | `test_performance.py` | `perf` | 非流式延迟 + 流式 TTFT/吞吐 |
 | `test_deno_pro_mock_regression.py` | `smoke` | **mock 上游驱动的门控/协议契约回归** (零额度): 三段超时、排队后二次准入、半开探测、成功判定、四协议错误出口矩阵、Context 预算、会话复用、官方 SDK 契约 (openai / anthropic / google-genai) |
+| `test_deno_pro_reliability.py` | `smoke` | 四协议输入校验、特殊模型与窗口别名、最终上下文预算及裁剪通知、请求总期限、会话检查点与并发、早期拒绝统计和日志 |
 | `test_stream_contract.py` | `stream` | 流式事件契约 (Anthropic content-block 状态机) |
 | `test_rate_limit.py` | `cost`/`rate_limit` | 熔断语义 (603 不熔断) |
 | `test_stats.py` | `smoke`/`chat` | `/stats` 页面与 `/stats.json` 契约 |
@@ -73,5 +74,5 @@ BASE_URL=http://localhost:8000 pytest                    # 进程环境变量覆
 > 真实上游无法稳定复现的行为。改 `deno_pro.ts` 的门控、超时或协议事件后请先跑它:
 
 ```bash
-python -m pytest test/test_deno_pro_mock_regression.py -q
+python -m pytest test/test_deno_pro_mock_regression.py test/test_deno_pro_reliability.py -q
 ```
