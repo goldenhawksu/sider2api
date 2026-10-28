@@ -173,7 +173,7 @@ const MODEL_MAPPING: Record<string, string> = {
   "gemini-4-argon-think": "gemini-4-argon-think",
 
   // DeepSeek 系列
-  "deepseek-v4.1-flash": "deepseek-v4.1-flash",
+  "deepseek-v4-flash": "deepseek-v4-flash",
   "deepseek-v4-flash-think": "deepseek-v4-flash-think",
   "deepseek-v4-pro": "deepseek-v4-pro",
   "deepseek-v4-pro-think": "deepseek-v4-pro-think",
