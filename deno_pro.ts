@@ -132,6 +132,7 @@ const MODEL_MAPPING: Record<string, string> = {
   "gpt-4.1-mini": "gpt-4.1-mini",
   "gpt-6-luna": "gpt-6-luna",
   "gpt-6.1-sol": "gpt-6.1-sol",
+  "gpt-6.1-terra": "gpt-6.1-terra",
 
   // Claude 系列
   "claude-opus-4.8": "claude-opus-4.8",
@@ -168,9 +169,11 @@ const MODEL_MAPPING: Record<string, string> = {
   "gemini-3.1-pro": "gemini-3.1-pro",
   "gemini-3.0-pro-think": "gemini-3.0-pro-think",
   "gemini-3.1-pro-think": "gemini-3.1-pro-think",
+  "gemini-4-argon": "gemini-4-argon",
+  "gemini-4-argon-think": "gemini-4-argon-think",
 
   // DeepSeek 系列
-  "deepseek-v4-flash": "deepseek-v4-flash",
+  "deepseek-v4.1-flash": "deepseek-v4.1-flash",
   "deepseek-v4-flash-think": "deepseek-v4-flash-think",
   "deepseek-v4-pro": "deepseek-v4-pro",
   "deepseek-v4-pro-think": "deepseek-v4-pro-think",
