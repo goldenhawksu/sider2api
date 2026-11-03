@@ -136,7 +136,7 @@ def test_early_rejection_records_requested_model_and_completion_log(reliability_
     field = "parts" if protocol == "gemini" else "content"
     body[key][0][field] = [{"unknown": {}}] if protocol == "gemini" else [{"type": "unknown"}]
     def failures():
-        snapshot = requests.get(stack["base_url"] + "/stats.json", timeout=5).json()
+        snapshot = requests.get(stack["base_url"] + "/stats.json", headers=_headers(), timeout=5).json()
         return next((row["failures"] for row in snapshot["models"] if row["model"] == "gpt-5.5"), 0)
     before = failures()
     request_id = "early-" + uuid4().hex

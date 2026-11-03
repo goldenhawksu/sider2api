@@ -1,8 +1,8 @@
-"""stats 用量统计测试: /stats 页面公开可看, /stats.json 公开返回快照+预渲染片段,
+"""stats 用量统计测试: /stats 和 /stats.json 均需凭证，返回快照及预渲染片段,
 时间戳用 UTC+8 显示, 页面内嵌 5 秒局部刷新脚本, 采集链路随真实请求生效。
 
 分层:
-- smoke 级 (零额度): /stats 200 + HTML 结构契约; /stats.json 公开 + 快照结构 + html 片段契约。
+- smoke 级 (零额度): 看板鉴权、HTML 结构与 JSON 快照/预渲染片段契约。
 - chat 级 (耗真实额度): 发起一次对话后, /stats.json 的近 24h 窗口应反映该请求。
 """
 import re
@@ -33,9 +33,10 @@ TOTALS_KEYS = {"requests", "streaming", "toolCalls", "inputChars", "outputChars"
 HTML_FRAGMENT_KEYS = {"tiles", "sub", "donut", "modelRows", "trend", "toolRows", "recentRows", "footer"}
 
 
-def test_stats_page_public(client):
-    """/stats 页面公开 (无需鉴权), 返回自包含 HTML。"""
-    r = client.get("/stats", auth=False)
+def test_stats_page_requires_auth(client):
+    """看板拒绝匿名访问，凭证有效时返回自包含 HTML。"""
+    assert client.get("/stats", auth=False).status_code == 401
+    r = client.get("/stats")
     assert r.status_code == 200
     assert "text/html" in r.headers.get("content-type", "")
     html = r.text
@@ -48,16 +49,17 @@ def test_stats_page_public(client):
     assert "setInterval" in html and "5000" in html
 
 
-def test_stats_json_public(client):
-    """/stats.json 与 /stats 同级公开 (页面每 5s 局部刷新依赖它, 无需鉴权)。"""
-    r = client.get("/stats.json", auth=False)
+def test_stats_json_requires_auth(client):
+    """原始数据拒绝匿名访问，凭证有效时返回快照。"""
+    assert client.get("/stats.json", auth=False).status_code == 401
+    r = client.get("/stats.json")
     assert r.status_code == 200
     assert "application/json" in r.headers.get("content-type", "")
 
 
 def test_stats_json_contract(client):
     """/stats.json 返回完整快照结构 (即使全 0) + 预渲染 HTML 片段。"""
-    r = client.get("/stats.json", auth=False)
+    r = client.get("/stats.json")
     assert r.status_code == 200
     snap = r.json()
     assert SNAPSHOT_KEYS <= set(snap.keys()), f"快照缺字段: {SNAPSHOT_KEYS - set(snap.keys())}"
@@ -86,7 +88,7 @@ def test_stats_json_contract(client):
 
 def test_stats_page_shows_failures_column(client):
     """/stats 模型分布表含"失败"列 (表头 + 数据行均带 failures)。"""
-    page = client.get("/stats", auth=False)
+    page = client.get("/stats")
     assert page.status_code == 200
     # 表头含失败列
     assert "失败</th>" in page.text
@@ -101,7 +103,7 @@ def test_stats_failure_recorded_on_vision_gate(client):
     零成本: 视觉门控在入站即拒绝, 不触达上游。金额消耗: 0。
     """
     model = config.SINGLE_MODEL
-    r_before = client.get("/stats.json", auth=False)
+    r_before = client.get("/stats.json")
     before = r_before.json()
     before_fail = 0
     for m in before["models"]:
@@ -116,7 +118,7 @@ def test_stats_failure_recorded_on_vision_gate(client):
     ]}], stream=False)
     assert r.status_code == 422, f"视觉门控应返回 422: {r.status_code} {r.text[:100]}"
 
-    r_after = client.get("/stats.json", auth=False)
+    r_after = client.get("/stats.json")
     snap = r_after.json()
     after_fail = 0
     for m in snap["models"]:
@@ -134,7 +136,7 @@ def test_stats_page_utc8_timestamps(client):
     通过 /stats.html 片段的趋势图 x 轴标签断言: 快照 trend 的 at 是 UTC ISO 字符串,
     页面显示的 hhmm 应等于 at+8h 的时分。取最近一个桶做验证。
     """
-    r = client.get("/stats.json", auth=False)
+    r = client.get("/stats.json")
     assert r.status_code == 200
     snap = r.json()
     trend = snap["trend"]
@@ -146,7 +148,7 @@ def test_stats_page_utc8_timestamps(client):
     utc8 = utc + timedelta(hours=8)
     expect_hhmm = f"{utc8.hour:02d}:{utc8.minute:02d}"
 
-    page = client.get("/stats", auth=False)
+    page = client.get("/stats")
     assert page.status_code == 200
     assert expect_hhmm in page.text, (
         f"页面未显示 UTC+8 时间 {expect_hhmm} (trend 末桶 at={last['at']})"
@@ -191,10 +193,10 @@ def test_stats_reflects_chat_request(client):
 def test_stats_models_match_24h_window(client):
     """统计快照统一使用 24h 窗口, 而非累计全量。
 
-    断言: totals 等于当前窗口趋势桶求和; models 的总请求数 ≤ 当前窗口请求数。
+    断言: totals 等于当前窗口趋势桶求和; models 的总请求数等于当前窗口请求数。
     金额消耗: 0 (只读)。
     """
-    snap = client.get("/stats.json", auth=False).json()
+    snap = client.get("/stats.json").json()
     models_total = sum(m["requests"] for m in snap["models"])
     trend_total = sum(b["requests"] for b in snap["trend"])
     trend_totals = {
@@ -207,10 +209,9 @@ def test_stats_models_match_24h_window(client):
     assert snap["totals"] == trend_totals, (
         f"totals 应等于近 24h 趋势总量: totals={snap['totals']} trend={trend_totals}"
     )
-    # 模型分布来自窗口内 recent 聚合; trend 来自小时桶。两者同窗口,
-    # 差异仅来自 recent 200 条上限 (高流量下 trend 可能更高)。
-    assert models_total <= trend_total + 2, (
-        f"模型分布应 ≤ 24h 窗口趋势总量: models={models_total} trend={trend_total}"
+    # 模型分布与趋势均来自独立小时桶，明细容量不影响聚合。
+    assert models_total == trend_total, (
+        f"模型分布应等于 24h 窗口趋势总量: models={models_total} trend={trend_total}"
     )
     # 若窗口内有流量, 模型分布不应为空
     if trend_total > 0:

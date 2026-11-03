@@ -65,7 +65,7 @@ irm https://deno.land/install.ps1 | iex
 # 必需
 export SIDER_AUTH_TOKEN="你的_Sider_Token"
 
-# 可选 - API认证 (推荐生产环境配置)
+# 必需 - 业务 API 认证；未配置时默认拒绝请求
 export AUTH_TOKEN="your-secret-key"
 ```
 
@@ -101,6 +101,8 @@ deno run --allow-net --allow-env --allow-read --allow-write deno_pro.ts
 
 ### API 认证
 
+当前版本要求配置 `AUTH_TOKEN`。管理 API 使用 `ADMIN_TOKEN`，未单独设置时沿用 `AUTH_TOKEN`；只读看板可使用 `STATS_TOKEN`，浏览器登录后可自动刷新。详细配置与迁移说明见 [上游更新移植报告](上游更新移植与验证报告_20261103.md)。
+
 配置 `AUTH_TOKEN` 后,所有管理 API 请求都需要携带 Bearer Token:
 
 ```bash
@@ -132,6 +134,7 @@ curl -H "Authorization: Bearer YOUR_AUTH_TOKEN" \
 ```bash
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_AUTH_TOKEN" \
   -d '{
     "model": "claude-4.5-sonnet",
     "messages": [{"role": "user", "content": "你好"}],
@@ -144,6 +147,7 @@ curl http://localhost:8000/v1/chat/completions \
 ```bash
 curl http://localhost:8000/v1/images/generations \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_AUTH_TOKEN" \
   -d '{
     "prompt": "一只可爱的小猫",
     "n": 1,

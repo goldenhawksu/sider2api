@@ -66,7 +66,8 @@ BASE_URL=http://localhost:8000 pytest                    # 进程环境变量覆
 | `test_deno_pro_reliability.py` | `smoke` | 四协议输入校验、特殊模型与窗口别名、最终上下文预算及裁剪通知、请求总期限、会话检查点与并发、早期拒绝统计和日志 |
 | `test_stream_contract.py` | `stream` | 流式事件契约 (Anthropic content-block 状态机) |
 | `test_rate_limit.py` | `cost`/`rate_limit` | 熔断语义 (603 不熔断) |
-| `test_stats.py` | `smoke`/`chat` | `/stats` 页面与 `/stats.json` 契约 |
+| `test_stats.py` | `smoke`/`chat` | 看板鉴权、`/stats` 页面与 `/stats.json` 契约 |
+| `test_upstream_updates.py` | `smoke` | 开流提交窗口、退避字段、凭证隔离、看板 Cookie、字节及会话容量、小时桶和上游计数 |
 | `test_sdk_auth.py` | `smoke`/`cost` | 三家官方 SDK 的鉴权头兼容 |
 
 > **mock 回归是改动门控/协议时的第一道闸门**: 它自带 mock 上游与独立 deno 实例,

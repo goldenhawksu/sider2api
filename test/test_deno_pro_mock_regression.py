@@ -324,6 +324,7 @@ def _launch_stack(env_extra: dict[str, str] | None = None):
         "SIDER_API_ENDPOINT": f"http://127.0.0.1:{mock_server.server_port}/sider",
         "SIDER_AUTH_TOKEN": "mock-sider-token",
         "AUTH_TOKEN": AUTH_TOKEN,
+        "ADMIN_TOKEN": "", "STATS_TOKEN": "", "STATS_PUBLIC": "false", "ALLOW_OPEN_AUTH": "false",
         "RATE_LIMIT_ENABLED": "true",
         "RATE_LIMIT_MAX_CALLS": "100",
         "SSE_PING_INTERVAL_MS": "0",
@@ -474,6 +475,7 @@ def timeout_stack():
     with _launch_stack({
         "UPSTREAM_HEADER_TIMEOUT_MS": "2000",
         "UPSTREAM_STREAM_IDLE_TIMEOUT_MS": "1000",
+        "STREAM_COMMIT_WINDOW_MS": "0",
         "UPSTREAM_TOTAL_TIMEOUT_MS": "20000",
         "UPSTREAM_MAX_CONCURRENCY": "1",
     }) as stack:
@@ -607,7 +609,7 @@ def _collect_openai_stream(resp) -> dict[str, Any]:
 
 
 def _get_stats(base_url: str) -> dict[str, Any]:
-    resp = requests.get(base_url + "/stats.json", timeout=(3, 10))
+    resp = requests.get(base_url + "/stats.json", headers=_headers(), timeout=(3, 10))
     assert resp.status_code == 200, resp.text
     return resp.json()
 

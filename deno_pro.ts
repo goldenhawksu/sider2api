@@ -9,8 +9,16 @@ const SIDER_API_ENDPOINT = Deno.env.get("SIDER_API_ENDPOINT") ||
 
 // 从环境变量获取 Token,如果没有则使用默认值(仅用于测试)
 const SIDER_AUTH_TOKEN = Deno.env.get("SIDER_AUTH_TOKEN")
-// 服务端 API 认证 Token(可选)
+// 客户端、管理与只读看板凭证；管理凭证未单独设置时沿用客户端凭证。
 const AUTH_TOKEN = Deno.env.get("AUTH_TOKEN");
+const ADMIN_TOKEN = Deno.env.get("ADMIN_TOKEN") || AUTH_TOKEN;
+const STATS_TOKENS = [Deno.env.get("STATS_TOKEN"), AUTH_TOKEN, ADMIN_TOKEN].filter((v): v is string => !!v);
+const ALLOW_OPEN_AUTH = Deno.env.get("ALLOW_OPEN_AUTH") === "true";
+const STATS_PUBLIC = Deno.env.get("STATS_PUBLIC") === "true";
+const MAX_REQUEST_BODY_BYTES = Math.max(1, parseInt(Deno.env.get("MAX_REQUEST_BODY_BYTES") || "", 10) || 32 * 1024 * 1024);
+const MAX_CONVERSATION_SESSIONS = Math.max(1, parseInt(Deno.env.get("MAX_CONVERSATION_SESSIONS") || "", 10) || 2000);
+const configuredCommitWindow = Number(Deno.env.get("STREAM_COMMIT_WINDOW_MS") ?? "20000");
+const STREAM_COMMIT_WINDOW_MS = Number.isFinite(configuredCommitWindow) && configuredCommitWindow >= 0 ? configuredCommitWindow : 20000;
 
 // ==================== 性能/兼容性开关 ====================
 // 上游请求【三段超时】(毫秒)。单个定时器只能约束到"响应头到达"为止 —— 上游回了 200
@@ -240,6 +248,24 @@ interface ConversationSession {
 }
 
 const conversationSessions = new Map<string, ConversationSession>();
+
+function getConversationSession(id: string): ConversationSession | undefined {
+  const session = conversationSessions.get(id);
+  if (session && Date.now() - session.last_used > 3600000) {
+    conversationSessions.delete(id);
+    return undefined;
+  }
+  return session;
+}
+
+/** 完成轮次后更新最近使用顺序；容量淘汰不影响正在执行请求持有的检查点。 */
+function storeConversationSession(id: string, session: ConversationSession): void {
+  conversationSessions.delete(id);
+  conversationSessions.set(id, session);
+  while (conversationSessions.size > MAX_CONVERSATION_SESSIONS) {
+    conversationSessions.delete(conversationSessions.keys().next().value!);
+  }
+}
 
 // 会话清理(保留1小时内的会话)
 function cleanupOldSessions() {
@@ -792,6 +818,7 @@ function protocolErrorPayload(protocol: ApiProtocol, detail: UpstreamErrorDetail
       error: {
         type: anthropicErrorType(detail),
         message: detail.message,
+        ...(detail.retryAfterSec !== undefined ? { retry_after: detail.retryAfterSec } : {}),
         code: detail.reason ?? detail.type,
         ...(detail.model !== undefined ? { model: detail.model } : {}),
         ...(detail.upstreamCode !== undefined ? { upstream_code: detail.upstreamCode } : {}),
@@ -803,6 +830,7 @@ function protocolErrorPayload(protocol: ApiProtocol, detail: UpstreamErrorDetail
       error: {
         code: detail.statusCode,
         message: detail.message,
+        ...(detail.retryAfterSec !== undefined ? { retry_after: detail.retryAfterSec } : {}),
         status: geminiErrorStatus(detail),
         details: [{
           reason: detail.reason ?? detail.type,
@@ -816,6 +844,7 @@ function protocolErrorPayload(protocol: ApiProtocol, detail: UpstreamErrorDetail
   return {
     error: {
       message: detail.message,
+        ...(detail.retryAfterSec !== undefined ? { retry_after: detail.retryAfterSec } : {}),
       type: detail.type,
       ...(detail.param !== undefined ? { param: detail.param } : {}),
       ...(detail.reason !== undefined ? { code: detail.reason } : {}),
@@ -959,7 +988,11 @@ interface TrendBucketRow {
   outputChars: number;
 }
 
+type UpstreamStats = { attempts: number; succeeded: number; failed: number; quotaErrors: number; gateRejections: number };
+const emptyUpstreamStats = (): UpstreamStats => ({ attempts: 0, succeeded: 0, failed: 0, quotaErrors: 0, gateRejections: 0 });
+
 interface StatsSnapshot {
+  upstream: UpstreamStats;
   since: string;
   totals: {
     requests: number;
@@ -991,29 +1024,84 @@ const STATS_BUCKET_MS = 60 * 60_000; // 1 小时桶 = 近 24 小时趋势
 const STATS_BUCKET_COUNT = 24;
 
 const statsRecent: Array<{ at: number; record: UsageRecord }> = [];
-// 失败事件时间戳 (供 24h 模型分布的失败计数; 与 recent 同上限, 新在前)
-const statsFailureRecent: Array<{ at: number; model: string }> = [];
+interface LocalStatsBucket {
+  upstream: UpstreamStats;
+  trend: TrendBucketRow;
+  models: Map<string, ModelStatRow>;
+  tools: Map<string, number>;
+}
+const statsBuckets = new Map<number, LocalStatsBucket>();
 
-// 每次请求完成时调用 (fire-and-forget 语义: 不抛错、不阻塞响应路径)
-function recordUsage(record: UsageRecord): void {
-  statsRecent.unshift({ at: Date.now(), record });
-  if (statsRecent.length > STATS_RECENT_LIMIT) {
-    statsRecent.length = STATS_RECENT_LIMIT;
+/** 聚合只保留 24 个小时桶，明细容量不会截断窗口统计。 */
+function localStatsBucket(now = Date.now()): LocalStatsBucket {
+  const hour = Math.floor(now / STATS_BUCKET_MS) * STATS_BUCKET_MS;
+  for (const at of statsBuckets.keys()) {
+    if (at < hour - (STATS_BUCKET_COUNT - 1) * STATS_BUCKET_MS) statsBuckets.delete(at);
   }
-
-  persistUsage(record); // fire-and-forget; KV 未启用时内部直接返回
+  let bucket = statsBuckets.get(hour);
+  if (!bucket) {
+    bucket = {
+      trend: { at: new Date(hour).toISOString(), ...emptyStatsTotals(), failures: 0 },
+      models: new Map(), tools: new Map(), upstream: emptyUpstreamStats(),
+    };
+    statsBuckets.set(hour, bucket);
+  }
+  return bucket;
 }
 
-// 记录一次失败的请求 (上游错误/能力门控/异常出口)。
-// 单独函数: 失败路径没有完整的 UsageRecord (无 token/工具信息), 只关心模型维度计数。
-// 失败事件带时间戳入队, 供 24h 窗口的模型分布失败计数。
-function recordFailure(model: string): void {
-  statsFailureRecent.unshift({ at: Date.now(), model });
-  if (statsFailureRecent.length > STATS_RECENT_LIMIT) {
-    statsFailureRecent.length = STATS_RECENT_LIMIT;
+function localModelRow(bucket: LocalStatsBucket, model: string): ModelStatRow {
+  let row = bucket.models.get(model);
+  if (!row) {
+    row = { model, requests: 0, failures: 0, inputChars: 0, outputChars: 0, totalChars: 0 };
+    bucket.models.set(model, row);
   }
+  return row;
+}
 
-  persistFailure(model); // fire-and-forget; KV 未启用时内部直接返回
+function recordUsage(record: UsageRecord): void {
+  const now = Date.now();
+  statsRecent.unshift({ at: now, record });
+  if (statsRecent.length > STATS_RECENT_LIMIT) statsRecent.length = STATS_RECENT_LIMIT;
+  const bucket = localStatsBucket(now);
+  bucket.trend.requests += 1;
+  if (record.stream) bucket.trend.streaming += 1;
+  bucket.trend.toolCalls += record.toolUses.length;
+  bucket.trend.inputChars += record.inputChars;
+  bucket.trend.outputChars += record.outputChars;
+  const row = localModelRow(bucket, record.model);
+  row.requests += 1;
+  row.inputChars += record.inputChars;
+  row.outputChars += record.outputChars;
+  row.totalChars += record.inputChars + record.outputChars;
+  for (const name of record.toolUses) bucket.tools.set(name, (bucket.tools.get(name) ?? 0) + 1);
+  persistUsage(record);
+}
+
+function recordFailure(model: string): void {
+  const bucket = localStatsBucket();
+  bucket.trend.failures += 1;
+  localModelRow(bucket, model).failures += 1;
+  persistFailure(model);
+}
+
+/** 实际发送、结算和门控拒绝分开累计；沿用趋势命名空间与过期清理。 */
+function recordUpstreamActivity(field: keyof UpstreamStats): void {
+  localStatsBucket().upstream[field] += 1;
+  void (async () => {
+    const kv = await getStatsKv();
+    if (!kv) return;
+    const hour = Math.floor(Date.now() / STATS_BUCKET_MS) * STATS_BUCKET_MS;
+    await kv.atomic().sum([...statsKvPrefix(), "trend", hour, "upstream", field], 1n).commit();
+    void cleanupStaleTrendKeys(kv);
+  })().catch(() => {});
+}
+
+function localUpstreamStats(): UpstreamStats {
+  const result = emptyUpstreamStats();
+  for (const bucket of statsBuckets.values()) {
+    for (const field of Object.keys(result) as Array<keyof UpstreamStats>) result[field] += bucket.upstream[field];
+  }
+  return result;
 }
 
 type StatsTotals = StatsSnapshot["totals"];
@@ -1033,86 +1121,43 @@ function totalsFromTrend(trend: TrendBucketRow[]): StatsTotals {
   }, emptyStatsTotals());
 }
 
-// 近 24 小时按小时分桶; 空桶保留保证时间轴连续。
-// 数据源是 recent(200 条上限), 高流量下早期桶会偏低; KV 模式用小时桶聚合保持跨实例一致。
+// 趋势、模型和工具使用同一组小时桶；最近请求只负责展示明细。
 function buildStatsTrend(now: number): TrendBucketRow[] {
-  const currentBucket = Math.floor(now / STATS_BUCKET_MS) * STATS_BUCKET_MS;
-  const buckets = new Map<number, TrendBucketRow>();
-  for (let i = STATS_BUCKET_COUNT - 1; i >= 0; i -= 1) {
-    const at = currentBucket - i * STATS_BUCKET_MS;
-    buckets.set(at, {
-      at: new Date(at).toISOString(),
-      requests: 0,
-      streaming: 0,
-      toolCalls: 0,
-      failures: 0,
-      inputChars: 0,
-      outputChars: 0,
-    });
-  }
-  for (const { at, record } of statsRecent) {
-    const key = Math.floor(at / STATS_BUCKET_MS) * STATS_BUCKET_MS;
-    const bucket = buckets.get(key);
-    if (!bucket) continue; // 落在 24 小时窗口外
-    bucket.requests += 1;
-    if (record.stream) bucket.streaming += 1;
-    bucket.toolCalls += record.toolUses.length;
-    bucket.inputChars += record.inputChars;
-    bucket.outputChars += record.outputChars;
-  }
-  return [...buckets.values()];
+  localStatsBucket(now);
+  const hour = Math.floor(now / STATS_BUCKET_MS) * STATS_BUCKET_MS;
+  return Array.from({ length: STATS_BUCKET_COUNT }, (_, index) => {
+    const at = hour - (STATS_BUCKET_COUNT - 1 - index) * STATS_BUCKET_MS;
+    return statsBuckets.get(at)?.trend ?? { at: new Date(at).toISOString(), ...emptyStatsTotals(), failures: 0 };
+  });
 }
 
-// 近 24 小时窗口的模型分布聚合 (进程内)。
-// 数据源: statsRecent (带时间戳的请求记录) + statsFailureRecent (带时间戳的失败事件)。
-// 与 buildStatsTrend 同口径: 只统计 24 小时窗口内的记录, 窗口外忽略。
 function buildStatsModels(now: number): ModelStatRow[] {
-  const cutoff = now - STATS_BUCKET_MS * STATS_BUCKET_COUNT;
-  const map = new Map<string, ModelStatRow>();
-
-  // 请求记录 (成功路径: requests/inputChars/outputChars/totalChars)
-  for (const { at, record } of statsRecent) {
-    if (at < cutoff) continue; // 落在 24 小时窗口外
-    let row = map.get(record.model);
-    if (!row) {
-      row = { model: record.model, requests: 0, failures: 0, inputChars: 0, outputChars: 0, totalChars: 0 };
-      map.set(record.model, row);
+  localStatsBucket(now);
+  const rows = new Map<string, ModelStatRow>();
+  for (const bucket of statsBuckets.values()) {
+    for (const current of bucket.models.values()) {
+      let row = rows.get(current.model);
+      if (!row) {
+        row = { model: current.model, requests: 0, failures: 0, inputChars: 0, outputChars: 0, totalChars: 0 };
+        rows.set(current.model, row);
+      }
+      row.requests += current.requests;
+      row.failures += current.failures;
+      row.inputChars += current.inputChars;
+      row.outputChars += current.outputChars;
+      row.totalChars += current.totalChars;
     }
-    row.requests += 1;
-    row.inputChars += record.inputChars;
-    row.outputChars += record.outputChars;
-    row.totalChars += record.inputChars + record.outputChars;
   }
-
-  // 失败事件 (失败路径: failures 计数)
-  for (const { at, model } of statsFailureRecent) {
-    if (at < cutoff) continue; // 落在 24 小时窗口外
-    let row = map.get(model);
-    if (!row) {
-      row = { model, requests: 0, failures: 0, inputChars: 0, outputChars: 0, totalChars: 0 };
-      map.set(model, row);
-    }
-    row.failures += 1;
-  }
-
-  return [...map.values()].sort((a, b) => b.requests - a.requests);
+  return [...rows.values()].sort((a, b) => b.requests - a.requests);
 }
 
-// 近 24 小时窗口的工具调用频次 (进程内)。历史累计工具名不直接展示,
-// 避免旧的 create_image 记录被误读为当前仍在持续调用图像工具。
 function buildStatsTools(now: number): Array<{ name: string; count: number }> {
-  const cutoff = now - STATS_BUCKET_MS * STATS_BUCKET_COUNT;
-  const map = new Map<string, number>();
-  for (const { at, record } of statsRecent) {
-    if (at < cutoff) continue;
-    for (const name of record.toolUses) {
-      map.set(name, (map.get(name) ?? 0) + 1);
-    }
+  localStatsBucket(now);
+  const tools = new Map<string, number>();
+  for (const bucket of statsBuckets.values()) {
+    for (const [name, count] of bucket.tools) tools.set(name, (tools.get(name) ?? 0) + count);
   }
-  return [...map.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 8)
-    .map(([name, count]) => ({ name, count }));
+  return [...tools.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([name, count]) => ({ name, count }));
 }
 
 // 生成统计快照 (供 /stats 页面与 /stats.json 使用)
@@ -1123,6 +1168,7 @@ function getStatsSnapshot(now = Date.now()): StatsSnapshot {
   return {
     since: trend[0]?.at ?? new Date(now - STATS_BUCKET_MS * (STATS_BUCKET_COUNT - 1)).toISOString(),
     totals: totalsFromTrend(trend),
+    upstream: localUpstreamStats(),
     models,
     tools: buildStatsTools(now),
     trend,
@@ -1316,6 +1362,7 @@ async function cleanupStaleTrendKeys(kv: any): Promise<void> {
 
 /** KV 持久化的聚合视图; KV 未启用时返回 null (调用方回退进程内)。 */
 interface PersistentStats {
+  upstream: UpstreamStats;
   totals: {
     requests: number;
     streaming: number;
@@ -1361,17 +1408,23 @@ async function readPersistentStats(): Promise<PersistentStats | null> {
 async function collectPersistentStats(kv: any): Promise<PersistentStats | null> {
   const P = statsKvPrefix();
   const totals = emptyStatsTotals();
+  const upstream = emptyUpstreamStats();
   // 24h 窗口的模型分布 (从 trend 桶的模型维度键聚合; 与趋势图同窗口口径)
   const models: PersistentStats["models"] = [];
   const toolMap = new Map<string, number>();
   const trend: PersistentStats["trend"] = [];
   // 当前 24h 窗口起点 (ms) — 只聚合窗口内的模型维度桶 (与进程内 buildStatsModels 同口径)
-  const modelCutoff = Date.now() - STATS_KV_MODEL_WINDOW_MS;
+  const modelCutoff = Math.floor(Date.now() / STATS_KV_BUCKET_MS) * STATS_KV_BUCKET_MS - STATS_KV_MODEL_WINDOW_MS + STATS_KV_BUCKET_MS;
 
   // 只扫描本命名空间前缀, 不会读到 sider2claude 的 ["stats", ...] 键
   for await (const entry of kv.list({ prefix: P })) {
     const key = entry.key;
     const value = statsKvNum(entry.value);
+    if (key[2] === "trend" && key[4] === "upstream" && key.length === 6 && Number(key[3]) >= modelCutoff) {
+      const field = key[5] as keyof UpstreamStats;
+      if (Object.hasOwn(upstream, field)) upstream[field] += value;
+      continue;
+    }
 
     // 键形: [root, "stats", "trend", bucket, field] (趋势总量)
     //       [root, "stats", "trend", bucket, "model", model, field] (模型维度, 供 24h 模型分布)
@@ -1444,6 +1497,7 @@ async function collectPersistentStats(kv: any): Promise<PersistentStats | null> 
 
   return {
     totals,
+    upstream,
     models,
     tools,
     trend,
@@ -1484,6 +1538,7 @@ async function getStatsSnapshotMerged(now = Date.now()): Promise<StatsSnapshot> 
     ...local,
     since: trend[0]?.at ?? new Date(now - STATS_KV_BUCKET_MS * (STATS_BUCKET_COUNT - 1)).toISOString(),
     totals: totalsFromTrend(trend),
+    upstream: persistent.upstream,
     models: persistent.models
       .map((m) => ({
         ...m,
@@ -2018,11 +2073,11 @@ function handlerFailureResponse(protocol: ApiProtocol, err: unknown): Response {
   if (err instanceof RequestValidationError) return protocolErrorResponse(protocol, err.detail);
   const detail = upstreamErrorFromException(err);
   if (detail) return protocolErrorResponse(protocol, detail);
-  const message = err instanceof Error ? err.message : String(err);
   return protocolErrorResponse(protocol, {
     statusCode: 500,
     type: "server_error",
-    message: `处理请求失败: ${message}`,
+    reason: "internal_error",
+    message: "处理请求失败，请通过 X-Request-ID 联系管理员查询。",
   });
 }
 
@@ -2049,6 +2104,7 @@ async function fetchSiderRateLimited(
   // 1. 预检 (不认领半开探测名额): 账号闸门/熔断/超配额 -> 直接拒, 不触达上游
   const pre = checkRateLimit(model);
   if (!pre.allowed) {
+    recordUpstreamActivity("gateRejections");
     return detachedCall(gateRejectionResponse(protocol, model, pre), trace, "gate_rejected");
   }
 
@@ -2059,7 +2115,7 @@ async function fetchSiderRateLimited(
   try {
     if (sessionInfo?.reusable) {
       releaseSession = await acquireSessionSlot(sessionInfo.id, clientSignal);
-      const previous = conversationSessions.get(sessionInfo.id);
+      const previous = getConversationSession(sessionInfo.id);
       if (previous && previous.model !== model) {
         releaseSession();
         return detachedCall(protocolErrorResponse(protocol, {
@@ -2071,7 +2127,7 @@ async function fetchSiderRateLimited(
     const releaseUpstream = await acquireUpstreamSlot(clientSignal);
     releaseSlot = () => { releaseUpstream(); releaseSession(); };
     // 在同会话前序请求完成后读取检查点，避免排队前读到旧 parent。
-    const previous = sessionInfo?.reusable ? conversationSessions.get(sessionInfo.id) : undefined;
+    const previous = sessionInfo?.reusable ? getConversationSession(sessionInfo.id) : undefined;
     if (previous) {
       const body = JSON.parse(String(init.body));
       body.cid = previous.cid;
@@ -2109,6 +2165,7 @@ async function fetchSiderRateLimited(
   //    复检与扣配额之间没有 await, 构成原子操作 —— 排队的请求不会再穿透熔断去烧额度。
   const admitted = admitUpstreamCall(model);
   if (!admitted.allowed) {
+    recordUpstreamActivity("gateRejections");
     releaseSlot();
     return detachedCall(gateRejectionResponse(protocol, model, admitted), trace, "gate_rejected_after_queue");
   }
@@ -2121,6 +2178,8 @@ async function fetchSiderRateLimited(
   let sawValidData = false;
   let fatalCode = 0;
   let stagedSession: { cid: string; messageId: string } | undefined;
+  let upstreamAttempted = false;
+  let quotaRecorded = false;
   let idleTimer: number | undefined;
   let clientAbortHandler: (() => void) | undefined;
   const timers: number[] = [];
@@ -2153,10 +2212,11 @@ async function fetchSiderRateLimited(
   const settle = (creditSuccess: boolean, endReason: string) => {
     if (settled) return;
     settled = true;
+    if (upstreamAttempted) recordUpstreamActivity(creditSuccess && fatalCode === 0 && sawValidData && timedOut === null ? "succeeded" : "failed");
     if (creditSuccess && fatalCode === 0 && sawValidData && timedOut === null) {
       recordUpstreamSuccess(model);
       if (endReason === "end_turn" && sessionInfo?.reusable && stagedSession && !clientSignal?.aborted) {
-        conversationSessions.set(sessionInfo.id, {
+        storeConversationSession(sessionInfo.id, {
           cid: stagedSession.cid, parent_message_id: stagedSession.messageId, model,
           created_at: conversationSessions.get(sessionInfo.id)?.created_at ?? Date.now(),
           last_used: Date.now(),
@@ -2229,6 +2289,10 @@ async function fetchSiderRateLimited(
       }
     },
     reportBusinessError(code: number, msg?: string) {
+      if (code === 1135 && !quotaRecorded) {
+        quotaRecorded = true;
+        recordUpstreamActivity("quotaErrors");
+      }
       if (FATAL_GATE_CODES.has(code)) fatalCode = code;
       noteUpstreamOutcome(model, code, msg);
     },
@@ -2249,6 +2313,8 @@ async function fetchSiderRateLimited(
   // 5. fetch 上游 (signal 由租约持有, 调用方不再自建定时器)
   let res: Response;
   try {
+    upstreamAttempted = true;
+    recordUpstreamActivity("attempts");
     res = await fetch(url, { ...init, signal: controller.signal });
     if (trace) trace.responseHeaderMs = Date.now() - trace.startedAt;
   } catch (err) {
@@ -2270,7 +2336,7 @@ async function fetchSiderRateLimited(
     return detachedCall(protocolErrorResponse(protocol, {
       statusCode: 502,
       type: "upstream_error",
-      message: `上游连接失败: ${err instanceof Error ? err.message : String(err)}`,
+      message: "上游连接失败，请稍后重试。",
     }), trace, "fetch_error");
   }
   clearTimeout(headerTimer);
@@ -2391,9 +2457,8 @@ async function fetchSiderRateLimited(
 // 只认 Authorization 会让 anthropic / google-genai 官方 SDK 开箱即 401。
 function extractAuthToken(req: Request): string | null {
   const authHeader = req.headers.get("Authorization");
-  if (authHeader && authHeader.startsWith("Bearer ")) {
-    return authHeader.slice("Bearer ".length).trim() || null;
-  }
+  const bearer = authHeader?.match(/^Bearer\s+(.+)$/i);
+  if (bearer) return bearer[1].trim() || null;
 
   const apiKey = req.headers.get("x-api-key") || req.headers.get("x-goog-api-key");
   if (apiKey) return apiKey.trim() || null;
@@ -2404,51 +2469,119 @@ function extractAuthToken(req: Request): string | null {
   return null;
 }
 
+/** 避免凭证比较按首个不同字符提前返回。 */
+function timingSafeEqual(a: string, b: string): boolean {
+  const encoder = new TextEncoder();
+  const left = encoder.encode(a);
+  const right = encoder.encode(b);
+  let diff = left.length ^ right.length;
+  for (let i = 0; i < Math.max(left.length, right.length); i++) diff |= (left[i] ?? 0) ^ (right[i] ?? 0);
+  return diff === 0;
+}
+
 function authMiddleware(handler: (req: Request) => Promise<Response>): (req: Request) => Promise<Response> {
   return async (req: Request) => {
-    // 如果未配置 AUTH_TOKEN,允许所有请求
-    if (!AUTH_TOKEN) {
-      return handler(req);
+    const admin = new URL(req.url).pathname.startsWith("/api/admin/");
+    const configured = admin ? ADMIN_TOKEN : AUTH_TOKEN;
+    const protocol = requestTraces.get(req)?.protocol ?? "openai";
+    if (!configured) {
+      if (!admin && ALLOW_OPEN_AUTH) return handler(req);
+      return protocolErrorResponse(protocol, {
+        statusCode: 503, type: "server_error", reason: "auth_not_configured",
+        message: "服务端尚未配置认证凭证。",
+      });
     }
-
     const token = extractAuthToken(req);
-
-    if (!token) {
-      return new Response(JSON.stringify({
-        error: {
-          message: "Unauthorized: Missing or invalid credentials. Provide one of: " +
-            "Authorization: Bearer <token>, x-api-key, x-goog-api-key, or ?key=",
-          type: "invalid_request_error"
-        }
-      }), {
-        status: 401,
-        headers: {
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*"
-        }
+    if (!token || !timingSafeEqual(token, configured)) {
+      return protocolErrorResponse(protocol, {
+        statusCode: 401, type: protocol === "openai" || protocol === "responses" ? "invalid_request_error" : "auth_error", reason: "invalid_credentials",
+        message: token ? "Unauthorized: Invalid token" :
+          "Unauthorized: Missing or invalid credentials. Provide one of: " +
+          "Authorization: Bearer <token>, x-api-key, x-goog-api-key, or ?key=",
       });
     }
-
-    if (token !== AUTH_TOKEN) {
-      return new Response(JSON.stringify({
-        error: {
-          message: "Unauthorized: Invalid token",
-          type: "invalid_request_error"
-        }
-      }), {
-        status: 401,
-        headers: {
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*"
-        }
-      });
-    }
-
     return handler(req);
   };
 }
 
+const STATS_COOKIE = "s2p_stats";
+const STATS_SESSION_SECONDS = 12 * 60 * 60;
+
+/** Cookie 使用带到期时间的 HMAC，服务端校验到期时间，不保存凭证明文。 */
+async function statsSession(token: string, expires: number): Promise<string> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", encoder.encode(token),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const digest = await crypto.subtle.sign("HMAC", key, encoder.encode("sider2api-stats:" + expires));
+  return expires + "." + [...new Uint8Array(digest)].map(v => v.toString(16).padStart(2, "0")).join("");
+}
+
+async function statsAuthorized(req: Request): Promise<boolean> {
+  if (STATS_PUBLIC) return true;
+  const token = extractAuthToken(req);
+  if (token) return STATS_TOKENS.some(valid => timingSafeEqual(token, valid));
+  const cookie = req.headers.get("Cookie")?.match(/(?:^|;\s*)s2p_stats=([^;]+)/)?.[1];
+  if (!cookie) return false;
+  const expires = Number(cookie.split(".")[0]);
+  if (!Number.isSafeInteger(expires) || expires <= Date.now()) return false;
+  for (const valid of STATS_TOKENS) {
+    if (timingSafeEqual(cookie, await statsSession(valid, expires))) return true;
+  }
+  return false;
+}
+
+function statsCookieHeader(req: Request, value: string, maxAge: number): string {
+  const secure = new URL(req.url).protocol === "https:" || req.headers.get("X-Forwarded-Proto") === "https";
+  return STATS_COOKIE + "=" + value + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=" + maxAge +
+    (secure ? "; Secure" : "");
+}
+
+function statsLoginPage(): string {
+  return `<!DOCTYPE html><html lang="zh-CN"><meta charset="utf-8"><title>用量统计登录</title>
+<body><form id="login"><h1>用量统计</h1><p>请输入看板凭证。</p>
+<input id="token" type="password" autocomplete="current-password" required aria-label="看板凭证">
+<button>登录</button><p id="message" role="status"></p></form>
+<script>
+document.getElementById('login').addEventListener('submit', async function (event) {
+  event.preventDefault();
+  try {
+    const response = await fetch('/stats/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: document.getElementById('token').value }) });
+    if (response.ok) location.reload();
+    else document.getElementById('message').textContent = '凭证无效';
+  } catch { document.getElementById('message').textContent = '登录失败，请重试'; }
+});
+</script></body></html>`;
+}
+
 // ==================== SSE 处理 ====================
+
+/** 首段内容或等待窗口到达才提交响应；此前的错误保留 HTTP 状态和退避头。 */
+function createStreamCommit(protocol: ApiProtocol) {
+  let decided = false;
+  let resolve!: (detail?: UpstreamErrorDetail) => void;
+  let timer: number | undefined;
+  const decision = new Promise<UpstreamErrorDetail | undefined>(done => { resolve = done; });
+  const finish = (detail?: UpstreamErrorDetail) => {
+    if (decided) return;
+    decided = true;
+    clearTimeout(timer);
+    resolve(detail);
+  };
+  if (STREAM_COMMIT_WINDOW_MS === 0) finish();
+  else timer = setTimeout(() => finish(), STREAM_COMMIT_WINDOW_MS);
+  return {
+    finish,
+    async response(stream: ReadableStream, init: ResponseInit): Promise<Response> {
+      const detail = await decision;
+      if (detail) {
+        try { await stream.cancel(); } catch { /* 流可能已经结束 */ }
+        return protocolErrorResponse(protocol, detail);
+      }
+      return new Response(stream, init);
+    },
+  };
+}
 
 class SSELineReader {
   private buffer = '';
@@ -2870,7 +3003,16 @@ function validateTextContent(content: any, types: string[], gemini = false): voi
   }
 }
 
-async function readValidatedBody(req: Request, protocol: ApiProtocol): Promise<any> {
+function bodyTooLarge(): never {
+  throw new RequestValidationError({
+    statusCode: 413, type: "request_too_large", reason: "request_too_large",
+    message: "请求体超过 " + MAX_REQUEST_BODY_BYTES + " 字节上限。",
+  });
+}
+
+async function readJsonBody(req: Request): Promise<any> {
+  if (Number(req.headers.get("Content-Length")) > MAX_REQUEST_BODY_BYTES) bodyTooLarge();
+  let bytes = 0;
   const reader = req.body?.getReader();
   const chunks: Uint8Array[] = [];
   const abort = () => { void reader?.cancel(req.signal.reason).catch(() => {}); };
@@ -2883,6 +3025,8 @@ async function readValidatedBody(req: Request, protocol: ApiProtocol): Promise<a
         const { done, value } = await reader.read();
         if (req.signal.aborted) throw req.signal.reason;
         if (done) break;
+        bytes += value.byteLength;
+        if (bytes > MAX_REQUEST_BODY_BYTES) bodyTooLarge();
         chunks.push(value);
       }
     }
@@ -2893,8 +3037,14 @@ async function readValidatedBody(req: Request, protocol: ApiProtocol): Promise<a
     }
   } finally {
     req.signal.removeEventListener("abort", abort);
+    void reader?.cancel().catch(() => {});
     reader?.releaseLock();
   }
+  return body;
+}
+
+async function readValidatedBody(req: Request, protocol: ApiProtocol): Promise<any> {
+  const body = await readJsonBody(req);
   if (!isRecord(body)) invalidInput("请求体必须是 JSON 对象。");
   if (body.model !== undefined && (typeof body.model !== "string" || !body.model.trim())) invalidInput("model 必须是非空字符串。");
   const trace = requestTraces.get(req);
@@ -3225,7 +3375,7 @@ async function handleNonStreamingResponse(
         break;
 
       case "tool_call":
-        console.log("🔧 工具调用:", data.tool_call);
+        console.log("🔧 工具调用:", { name: data.tool_call?.name, status: data.tool_call?.status });
         break;
     }
   }
@@ -3349,17 +3499,18 @@ async function handleNonStreamingResponse(
 }
 
 // 处理流式响应
-function handleStreamingResponse(
+async function handleStreamingResponse(
   call: UpstreamCall,
   modelName: string,
   isImageGen: boolean,
   session: SessionInfo,
   outputLimits: OutputLimitOptions = {},
   inputText = "",
-): Response {
+): Promise<Response> {
   const siderResponse = call.response;
   let conversationId = "";
   let closeHeartbeat = () => {};
+  const commit = createStreamCommit("openai");
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -3387,6 +3538,7 @@ function handleStreamingResponse(
 
       // 流式请求完成时统一采集 (正常出口调用)
       const finishStreamStats = () => {
+          commit.finish();
         recordUsage({
           model: modelName,
           stream: true,
@@ -3399,6 +3551,7 @@ function handleStreamingResponse(
 
       const enqueueTextChunk = (text: string, finishReason: "stop" | "length" | null = null) => {
         if (!text && finishReason === null) return;
+        if (text) commit.finish();
         controller.enqueue(encoder.encode(`data: ${JSON.stringify({
           id: responseId,
           object: "chat.completion.chunk",
@@ -3420,6 +3573,7 @@ function handleStreamingResponse(
         hb.close();
       };
       const finishOpenAIError = (detail: UpstreamErrorDetail) => {
+          commit.finish(detail);
         if (hb.closed) return;
         try {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify({
@@ -3431,6 +3585,7 @@ function handleStreamingResponse(
             error: {
               code: detail.upstreamCode ?? detail.statusCode,
               message: detail.message,
+        ...(detail.retryAfterSec !== undefined ? { retry_after: detail.retryAfterSec } : {}),
               type: detail.type,
               reason: detail.reason,
             },
@@ -3633,6 +3788,7 @@ function handleStreamingResponse(
           }
 
           if (openAIChunk) {
+            commit.finish();
             const chunk = `data: ${JSON.stringify(openAIChunk)}\n\n`;
             controller.enqueue(encoder.encode(chunk));
           }
@@ -3652,7 +3808,7 @@ function handleStreamingResponse(
         finishOpenAIError(upstreamErrorFromException(error) ?? {
           statusCode: 502,
           type: "upstream_error",
-          message: error instanceof Error ? error.message : String(error),
+          message: "上游响应流异常中断。",
         });
       }
     },
@@ -3663,7 +3819,7 @@ function handleStreamingResponse(
     }
   });
 
-  return new Response(stream, {
+  return commit.response(stream, {
     headers: {
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache",
@@ -3680,8 +3836,8 @@ async function handleImageGeneration(req: Request): Promise<Response> {
   let model = "dall-e-3"; // 函数级: catch 出口的失败统计也要用
   const trace = createRequestTrace(req, "openai");
   try {
-    const requestBody = await req.json();
-    console.log("🎨 收到图像生成请求:", requestBody);
+    const requestBody = await readJsonBody(req);
+    console.log("🎨 收到图像生成请求:", { n: requestBody.n, size: requestBody.size });
 
     // ==================== 参数验证和标准化 (OpenAI API 兼容) ====================
 
@@ -3928,7 +4084,7 @@ async function handleImageGeneration(req: Request): Promise<Response> {
         case "text":
           // 某些情况下可能有文本响应
           if (data.text) {
-            console.log("💬 文本内容:", data.text.substring(0, 50));
+            console.log("💬 文本字符数:", data.text.length);
           }
           break;
 
@@ -4278,6 +4434,7 @@ async function handleGeminiGenerate(
     // 候选事件收尾, 然后直接关闭连接。多发一个 [DONE] 会让严格按 spec 实现的客户端
     // (如 google-genai) 解析到非 Gemini 结构。
     let closeHeartbeat = () => {};
+    const commit = createStreamCommit("gemini");
     const stream = new ReadableStream({
       async start(controller) {
         const reader = siderResponse.body?.getReader();
@@ -4295,6 +4452,7 @@ async function handleGeminiGenerate(
         const gTools = new Set<string>();
         const textLimiter = createStreamingOutputLimiter(outputLimits);
         const finishGeminiStats = () => {
+          commit.finish();
           recordUsage({
             model: geminiModel,
             stream: true,
@@ -4307,6 +4465,7 @@ async function handleGeminiGenerate(
 
         const enqueueGeminiText = (text: string, finishReason?: "STOP" | "MAX_TOKENS") => {
           if (!text && !finishReason) return;
+          if (text) commit.finish();
           controller.enqueue(encoder.encode(`data: ${JSON.stringify({
             candidates: [{
               content: { role: "model", parts: text ? [{ text }] : [] },
@@ -4323,6 +4482,7 @@ async function handleGeminiGenerate(
           hb.close();
         };
         const finishGeminiError = (detail: UpstreamErrorDetail) => {
+          commit.finish(detail);
           if (!hb.closed) {
             try {
               controller.enqueue(encoder.encode(
@@ -4397,6 +4557,7 @@ async function handleGeminiGenerate(
             }
 
             if (geminiChunk) {
+              commit.finish();
               controller.enqueue(encoder.encode(`data: ${JSON.stringify(geminiChunk)}\n\n`));
             }
           }
@@ -4414,7 +4575,7 @@ async function handleGeminiGenerate(
           finishGeminiError(upstreamErrorFromException(err) ?? {
             statusCode: 502,
             type: "upstream_error",
-            message: err?.message || "stream error",
+            message: "上游响应流异常中断。",
           });
         }
       },
@@ -4425,7 +4586,7 @@ async function handleGeminiGenerate(
       }
     });
 
-    return new Response(stream, {
+    return commit.response(stream, {
       headers: {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache",
@@ -4698,6 +4859,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
     // ---- 流式: Anthropic SSE 事件序列 (content-block 状态机) ----
     // 惰性开块 + 单调 index + 成对 start/stop; reasoning_content->thinking, text->text。
     let closeHeartbeat = () => {};
+    const commit = createStreamCommit("anthropic");
     const sstream = new ReadableStream<Uint8Array>({
       async start(controller) {
         const reader = siderResp.body?.getReader();
@@ -4712,6 +4874,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
 
         const sendEvent = (event: string, data: any) => {
           if (hb.closed) return;
+          if (event === "content_block_delta") commit.finish();
           try {
             controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
           } catch {
@@ -4731,6 +4894,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
         const anthroT0 = Date.now();
         const anthroTools = new Set<string>();
         const finishAnthroStats = () => {
+          commit.finish();
           recordUsage({
             model: anthroModel,
             stream: true,
@@ -4784,6 +4948,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
           hb.close();
         };
         const finishError = (detail: UpstreamErrorDetail) => {
+          commit.finish(detail);
           closeBlock();
           sendEvent("error", protocolErrorPayload("anthropic", detail));
           finishAnthroStats();
@@ -4890,7 +5055,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
           finishError(upstreamErrorFromException(err) ?? {
             statusCode: 502,
             type: "upstream_error",
-            message: err?.message || "stream error",
+            message: "上游响应流异常中断。",
           });
         }
       },
@@ -4901,7 +5066,7 @@ async function handleAnthropicMessage(req: Request): Promise<Response> {
       },
     });
 
-    return new Response(sstream, {
+    return commit.response(sstream, {
       headers: {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache", "Connection": "keep-alive",
@@ -5194,6 +5359,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
 
     // ---- 流式: Responses API SSE ----
     let closeHeartbeat = () => {};
+    const commit = createStreamCommit("responses");
     const respStream = new ReadableStream({
       async start(controller) {
         const reader = siderResp.body?.getReader();
@@ -5212,6 +5378,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
         const rTools = new Set<string>();
         const textLimiter = createStreamingOutputLimiter(outputLimits);
         const finishResponsesStats = () => {
+          commit.finish();
           recordUsage({
             model: modelName,
             stream: true,
@@ -5224,6 +5391,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
 
         const sendEvent = (event: string, data: any) => {
           if (hb.closed) return;
+          if (event === "content_block_delta") commit.finish();
           try {
             controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
           } catch {
@@ -5263,6 +5431,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
         });
 
         const sendDelta = (text: string) => {
+          commit.finish();
           ensureItem();
           rOutputChars += text.length;
           outputTextAcc += text;
@@ -5315,6 +5484,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
           hb.close();
         };
         const finishResponsesFailure = (detail: UpstreamErrorDetail) => {
+          commit.finish(detail);
           const failedResp = {
             ...initialResp,
             status: "failed",
@@ -5322,6 +5492,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
             error: {
               code: detail.reason || detail.type,
               message: detail.message,
+        ...(detail.retryAfterSec !== undefined ? { retry_after: detail.retryAfterSec } : {}),
               upstream_code: detail.upstreamCode,
             },
             usage: {
@@ -5384,7 +5555,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
           finishResponsesFailure(upstreamErrorFromException(err) ?? {
             statusCode: 502,
             type: "upstream_error",
-            message: err?.message || "stream error",
+            message: "上游响应流异常中断。",
           });
         }
       },
@@ -5395,7 +5566,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
       },
     });
 
-    return new Response(respStream, {
+    return commit.response(respStream, {
       headers: {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache", "Connection": "keep-alive",
@@ -5413,7 +5584,7 @@ async function handleOpenAIResponse(req: Request): Promise<Response> {
 // ==================== 内嵌管理界面HTML (Deploy环境) ====================
 
 function getEmbeddedAdminHTML(): string {
-  const hasAuth = AUTH_TOKEN ? true : false;
+  const hasAuth = ADMIN_TOKEN ? true : false;
 
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -5534,7 +5705,7 @@ function getEmbeddedAdminHTML(): string {
   <div id="authContainer" class="auth-container">
     <h2>🔐 管理界面认证</h2>
     <div id="authError" class="error">认证失败,请检查密码</div>
-    <input type="password" id="authToken" placeholder="请输入 AUTH_TOKEN" />
+    <input type="password" id="authToken" placeholder="请输入管理凭证" />
     <button onclick="authenticate()">登录</button>
   </div>
   ` : ''}
@@ -5832,7 +6003,7 @@ function statsShownModels(snapshot: StatsSnapshot): ModelStatRow[] {
 
 /** 顶部三个统计卡。 */
 function statsTilesHtml(totals: StatsSnapshot["totals"]): string {
-  return `<div class="card tile"><div class="v">${totals.requests}</div><div class="k">近 24h 上游请求</div></div>
+  return `<div class="card tile"><div class="v">${totals.requests}</div><div class="k">近 24h 业务响应</div></div>
   <div class="card tile"><div class="v">${compactNum(totals.inputChars + totals.outputChars)}</div><div class="k">近 24h 字符总量</div></div>
   <div class="card tile"><div class="v">${totals.toolCalls}</div><div class="k">近 24h 工具调用</div></div>`;
 }
@@ -5891,7 +6062,8 @@ function statsToolRowsHtml(tools: StatsSnapshot["tools"]): string {
 function statsFooterHtml(snapshot: StatsSnapshot): string {
   return `${escHtml(snapshot.note)}<br>
   ${snapshot.persisted ? "聚合窗口数据已持久化（Deno KV），跨实例读取一致。" : "⚠️ 聚合窗口数据未持久化：仅统计当前实例，且实例回收后清零。"}
-  近 24h 流式请求 ${snapshot.totals.streaming} 次。字符数以请求文本长度估算（上游流式不回传 token 用量）。`;
+  实际上游请求 ${snapshot.upstream.attempts} 次：成功 ${snapshot.upstream.succeeded}、失败 ${snapshot.upstream.failed}、额度限制 ${snapshot.upstream.quotaErrors}、门控拒绝 ${snapshot.upstream.gateRejections}。<br>
+  近 24h 流式业务响应 ${snapshot.totals.streaming} 次。字符数以请求文本长度估算（上游流式不回传 token 用量）。`;
 }
 
 /** 环形图整块 (含 svg 外壳)。 */
@@ -6129,18 +6301,53 @@ async function handleRequest(req: Request): Promise<Response> {
     });
   }
 
-  // 用量统计页面 (公开, 参考 sider2claude /stats 设计; 聚合取 KV 持久层, 明细取进程内)
+  if (req.method === "POST" && path === "/stats/login") {
+    try {
+      const body = await readJsonBody(req);
+      const token = typeof body?.token === "string" ? body.token : "";
+      if (!token || !STATS_TOKENS.some(valid => timingSafeEqual(token, valid))) {
+        return protocolErrorResponse("openai", { statusCode: 401, type: "auth_error", message: "看板凭证无效。" });
+      }
+      const value = await statsSession(token, Date.now() + STATS_SESSION_SECONDS * 1000);
+      return Response.json({ status: "ok" }, {
+        headers: { "Set-Cookie": statsCookieHeader(req, value, STATS_SESSION_SECONDS), "Cache-Control": "no-store" },
+      });
+    } catch (error) {
+      return handlerFailureResponse("openai", error);
+    }
+  }
+  if (req.method === "POST" && path === "/stats/logout") {
+    return Response.json({ status: "ok" }, {
+      headers: { "Set-Cookie": statsCookieHeader(req, "", 0), "Cache-Control": "no-store" },
+    });
+  }
+  if (req.method === "GET" && (path === "/stats" || path === "/stats.json")) {
+    if (!await statsAuthorized(req)) {
+      const status = STATS_TOKENS.length ? 401 : 503;
+      if (path === "/stats" && req.headers.get("Accept")?.includes("text/html")) {
+        return new Response(statsLoginPage(), {
+          status, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+        });
+      }
+      return protocolErrorResponse("openai", {
+        statusCode: status, type: status === 401 ? "auth_error" : "server_error",
+        message: status === 401 ? "访问用量看板需要认证。" : "服务端尚未配置看板凭证。",
+      }, { "Cache-Control": "no-store" });
+    }
+  }
+
+  // 用量看板和原始数据共用鉴权，Cookie 登录兼容页面自动刷新。
   if (req.method === "GET" && path === "/stats") {
     return new Response(renderStatsPage(await getStatsSnapshotMerged()), {
       headers: {
+        "Cache-Control": "no-store",
         "Content-Type": "text/html; charset=utf-8",
         "Access-Control-Allow-Origin": "*"
       }
     });
   }
 
-  // 用量统计原始数据 (JSON, 与 /stats 页面同级公开; 附预渲染 HTML 片段,
-  // 供页面每 5s 前端局部刷新。数据为聚合统计 + 最近请求元数据, 不含消息内容。)
+  // 用量统计原始数据；附预渲染片段供页面每 5 秒局部刷新。
   if (req.method === "GET" && path === "/stats.json") {
     const snapshot = await getStatsSnapshotMerged();
     const payload = {
@@ -6149,6 +6356,7 @@ async function handleRequest(req: Request): Promise<Response> {
     };
     return new Response(JSON.stringify(payload), {
       headers: {
+        "Cache-Control": "no-store",
         "Content-Type": "application/json",
         "Access-Control-Allow-Origin": "*"
       }
@@ -6286,7 +6494,7 @@ async function handleRequest(req: Request): Promise<Response> {
   if (req.method === "POST" && path === "/api/admin/models") {
     return authMiddleware(async (req: Request) => {
       try {
-        const model: CustomModel = await req.json();
+        const model: CustomModel = await readJsonBody(req);
 
         // 验证必需字段
         if (!model.id || !model.model) {
@@ -6318,7 +6526,8 @@ async function handleRequest(req: Request): Promise<Response> {
           }
         });
       } catch (error: any) {
-        return new Response(`添加失败: ${error.message}`, {
+        if (error instanceof RequestValidationError) return handlerFailureResponse("openai", error);
+        return new Response("添加模型失败，请联系管理员。", {
           status: 500,
           headers: {
             "Content-Type": "text/plain",
@@ -6333,7 +6542,7 @@ async function handleRequest(req: Request): Promise<Response> {
   if (req.method === "PUT" && path === "/api/admin/models") {
     return authMiddleware(async (req: Request) => {
       try {
-        const model: CustomModel = await req.json();
+        const model: CustomModel = await readJsonBody(req);
 
         if (!model.id || !model.model) {
           return new Response("缺少必需字段: id 和 model", {
@@ -6353,7 +6562,8 @@ async function handleRequest(req: Request): Promise<Response> {
           }
         });
       } catch (error: any) {
-        return new Response(`更新失败: ${error.message}`, {
+        if (error instanceof RequestValidationError) return handlerFailureResponse("openai", error);
+        return new Response("更新模型失败，请联系管理员。", {
           status: 400,
           headers: {
             "Content-Type": "text/plain",
@@ -6442,4 +6652,4 @@ console.log("   - 自定义模型映射");
 console.log(`   - 支持 ${Object.keys(MODEL_MAPPING).length} 个模型`);
 console.log("\n🔐 安全配置:");
 console.log(`   - SIDER_AUTH_TOKEN: ${SIDER_AUTH_TOKEN ? "✅ 已配置" : "❌ 未配置"}`);
-console.log(`   - AUTH_TOKEN: ${AUTH_TOKEN ? "✅ 已启用认证" : "⚠️ 未启用认证(开发模式)"}`);
+console.log(`   - AUTH_TOKEN: ${AUTH_TOKEN ? "✅ 已启用认证" : ALLOW_OPEN_AUTH ? "⚠️ 显式开发开放模式" : "❌ 未配置，默认拒绝请求"}`);
